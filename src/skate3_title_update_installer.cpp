@@ -23,6 +23,10 @@
 
 #include "third_party/rexglue-sdk/thirdparty/crypto/sha256.h"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -608,6 +612,12 @@ std::filesystem::path PickTitleUpdateFile() {
     return {};
   }
   return filename;
+}
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+std::filesystem::path PickTitleUpdateFile() {
+  // No file picker on iOS; the title update is expected to be staged in the
+  // app's Documents directory already, so report nothing selected.
+  return {};
 }
 #elif defined(__APPLE__)
 std::filesystem::path PickTitleUpdateFile() {

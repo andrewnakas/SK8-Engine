@@ -19,6 +19,10 @@
 #include <rex/ui/overlay/install_wizard_overlay.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -102,6 +106,12 @@ std::filesystem::path PickIsoFile() {
     return {};
   }
   return filename;
+}
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+std::filesystem::path PickIsoFile() {
+  // No file picker on iOS; the ISO is expected to be staged in the
+  // app's Documents directory already, so report nothing selected.
+  return {};
 }
 #elif defined(__APPLE__)
 std::filesystem::path PickIsoFile() {

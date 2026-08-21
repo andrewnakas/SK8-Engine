@@ -56,10 +56,17 @@ if(WIN32)
         set(SKATE3_BUILD_PLATFORM "win-${SKATE3_TARGET_PROCESSOR}")
     endif()
 elseif(APPLE)
-    if(SKATE3_TARGET_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-        set(SKATE3_BUILD_PLATFORM "macos-arm64")
+    # CMake sets APPLE (and UNIX) for iOS too.
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(SKATE3_IOS TRUE)
+    endif()
+    if(NOT SKATE3_TARGET_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        message(FATAL_ERROR "Unsupported Apple architecture: ${SKATE3_TARGET_PROCESSOR}. Apple builds are ARM64-only.")
+    endif()
+    if(SKATE3_IOS)
+        set(SKATE3_BUILD_PLATFORM "ios-arm64")
     else()
-        message(FATAL_ERROR "Unsupported macOS architecture: ${SKATE3_TARGET_PROCESSOR}. macOS builds are ARM64-only.")
+        set(SKATE3_BUILD_PLATFORM "macos-arm64")
     endif()
 elseif(UNIX AND NOT APPLE)
     if(SKATE3_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
@@ -268,7 +275,8 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )
-if(APPLE)
+if(APPLE AND NOT SKATE3_IOS)
+    # NSOpenPanel; there is no file picker on iOS and the disc is pre-extracted.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_macos.mm)
 endif()
 
@@ -370,8 +378,15 @@ target_link_libraries(skate3 PRIVATE rex::runtime)
 rexglue_configure_target(skate3)
 
 if(APPLE)
-    target_link_options(skate3 PRIVATE -Wl,-stack_size,0x4000000)
-    target_link_libraries(skate3 PRIVATE "-framework Cocoa")
+    if(SKATE3_IOS)
+        # UIKit rather than AppKit. -stack_size applies to the main thread of an
+        # executable; on iOS the main thread stack is fixed at 1 MB and SDL runs
+        # the app on its own thread anyway, so it is omitted here.
+        target_link_libraries(skate3 PRIVATE "-framework UIKit" "-framework Foundation")
+    else()
+        target_link_options(skate3 PRIVATE -Wl,-stack_size,0x4000000)
+        target_link_libraries(skate3 PRIVATE "-framework Cocoa")
+    endif()
 endif()
 
 if(WIN32)
