@@ -53,7 +53,12 @@
 
 #include "generated/skate3_init.h"
 
+#if defined(__ANDROID__)
+// bionic has no <execinfo.h>; this supplies backtrace* over the unwinder.
+#include <rex/execinfo_android.h>
+#else
 #include <execinfo.h>
+#endif
 #include <signal.h>
 #include <sys/prctl.h>
 

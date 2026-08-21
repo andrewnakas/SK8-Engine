@@ -27,6 +27,9 @@
 
 #include <rex/ui/window_win.h>
 #elif defined(__APPLE__)
+#elif defined(__ANDROID__)
+// No native file dialog on Android: the game data is addressed by path under
+// the app's external files directory, so the ISO install wizard is inert.
 #else
 #include <gtk/gtk.h>
 #endif
@@ -103,6 +106,12 @@ std::filesystem::path PickIsoFile() {
 #elif defined(__APPLE__)
 std::filesystem::path PickIsoFile() {
   return skate3::PickIsoFileMacOS();
+}
+#elif defined(__ANDROID__)
+std::filesystem::path PickIsoFile() {
+  // Nothing to pick from: an empty path makes the caller report that no ISO
+  // was selected, which is the correct outcome for a pre-installed data dir.
+  return {};
 }
 #else
 std::filesystem::path PickIsoFile() {
@@ -486,7 +495,7 @@ bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context
     if (window) {
       window->RequestPaint();
     }
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__ANDROID__)
     while (gtk_events_pending()) {
       gtk_main_iteration_do(FALSE);
     }

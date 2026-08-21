@@ -5,7 +5,12 @@
 #if !defined(_WIN32)
 
 #include <dirent.h>
+#if defined(__ANDROID__)
+// bionic has no <execinfo.h>; this supplies backtrace* over the unwinder.
+#include <rex/execinfo_android.h>
+#else
 #include <execinfo.h>
+#endif
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>

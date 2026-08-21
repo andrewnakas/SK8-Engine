@@ -34,6 +34,9 @@
 #include <rex/ui/window_win.h>
 #elif defined(__APPLE__)
 #include <sys/wait.h>
+#elif defined(__ANDROID__)
+#include <sys/wait.h>
+// No native file dialog on Android; see PickTitleUpdateFile below.
 #else
 #include <sys/wait.h>
 
@@ -610,6 +613,12 @@ std::filesystem::path PickTitleUpdateFile() {
 std::filesystem::path PickTitleUpdateFile() {
   return skate3::PickTitleUpdateFileMacOS();
 }
+#elif defined(__ANDROID__)
+std::filesystem::path PickTitleUpdateFile() {
+  // An empty path reads as "nothing selected". The Android build expects the
+  // title update to already be staged alongside the rest of the game data.
+  return {};
+}
 #else
 std::filesystem::path PickTitleUpdateFile() {
   GtkWidget* dialog = gtk_file_chooser_dialog_new(
@@ -899,7 +908,7 @@ bool RunTitleUpdateInstallWizardBlocking(rex::ui::WindowedAppContext& app_contex
     if (window) {
       window->RequestPaint();
     }
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__ANDROID__)
     while (gtk_events_pending()) {
       gtk_main_iteration_do(FALSE);
     }

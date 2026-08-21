@@ -291,6 +291,13 @@ if(WIN32)
         @ONLY
     )
     target_sources(skate3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc)
+elseif(ANDROID)
+    # SDLActivity dlopen()s this and calls SDL_main, so the game is a shared
+    # library rather than an executable. SDL3 is linked in statically, so the
+    # activity only has to load this one object.
+    add_library(skate3 SHARED ${SKATE3_SOURCES})
+    # SDLActivity's default getMainSharedObject() looks for libmain.so.
+    set_target_properties(skate3 PROPERTIES OUTPUT_NAME main)
 else()
     add_executable(skate3 ${SKATE3_SOURCES})
 endif()

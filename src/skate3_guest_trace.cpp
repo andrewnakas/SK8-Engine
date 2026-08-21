@@ -60,7 +60,12 @@
 #include <vector>
 
 #if defined(__linux__)
+#if defined(__ANDROID__)
+// bionic has no <execinfo.h>; this supplies backtrace* over the unwinder.
+#include <rex/execinfo_android.h>
+#else
 #include <execinfo.h>
+#endif
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
