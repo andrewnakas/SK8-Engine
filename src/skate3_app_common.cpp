@@ -2,6 +2,7 @@
 
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
+#include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
 #include "skate3_native_scene.h"
@@ -10,6 +11,7 @@
 #include "skate3_win_icon.h"
 #include "skate3_title_update_installer.h"
 #include "skate3_user_settings.h"
+#include "skate3_warp.h"
 
 #include <algorithm>
 #include <chrono>
@@ -681,6 +683,40 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // skate3_native_render_mode_indicator shows it live). Input-transparent,
   // so it never affects cursor or focus handling.
   render_mode_indicator_ = std::make_unique<skate3::RenderModeIndicator>(drawer);
+  // Loading cover for launcher-driven map selection. Constructed unconditionally
+  // (it is inert unless skate3_loader_overlay is set) so the cvar stays live.
+  loader_overlay_ = std::make_unique<skate3::LoaderOverlay>(drawer);
+  // In-game map picker for launcher-driven sessions (F3). Inert unless the
+  // launcher passed a level list.
+  level_select_dialog_ =
+      std::make_unique<skate3::LevelSelectDialog>(drawer, loader_overlay_.get());
+  // Shown beside the normal Escape settings screen, so the system menu keeps
+  // everything it had and simply gains a map list.
+  level_select_dialog_->SetCompanionPredicate(
+      [this] { return simple_settings_dialog_ && simple_settings_dialog_->visible(); });
+  // Choosing a map closes the whole system menu, so the new world is not loaded
+  // underneath a settings screen nobody asked to keep open.
+  level_select_dialog_->SetCloseMenusCallback([this] {
+    if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
+      ToggleSimpleSettings();
+    }
+  });
+  if (skate3::LoaderPickerOpensAtStart()) {
+    level_select_dialog_->RequestOpenOnGameplay();
+  }
+  // Backtick is the level picker, the way a console key would be. F7 stays as a
+  // second binding so existing muscle memory and any saved config still work.
+  rex::ui::RegisterBind("bind_skate3_level_select", "Backtick", "Skate 3 level select", [this] {
+    if (level_select_dialog_) {
+      level_select_dialog_->Toggle();
+    }
+  });
+  rex::ui::RegisterBind("bind_skate3_level_select_alt", "F7",
+                        "Skate 3 level select (alternate)", [this] {
+    if (level_select_dialog_) {
+      level_select_dialog_->Toggle();
+    }
+  });
   rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings", [this] {
     // Escape backs out of the settings screen level by level (rows ->
     // category rail -> closed); when the screen is closed it opens it.
@@ -763,6 +799,16 @@ void Skate3BaseApp::OnPostSetup() {
     input_system->SetMenuChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() { ToggleSimpleSettings(); });
     });
+    // The middle Xbox button opens the level picker (cvar picker_chord). It
+    // only reaches the input system when guide_button is on, so a launcher that
+    // wants it must set both.
+    input_system->SetPickerChordCallback([this]() {
+      app_context().CallInUIThreadDeferred([this]() {
+        if (level_select_dialog_) {
+          level_select_dialog_->Toggle();
+        }
+      });
+    });
   }
 
   if (std::getenv("SKATE3_DISABLE_BIG_ALIASES") == nullptr) {
@@ -793,6 +839,13 @@ void Skate3BaseApp::OnPostSetup() {
   auto* dispatcher = runtime()->function_dispatcher();
   skate3::native_render::Install();
   skate3::demo_path::InstallHooks(dispatcher);
+  // Guest call trace: no-op unless --skate3_trace=true. Installed after the
+  // demo path because its controller reads that macro's progress milestones.
+  skate3::guest_trace::Install();
+  // Direct level load and its probe: no-op unless one of its cvars is set.
+  // Last, so a probe chains to whatever hook the features above installed
+  // rather than replacing it.
+  skate3::warp::Install(dispatcher);
   // User-facing intro-movie skip (independent of the demo path): the movie
   // completion override polls the merged UI pad state through this provider.
   skate3::demo_path::SetUiInputProvider([this]() {

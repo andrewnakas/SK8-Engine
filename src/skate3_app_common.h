@@ -13,6 +13,7 @@
 #include <rex/rex_app.h>
 #include <rex/ui/overlay/simple_settings_overlay.h>
 
+#include "skate3_loader_overlay.h"
 #include "skate3_native_debug_dialog.h"
 
 namespace rex::ui {
@@ -60,6 +61,9 @@ class Skate3BaseApp : public rex::ReXApp {
   std::unique_ptr<rex::ui::SimpleSettingsDialog> simple_settings_dialog_;
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
+  // Full-screen "loading <map>" cover for launcher-driven map selection.
+  std::unique_ptr<skate3::LoaderOverlay> loader_overlay_;
+  std::unique_ptr<skate3::LevelSelectDialog> level_select_dialog_;
   bool recipe_overlay_installed_ = false;
   bool big_device_aliases_installed_ = false;
   std::atomic<uint32_t> debug_marker_count_{0};

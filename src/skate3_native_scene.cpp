@@ -59,6 +59,28 @@
 
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
+REXCVAR_DEFINE_INT32(skate3_hang_watchdog_seconds, 15, "Skate 3",
+                     "Seconds without a guest frame before the hang watchdog dumps every "
+                     "thread's stack to the log and to <log_file>.crash (0 = off). A freeze "
+                     "raises no signal, so the crash reporter never sees one and the log "
+                     "simply stops - this is the only way to find out which thread is stuck "
+                     "and what everyone else is waiting on. Costs one sleeping thread.")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_fe_debug_screen_offset, 0x264, "Skate 3",
+                     "Offset in the frontend manager holding the CURRENT SCREEN pointer; "
+                     "skate3_fe_debug follows it and reports words that step by exactly "
+                     "one, which is what a menu cursor does and a timer does not. The "
+                     "manager's own window has no cursor in it - only fade ramps.")
+    .range(0, 2044)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_fe_debug, false, "Skate 3",
+                    "Log the frontend menu state: the screen push-state stack, the raw words "
+                    "of the live screen record, and the head of the object it points at. The "
+                    "selection/cursor field identifies itself - move the cursor N rows and "
+                    "exactly one word steps N times. Lets a harness drive the menus exactly "
+                    "instead of pressing 'down' forty times and hoping.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene, true, "Skate 3",
                     "Render the game scene natively from the hooked MeshContext stream, "
                     "replacing the emulated GPU output (requires skate3_native_render). "
@@ -618,16 +640,18 @@ REXCVAR_DEFINE_INT32(
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_menu_unsuppress, false, "Skate 3",
-    "ESCAPE HATCH, normally unnecessary: while a menu/pause/loading context "
-    "(presence context 0) renders natively, temporarily clear "
-    "native_render_suppress_emulated_draws so ALL emulated passes execute. "
-    "The original motivation, the team-menu skater portrait boxes are "
-    "one-shot render-to-texture passes that suppression left forever empty "
-    ", is covered without this by the SDK's pitch-selective suppression "
-    "(native_render_suppress_mode 2: surfaces <= 512 px wide, incl. the "
-    "portrait cards, always execute). Turn on only if small offscreen "
-    "composites are missing in menus despite that; costs the full emulated "
-    "pipeline's GPU time during menus.")
+    "ESCAPE HATCH: while a menu/pause/loading context (presence context 0) "
+    "renders natively, temporarily clear native_render_suppress_emulated_draws "
+    "so ALL emulated passes execute; restored on the first gameplay frame. "
+    "Its original motivation (team-menu skater portrait boxes left empty by "
+    "suppression) is covered without it by the SDK's pitch-selective "
+    "suppression. Costs the full emulated pipeline's GPU time during menus and "
+    "loads, and roughly doubles the worst event-loop stall (measured 1.0 s -> "
+    "2.4 s), which the desktop reports as the window not responding. "
+    "NOT a fix for the intermittent map-load crash: it was briefly defaulted on "
+    "for that, on an under-powered harness that only reached ~2 map loads per "
+    "run; at 3+ loads per run the crash reproduces with un-suppression verified "
+    "active in the log. See the crash notes before trying this again.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_snapshot_all_draws, false, "Skate 3",
                     "Record the draw stream on every recorded frame instead of 2 of every "
@@ -1160,6 +1184,14 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_log, false, "Skate 3",
                     "(see skate3_native_render_scene_perf_interval)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_publish_census, false, "Skate 3",
+                    "Diagnostic: report why BuildFrameScene did or did not publish a "
+                    "scene. Both of its early exits (no submit records at all; records "
+                    "but no screen-shaped perspective view) are silent by design, so a "
+                    "renderer that never takes over gives no clue which one is firing. "
+                    "One aggregate line every 300 builds.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_perf_interval, 600, "Skate 3",
                      "Frames between native-scene perf/stats log lines. Lower "
                      "values give finer windows for chasing transient frame-"
@@ -1220,6 +1252,15 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dyn_gap_fill, true, "Skate 3",
                     "missed publish frames (high-frame-rate body flicker)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace skate3::native_scene {
+
+// Top of the frontend push-state stack, refreshed every frame by
+// PortraitRttWindowActive(); kFrontEndStackEmpty when the stack is empty or the
+// frontend has not been read yet. Written on the render thread, read by the
+// boot macro's input worker - relaxed is enough, it gates a retry, not memory.
+std::atomic<uint32_t> g_fe_stack_top{kFrontEndStackEmpty};
+
+uint32_t FrontEndTopScreen() { return g_fe_stack_top.load(std::memory_order_relaxed); }
+
 namespace {
 
 // Verified guest structure offsets.
@@ -3255,6 +3296,183 @@ bool CasEditorActive(uint8_t* base) {
 //  - the CAS editor heartbeat is fresh.
 // Render thread only (statics). Every stack change logs its ids (capped)
 // so unknown portrait screens name themselves in the session log.
+// Frontend menu readout (skate3_fe_debug). Blind pad macros - "press down 40
+// times and hope" - land on challenge entries and soft-lock, which makes any
+// map-load test unreliable and slow. Two outputs, both change-gated:
+//
+//  1. The whole frontend push-state stack, one line per change, with each
+//     screen's id and its 5 record words. That alone lets a harness navigate
+//     closed-loop ("am I on the screen I wanted yet?") instead of pressing
+//     buttons blind.
+//  2. A CHANGE DIFF over a window of the frontend manager object. The cursor
+//     lives in the manager or a screen object, not in the 20-byte stack
+//     record, so rather than guess the offset this reports which words moved
+//     and from what to what. Step the cursor N rows and the selection field
+//     names itself: it is the one that steps N times by 1.
+//
+// Off by default. The window is read with the guarded loader, so an
+// unmapped or torn frontend is a skipped line rather than a fault.
+constexpr uint32_t kFeWindowWords = 512;  // 2 KiB from the manager base
+
+void LogFrontEndDebug(uint8_t* base, uint32_t mgr, const uint32_t* ids, uint32_t n,
+                      uint32_t beg) {
+  if (!REXCVAR_GET(skate3_fe_debug)) {
+    return;
+  }
+
+  // ---- 1. the stack, with every record ----
+  {
+    static uint64_t s_last_stack = 0;
+    uint64_t sig = 1469598103934665603ull;
+    char buf[512] = "";
+    int off = 0;
+    bool ok = true;
+    for (uint32_t i = 0; i < n && ok; ++i) {
+      uint32_t rec[5] = {};
+      for (uint32_t w = 0; w < 5; ++w) {
+        if (!GuestTryLoadU32(base, beg + i * 20 + w * 4, &rec[w])) {
+          ok = false;
+          break;
+        }
+        sig = (sig ^ rec[w]) * 1099511628211ull;
+      }
+      if (!ok) break;
+      if (off < int(sizeof(buf)) - 64) {
+        off += std::snprintf(buf + off, sizeof(buf) - off, "%s%u{%08X %08X %08X %08X}",
+                             i ? " " : "", ids[i], rec[1], rec[2], rec[3], rec[4]);
+      }
+    }
+    if (ok && sig != s_last_stack) {
+      s_last_stack = sig;
+      REXLOG_INFO("fe-debug: stack mgr={:08X} n={} [{}]", mgr, n, buf);
+    }
+  }
+
+  // ---- 2. the manager-window change diff ----
+  static uint32_t s_prev[kFeWindowWords] = {};
+  static bool s_have_prev = false;
+  static uint32_t s_prev_mgr = 0;
+  uint32_t cur[kFeWindowWords] = {};
+  for (uint32_t i = 0; i < kFeWindowWords; ++i) {
+    if (!GuestTryLoadU32(base, mgr + i * 4, &cur[i])) {
+      return;  // window not fully readable this frame; try again next time
+    }
+  }
+  if (!s_have_prev || s_prev_mgr != mgr) {
+    std::memcpy(s_prev, cur, sizeof(cur));
+    s_have_prev = true;
+    s_prev_mgr = mgr;
+    return;
+  }
+  // Per-frame counters and timers (the manager has at least one at +060, which
+  // steps every frame) drown everything else. A word that has already moved
+  // many times is one of those, not a cursor: a cursor moves once per button
+  // press, so a handful of times in a whole session. Retire the busy ones.
+  static uint8_t s_change_count[kFeWindowWords] = {};
+  constexpr uint8_t kBusyWord = 8;
+  char diff[512] = "";
+  int off = 0;
+  uint32_t changed = 0;
+  for (uint32_t i = 0; i < kFeWindowWords; ++i) {
+    if (cur[i] == s_prev[i]) {
+      continue;
+    }
+    if (s_change_count[i] < kBusyWord) {
+      ++s_change_count[i];
+    }
+    if (s_change_count[i] >= kBusyWord) {
+      continue;  // a counter/timer; it has nothing to say about the selection
+    }
+    ++changed;
+    if (off < int(sizeof(diff)) - 40) {
+      off += std::snprintf(diff + off, sizeof(diff) - off, "%s+%03X:%08X->%08X", off ? " " : "",
+                           i * 4, s_prev[i], cur[i]);
+    }
+  }
+  std::memcpy(s_prev, cur, sizeof(cur));
+  // A handful of moving words is a cursor or a timer; hundreds is the screen
+  // being rebuilt and tells us nothing about the selection.
+  if (changed == 0 || changed > 24) {
+    return;
+  }
+  REXLOG_INFO("fe-debug: mgr {:08X} changed {} word(s): {}", mgr, changed, diff);
+
+  // ---- 3. the SCREEN object, one level down ----
+  //
+  // The manager's first 2 KiB holds no cursor: stepping the Locations list 13
+  // rows moved only fade ramps and alpha (floats at +1D4/+1D8, 0xFF->0xF0->...
+  // at +1DC..+1E4). What it does hold is the current screen at +264 (and +254),
+  // and the cursor lives in there. Reported differently from the window above,
+  // because a cursor announces itself by HOW it moves rather than how often: a
+  // row step is a word changing by exactly one. Nothing else in a frontend
+  // object does that repeatedly, so no busy-word retirement is needed - and
+  // retirement would have hidden a 13-row walk anyway (it retires at 8).
+  const uint32_t screen_ptr_offset =
+      uint32_t(REXCVAR_GET(skate3_fe_debug_screen_offset));
+  if (screen_ptr_offset == 0 || screen_ptr_offset / 4 >= kFeWindowWords) {
+    return;
+  }
+  const uint32_t screen = cur[screen_ptr_offset / 4];
+  if (screen < 0x10000) {
+    return;
+  }
+  constexpr uint32_t kScreenWords = 256;
+  // A baseline PER ADDRESS, not one global one: mgr+264 alternates between two
+  // adjacent objects every frame (405F3520 / 405F3534), and re-baselining on
+  // each flip threw away the very comparison this exists to make - a 13-row
+  // walk showed up as one step.
+  constexpr uint32_t kScreenSlots = 4;
+  static uint32_t s_screen_addr[kScreenSlots] = {};
+  static uint32_t s_screen_prev[kScreenSlots][kScreenWords] = {};
+  uint32_t scur[kScreenWords] = {};
+  for (uint32_t i = 0; i < kScreenWords; ++i) {
+    if (!GuestTryLoadU32(base, screen + i * 4, &scur[i])) {
+      return;
+    }
+  }
+  uint32_t slot = kScreenSlots;
+  for (uint32_t i = 0; i < kScreenSlots; ++i) {
+    if (s_screen_addr[i] == screen) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot == kScreenSlots) {
+    for (uint32_t i = 0; i < kScreenSlots; ++i) {
+      if (s_screen_addr[i] == 0) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot == kScreenSlots) {
+      slot = 0;  // oldest wins; four is plenty for a menu stack
+    }
+    s_screen_addr[slot] = screen;
+    std::memcpy(s_screen_prev[slot], scur, sizeof(scur));
+    REXLOG_INFO("fe-debug: screen object {:08X} (mgr+{:03X}) watched", screen,
+                screen_ptr_offset);
+    return;
+  }
+  char sdiff[256] = "";
+  int soff = 0;
+  uint32_t steps = 0;
+  for (uint32_t i = 0; i < kScreenWords; ++i) {
+    const int64_t delta = int64_t(scur[i]) - int64_t(s_screen_prev[slot][i]);
+    if (delta != 1 && delta != -1) {
+      continue;
+    }
+    ++steps;
+    if (soff < int(sizeof(sdiff)) - 32) {
+      soff += std::snprintf(sdiff + soff, sizeof(sdiff) - soff, "%s+%03X:%u->%u",
+                            soff ? " " : "", i * 4, s_screen_prev[slot][i], scur[i]);
+    }
+  }
+  std::memcpy(s_screen_prev[slot], scur, sizeof(scur));
+  if (steps != 0 && steps <= 8) {
+    REXLOG_INFO("fe-debug: screen {:08X} stepped {}: {}", screen, steps, sdiff);
+  }
+}
+
 bool PortraitRttWindowActive() {
   if (CasEditorHeartbeatFresh()) {
     return true;
@@ -3296,6 +3514,15 @@ bool PortraitRttWindowActive() {
       unknown_screen = true;
     }
   }
+  // Publish the top of the stack for the boot macro. It presses `start` a
+  // fixed delay after the gameplay presence context and has no way to know the
+  // press was taken; on some maps the game is not accepting input yet, the
+  // press is swallowed, and the whole sequence then runs against a screen that
+  // never opened. This is the cheapest honest feedback available - the value is
+  // already computed here, every frame, for the render decision below.
+  g_fe_stack_top.store(n != 0 ? ids[n - 1] : kFrontEndStackEmpty,
+                       std::memory_order_relaxed);
+  LogFrontEndDebug(base, mgr, ids, n, beg);
   static uint64_t s_last_sig = 0;
   static int64_t s_change_ns = -1;
   static bool s_prev_unknown = false;
@@ -8300,6 +8527,38 @@ void WidenPublishedCamera(FrameScene& scene, float scale) {
   }
 }
 
+// Publish-gate census, behind skate3_native_render_scene_publish_census. One
+// aggregate line per 300 builds: the running mix of the two silent early exits
+// plus the shape of the LAST frame's views, which is what says whether the game
+// is submitting no scene views at all or submitting ones the perspective /
+// aspect test rejects.
+void CensusReport(uint32_t records, uint32_t views, uint32_t cam_ok, uint32_t persp,
+                  uint32_t aux, float persp_w, float m00, float m11,
+                  bool picked = false) {
+  static std::atomic<uint64_t> s_calls{0};
+  static std::atomic<uint64_t> s_no_records{0};
+  static std::atomic<uint64_t> s_no_view{0};
+  static std::atomic<uint64_t> s_picked{0};
+  if (picked) {
+    s_picked.fetch_add(1, std::memory_order_relaxed);
+  } else if (records == 0) {
+    s_no_records.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    s_no_view.fetch_add(1, std::memory_order_relaxed);
+  }
+  const uint64_t n = s_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n % 300 != 0) {
+    return;
+  }
+  REXLOG_INFO(
+      "native-scene: publish census {} builds [no_records={} no_view={} published={}] "
+      "last: records={} views={} cam_ok={} persp={} aux_rejected={} persp_w={:.3f} "
+      "m00={:.3f} m11={:.3f}",
+      n, s_no_records.load(std::memory_order_relaxed),
+      s_no_view.load(std::memory_order_relaxed), s_picked.load(std::memory_order_relaxed),
+      records, views, cam_ok, persp, aux, persp_w, m00, m11);
+}
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
@@ -8432,7 +8691,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_sky_seen_this_frame = false;
   const bool outline_edge_seen = g_outline_edge_seen;
   g_outline_edge_seen = false;
+  // Publish-gate census (skate3_native_render_scene_publish_census): when the
+  // renderer never takes over, the question is always WHICH of this function's
+  // two early exits is firing - the guest submitted nothing at all, or it
+  // submitted views none of which read as the screen-shaped perspective one.
+  // Nothing downstream logs that, because both exits are silent by design.
+  const bool census = REXCVAR_GET(skate3_native_render_scene_publish_census);
+  uint32_t census_views = 0, census_cam_ok = 0, census_persp = 0, census_aux = 0;
+  float census_persp_w = 0.0f, census_m00 = 0.0f, census_m11 = 0.0f;
   if (count == 0) {
+    if (census) {
+      CensusReport(0, 0, 0, 0, 0, 0.0f, 0.0f, 0.0f);
+    }
     return;
   }
 
@@ -8447,12 +8717,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     if (r.kind != 1 || r.c == 0) {
       continue;
     }
+    ++census_views;
     const uint32_t cam = REX_LOAD_U32(r.c + kViewCameraFromView);
     if (!GuestReadableApprox(base, cam)) {
       continue;
     }
+    ++census_cam_ok;
     const float persp_w = LoadGuestF32(base, cam + 0x60 + (2 * 4 + 3) * 4);
+    if (census && census_persp_w == 0.0f) {
+      census_persp_w = persp_w;
+    }
     if (persp_w == 1.0f) {
+      ++census_persp;
       // Screen-shaped views only. The skater-portrait render-to-texture
       // passes (team menu boxes, Import Skater card) submit their OWN
       // perspective SceneRenderView with a tall narrow projection; picking
@@ -8464,7 +8740,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       // raw projection; every real screen view is >= 4:3.
       const float m00 = std::fabs(LoadGuestF32(base, cam + 0x60 + 0 * 4));
       const float m11 = std::fabs(LoadGuestF32(base, cam + 0x60 + (1 * 4 + 1) * 4));
+      if (census && census_m00 == 0.0f) {
+        census_m00 = m00;
+        census_m11 = m11;
+      }
       if (!(m00 > 1e-6f) || m11 < m00 * 1.2f) {
+        ++census_aux;
         static std::atomic<uint64_t> s_aux_views{0};
         const uint64_t n = s_aux_views.fetch_add(1, std::memory_order_relaxed);
         if (n < 4 || (n & 255u) == 0) {
@@ -8481,7 +8762,15 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
   if (view == 0) {
+    if (census) {
+      CensusReport(uint32_t(count), census_views, census_cam_ok, census_persp,
+                   census_aux, census_persp_w, census_m00, census_m11);
+    }
     return;
+  }
+  if (census) {
+    CensusReport(uint32_t(count), census_views, census_cam_ok, census_persp, census_aux,
+                 census_persp_w, census_m00, census_m11, /*picked=*/true);
   }
 
   FrameScene scene;

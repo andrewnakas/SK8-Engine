@@ -242,15 +242,19 @@ include(cmake/CodegenTargets.cmake)
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
+    src/skate3_crash_report.cpp
     src/skate3_demo_path.cpp
     src/skate3_draw_distance.cpp
     src/skate3_fov.cpp
+    src/skate3_guest_trace.cpp
+    src/skate3_heap_check.cpp
     src/skate3_iso_installer.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
     src/native/skate3_native_lw.cpp
     src/native/skate3_native_palette.cpp
+    src/skate3_loader_overlay.cpp
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
@@ -260,6 +264,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_shader_disasm.cpp
     src/skate3_title_update_installer.cpp
     src/skate3_user_settings.cpp
+    src/skate3_warp.cpp
     src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )

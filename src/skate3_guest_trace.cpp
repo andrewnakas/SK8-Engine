@@ -1,0 +1,551 @@
+// Guest call trace - see the header for what it is for.
+//
+// The problem it solves: the game's own logic is machine-translated PowerPC,
+// one host function per guest function, named `sub_XXXXXXXX` and nothing else.
+// To find the code behind an observable event you either guess addresses or
+// watch what actually runs. Backtracing from the observable does not always
+// work either - the world files are opened on the file thread, seconds after
+// and one queue hop away from whatever asked for the world.
+//
+// So this records function ENTRIES, in two modes:
+//
+//   first  (default) the first call of each guest function since the trace was
+//          armed. Bounded by the number of distinct functions, so it spans a
+//          whole multi-second transition, and "what ran that had not run
+//          before" is exactly the question worth asking about a state change.
+//   ring   every call, into a circular buffer. Exact call order and repeat
+//          counts for a short window, once `first` has said where to look.
+//
+// The recording hook is a local edit to generated/skate3_init.h (which is
+// gitignored and regenerated away by codegen - the same arrangement as the
+// heap store watch). Disarmed, it costs two loads of a hot global and a
+// not-taken branch per guest call:
+//
+//   extern "C" uint32_t g_skate3_trace_gen;   // 0 = off, bumped on each arm
+//   extern "C" uint32_t g_skate3_trace_all;   // ring mode
+//   extern "C" void skate3_trace_enter(const char* fn, const PPCContext& ctx,
+//                                      uint8_t* base);
+//
+//   #define REX_FUNC_PROLOGUE()                                              \
+//     do {                                                                   \
+//       __builtin_assume(((size_t)base & 0x1F) == 0);                        \
+//       static uint32_t _skate3_seen = 0;                                    \
+//       const uint32_t _gen = g_skate3_trace_gen;                            \
+//       if (__builtin_expect((_gen != _skate3_seen) | g_skate3_trace_all,    \
+//                            0)) {                                           \
+//         _skate3_seen = _gen;                                               \
+//         if (_gen | g_skate3_trace_all)                                     \
+//           skate3_trace_enter(__func__, ctx, base);                         \
+//       }                                                                    \
+//     } while (0)
+//
+// The per-function `static uint32_t` is what makes `first` mode cheap: no set,
+// no hashing, one word per function. A generation counter rather than a bool
+// so re-arming does not have to clear 100k flags. The race on it is benign -
+// the worst case is one duplicate record.
+
+#include "skate3_guest_trace.h"
+
+#include "generated/skate3_init.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#if defined(__linux__)
+#include <execinfo.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+#include <rex/cvar.h>
+#include <rex/kernel/guest_presence.h>
+#include <rex/logging.h>
+#include <rex/logging/api.h>
+#include <rex/ppc/context.h>
+
+#include "skate3_demo_path.h"
+
+// The two globals the generated prologue tests, and the recorder it calls.
+// Defined here, declared by the local edit in generated/skate3_init.h.
+extern "C" {
+uint32_t g_skate3_trace_gen = 0;
+uint32_t g_skate3_trace_all = 0;
+void skate3_trace_enter(const char* fn, const PPCContext& ctx, uint8_t* base);
+}
+
+REXCVAR_DEFINE_BOOL(skate3_trace, false, "Skate 3",
+                    "Record guest function entries during a window and write them to "
+                    "<log_file>.trace. Off costs two global loads per guest call.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(skate3_trace_mode, "first", "Skate 3",
+                      "Trace mode: 'first' = the first call of each guest function since "
+                      "arming (bounded, spans seconds); 'ring' = every call into a "
+                      "circular buffer (exact order, short window).");
+REXCVAR_DEFINE_INT32(skate3_trace_capacity, 262144, "Skate 3",
+                     "Trace entries to reserve (24 bytes each).")
+    .range(1024, 16777216);
+REXCVAR_DEFINE_STRING(skate3_trace_arm, "macro-final", "Skate 3",
+                      "When to arm and dump: 'macro-final' = arm before the boot macro's "
+                      "last input, dump after the sequence completes; 'boot' = arm at "
+                      "startup, dump once gameplay is reached; 'gameplay' = arm when "
+                      "gameplay is reached; 'manual' = arm at startup, never auto-dump.");
+REXCVAR_DEFINE_INT32(skate3_trace_dump_delay_ms, 6000, "Skate 3",
+                     "Keep recording this long after the dump trigger before writing the "
+                     "trace out (the world starts streaming seconds after the confirm).")
+    .range(0, 120000);
+
+namespace skate3::guest_trace {
+namespace {
+
+// A world is named by a string ("DIST_sk8itbareclona"), so the argument that
+// carries the identity is a POINTER, and comparing pointer values between two
+// runs says nothing. Resolving them at DUMP time does not work either - the
+// dump is seconds later and the memory has moved on. So each pointer-shaped
+// argument is resolved to text as it is recorded, and the world name then
+// appears in the trace right next to the function that received it.
+constexpr size_t kStringPreview = 28;
+
+struct Entry {
+  const char* fn;   // "__imp__sub_82990768" - a static string in the generated code
+  uint32_t r3;
+  uint32_t r4;
+  uint32_t r5;
+  uint64_t stamp;
+  uint32_t thread;
+  // Text at r3/r4/r5 when they point at one, empty otherwise.
+  char text[3][kStringPreview];
+};
+
+Entry* g_entries = nullptr;
+size_t g_capacity = 0;
+bool g_ring = false;
+std::atomic<uint64_t> g_next{0};
+std::atomic<bool> g_dumped{false};
+std::atomic<int> g_full_warned{0};
+uint32_t g_generation = 0;
+
+std::mutex g_threads_mutex;
+std::vector<std::string> g_threads;
+thread_local int tl_thread = -1;
+
+inline uint64_t Stamp() {
+#if defined(__clang__) && (defined(__x86_64__) || defined(__aarch64__))
+  return __builtin_readcyclecounter();
+#elif defined(__x86_64__)
+  return __builtin_ia32_rdtsc();
+#else
+  return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+uint64_t NowMs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+// Interned once per thread; the index goes in every entry so a dump can be
+// filtered down to the thread that matters (the transition runs on the main
+// thread, while streaming and audio produce most of the volume).
+int ThreadIndex() {
+  if (tl_thread >= 0) {
+    return tl_thread;
+  }
+  char name[20] = {0};
+#if defined(__linux__)
+  if (prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) != 0) {
+    name[0] = 0;
+  }
+  const long tid = syscall(SYS_gettid);
+#else
+  const long tid = 0;
+#endif
+  char label[48];
+  std::snprintf(label, sizeof(label), "%s/%ld", name[0] ? name : "?", tid);
+  std::lock_guard<std::mutex> lock(g_threads_mutex);
+  g_threads.emplace_back(label);
+  tl_thread = static_cast<int>(g_threads.size() - 1);
+  return tl_thread;
+}
+
+std::string ThreadName(uint32_t index) {
+  std::lock_guard<std::mutex> lock(g_threads_mutex);
+  return index < g_threads.size() ? g_threads[index] : std::string("?");
+}
+
+// Guest regions worth dereferencing. Deliberately NOT the whole 4 GiB view:
+// the runtime arms fault recovery over parts of it, and a speculative read of
+// an arbitrary address is how a diagnostic turns into the crash it was meant
+// to explain. These three cover the heap, the low heap and the XEX image,
+// which is where every string lives (same regions as scripts/memfind.py).
+bool ReadableGuest(uint32_t address) {
+  return (address >= 0x00010000 && address < 0x40000000) ||
+         (address >= 0x40000000 && address < 0x80000000) ||
+         (address >= 0x82000000 && address < 0x84000000);
+}
+
+// Text at `address`, or "" if it does not look like a string. Requires the
+// whole preview to be printable and NUL-terminated within it, so a struct that
+// happens to start with a letter does not read as text.
+void ReadGuestString(const uint8_t* base, uint32_t address, char* out, size_t cap) {
+  out[0] = 0;
+  if (base == nullptr || !ReadableGuest(address)) {
+    return;
+  }
+  const char* src = reinterpret_cast<const char*>(base + address);
+  size_t n = 0;
+  while (n < cap - 1) {
+    const char c = src[n];
+    if (c == 0) {
+      break;
+    }
+    if (c < 0x20 || c > 0x7E) {
+      return;  // not text
+    }
+    ++n;
+  }
+  // One or two printable bytes is noise, not a name.
+  if (n < 4) {
+    return;
+  }
+  std::memcpy(out, src, n);
+  out[n] = 0;
+}
+
+// "__imp__sub_82990768" / "sub_82990768" -> 0x82990768, or 0.
+uint32_t GuestAddressOfName(const char* fn) {
+  if (fn == nullptr) {
+    return 0;
+  }
+  const char* p = std::strstr(fn, "sub_");
+  if (p == nullptr) {
+    return 0;
+  }
+  return uint32_t(std::strtoul(p + 4, nullptr, 16));
+}
+
+// ---- symbolization ---------------------------------------------------------
+
+struct HostEntry {
+  uintptr_t host;
+  uint32_t guest;
+};
+
+std::vector<uint32_t> g_guest_sorted;
+std::vector<HostEntry> g_host_sorted;
+std::once_flag g_tables_once;
+
+// A generated function body is large but not unbounded; refuse to attribute a
+// host pc further than this past a function entry, so runtime and app frames
+// resolve to "not guest" instead of to a plausible-looking wrong name.
+constexpr uintptr_t kMaxFunctionBytes = 256 * 1024;
+
+void BuildTables() {
+  const PPCFuncMapping* map = skate3_PPCImageConfig.func_mappings;
+  if (map == nullptr) {
+    return;
+  }
+  size_t count = 0;
+  while (map[count].guest != 0) {
+    ++count;
+  }
+  g_guest_sorted.reserve(count);
+  g_host_sorted.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    g_guest_sorted.push_back(uint32_t(map[i].guest));
+    if (map[i].host != nullptr) {
+      g_host_sorted.push_back({reinterpret_cast<uintptr_t>(map[i].host), uint32_t(map[i].guest)});
+    }
+  }
+  std::sort(g_guest_sorted.begin(), g_guest_sorted.end());
+  std::sort(g_host_sorted.begin(), g_host_sorted.end(),
+            [](const HostEntry& a, const HostEntry& b) { return a.host < b.host; });
+  REXLOG_INFO("skate3 trace: symbol table built - {} guest functions", count);
+}
+
+void EnsureTables() { std::call_once(g_tables_once, BuildTables); }
+
+// ---- dump ------------------------------------------------------------------
+
+std::string TracePath() {
+  const std::string& log_file = REXCVAR_GET(log_file);
+  return log_file.empty() ? std::string("skate3.trace") : log_file + ".trace";
+}
+
+}  // namespace
+
+uint32_t GuestFunctionAt(uint32_t guest_address, uint32_t* offset) {
+  EnsureTables();
+  if (g_guest_sorted.empty()) {
+    return 0;
+  }
+  auto it = std::upper_bound(g_guest_sorted.begin(), g_guest_sorted.end(), guest_address);
+  if (it == g_guest_sorted.begin()) {
+    return 0;
+  }
+  --it;
+  if (guest_address - *it > kMaxFunctionBytes) {
+    return 0;
+  }
+  if (offset != nullptr) {
+    *offset = guest_address - *it;
+  }
+  return *it;
+}
+
+uint32_t GuestFunctionForHostPc(const void* pc, uint32_t* offset) {
+  EnsureTables();
+  if (g_host_sorted.empty()) {
+    return 0;
+  }
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(pc);
+  auto it = std::upper_bound(g_host_sorted.begin(), g_host_sorted.end(), addr,
+                             [](uintptr_t value, const HostEntry& e) { return value < e.host; });
+  if (it == g_host_sorted.begin()) {
+    return 0;
+  }
+  --it;
+  if (addr - it->host > kMaxFunctionBytes) {
+    return 0;
+  }
+  if (offset != nullptr) {
+    *offset = uint32_t(addr - it->host);
+  }
+  return it->guest;
+}
+
+void LogHostBacktrace(const char* tag) {
+#if defined(__linux__)
+  void* frames[24];
+  const int n = ::backtrace(frames, 24);
+  for (int i = 0; i < n; ++i) {
+    uint32_t off = 0;
+    const uint32_t guest = GuestFunctionForHostPc(frames[i], &off);
+    if (guest != 0) {
+      REXLOG_INFO("skate3 trace: {} #{} sub_{:08X}+0x{:X}", tag, i, guest, off);
+    } else {
+      REXLOG_INFO("skate3 trace: {} #{} host {}", tag, i, frames[i]);
+    }
+  }
+#else
+  (void)tag;
+#endif
+}
+
+void Arm(const char* reason) {
+  if (g_entries == nullptr) {
+    return;
+  }
+  g_next.store(0, std::memory_order_relaxed);
+  g_dumped.store(false, std::memory_order_relaxed);
+  ++g_generation;
+  if (g_ring) {
+    __atomic_store_n(&g_skate3_trace_all, 1u, __ATOMIC_RELEASE);
+  }
+  // Published last: this is what the prologue tests.
+  __atomic_store_n(&g_skate3_trace_gen, g_generation, __ATOMIC_RELEASE);
+  REXLOG_INFO("skate3 trace: ARMED ({} mode, {} entries) - {}", g_ring ? "ring" : "first",
+              g_capacity, reason);
+}
+
+void Dump(const char* reason) {
+  if (g_entries == nullptr || g_dumped.exchange(true, std::memory_order_relaxed)) {
+    return;
+  }
+  __atomic_store_n(&g_skate3_trace_gen, 0u, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_skate3_trace_all, 0u, __ATOMIC_RELEASE);
+  // Let any recorder already inside skate3_trace_enter finish its stores.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  const uint64_t produced = g_next.load(std::memory_order_relaxed);
+  const uint64_t first = (g_ring && produced > g_capacity) ? produced - g_capacity : 0;
+  const uint64_t last = g_ring ? produced : std::min<uint64_t>(produced, g_capacity);
+
+  const std::string path = TracePath();
+  std::FILE* out = std::fopen(path.c_str(), "w");
+  if (out == nullptr) {
+    REXLOG_ERROR("skate3 trace: cannot write '{}'", path);
+    return;
+  }
+  std::fprintf(out,
+               "# skate3 guest trace: mode=%s reason=%s recorded=%llu written=%llu "
+               "capacity=%zu%s\n",
+               g_ring ? "ring" : "first", reason, static_cast<unsigned long long>(produced),
+               static_cast<unsigned long long>(last - first), g_capacity,
+               (!g_ring && produced > g_capacity) ? " TRUNCATED" : "");
+  std::fprintf(out, "# seq\tdcycles\tthread\tfunction\tr3\tr4\tr5\ttext\n");
+
+  const uint64_t base_stamp = (last > first) ? g_entries[first % g_capacity].stamp : 0;
+  for (uint64_t i = first; i < last; ++i) {
+    const Entry& e = g_entries[i % g_capacity];
+    if (e.fn == nullptr) {
+      continue;
+    }
+    // Most entries are `sub_XXXXXXXX`, but the recompiler also emits named
+    // helpers (__savegprlr_26 and friends, called by nearly every function).
+    // Printing those as sub_00000000 would read as a real address.
+    char name[64];
+    const uint32_t guest = GuestAddressOfName(e.fn);
+    if (guest != 0) {
+      std::snprintf(name, sizeof(name), "sub_%08X", guest);
+    } else {
+      const char* raw = e.fn;
+      if (std::strncmp(raw, "__imp__", 7) == 0) {
+        raw += 7;
+      }
+      std::snprintf(name, sizeof(name), "%s", raw);
+    }
+    // Strings go in one trailing column, tagged with the register they came
+    // from, so the format stays one line per entry and greppable.
+    char text[3 * (kStringPreview + 8)] = {0};
+    size_t used = 0;
+    for (int r = 0; r < 3; ++r) {
+      if (e.text[r][0] == 0) {
+        continue;
+      }
+      used += size_t(std::snprintf(text + used, sizeof(text) - used, "%sr%d=\"%s\"",
+                                   used ? " " : "", r + 3, e.text[r]));
+      if (used >= sizeof(text)) {
+        break;
+      }
+    }
+    std::fprintf(out, "%llu\t%lld\t%s\t%s\t%08X\t%08X\t%08X\t%s\n",
+                 static_cast<unsigned long long>(i - first),
+                 static_cast<long long>(e.stamp - base_stamp), ThreadName(e.thread).c_str(), name,
+                 e.r3, e.r4, e.r5, text);
+  }
+  std::fclose(out);
+  REXLOG_INFO("skate3 trace: DUMPED {} entries to '{}' - {}", last - first, path, reason);
+  rex::FlushLogging();
+}
+
+namespace {
+
+// The controller runs on its own host thread and only ever reads milestones
+// that already exist: macro progress from the demo path, and the guest's own
+// presence context. Nothing here touches guest memory.
+void ControllerMain() {
+  const std::string mode = REXCVAR_GET(skate3_trace_arm);
+  const uint64_t delay_ms = uint64_t(REXCVAR_GET(skate3_trace_dump_delay_ms));
+  bool armed = false;
+  bool triggered = false;
+  uint64_t dump_at = 0;
+
+  if (mode == "boot" || mode == "manual") {
+    Arm(mode.c_str());
+    armed = true;
+  }
+
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const bool in_gameplay = rex::kernel::guest_presence::GameplayContextValue() == 1;
+    const int32_t injected = skate3::demo_path::GameplayInputsInjected();
+    const int32_t total = skate3::demo_path::GameplayInputsTotal();
+
+    if (!armed) {
+      if (mode == "macro-final") {
+        // One input before the end: the last press is the confirm that starts
+        // the load, so this opens the window just ahead of it.
+        if (total > 0 && injected >= total - 1) {
+          Arm("macro about to confirm");
+          armed = true;
+        }
+      } else if (mode == "gameplay") {
+        if (in_gameplay) {
+          Arm("gameplay reached");
+          armed = true;
+        }
+      }
+      continue;
+    }
+
+    if (!triggered) {
+      if (mode == "macro-final" && skate3::demo_path::GameplayInputSequenceComplete()) {
+        triggered = true;
+      } else if (mode == "boot" && in_gameplay) {
+        triggered = true;
+      } else if (mode == "gameplay") {
+        triggered = true;
+      }
+      if (triggered) {
+        dump_at = NowMs() + delay_ms;
+      }
+      continue;
+    }
+
+    // A full buffer in `first` mode is not fatal - the entries kept are the
+    // earliest, which is the interesting end - but a silent truncation would
+    // be read as "nothing else ran".
+    if (!g_ring && g_next.load(std::memory_order_relaxed) > g_capacity &&
+        g_full_warned.fetch_add(1) == 0) {
+      REXLOG_WARN("skate3 trace: buffer full at {} entries - raise skate3_trace_capacity",
+                  g_capacity);
+    }
+    if (NowMs() >= dump_at) {
+      Dump("controller");
+      return;
+    }
+  }
+}
+
+}  // namespace
+
+void Install() {
+  if (!REXCVAR_GET(skate3_trace)) {
+    return;
+  }
+  g_ring = REXCVAR_GET(skate3_trace_mode) == "ring";
+  g_capacity = size_t(REXCVAR_GET(skate3_trace_capacity));
+  // Allocated once, before the guest boots, and never resized: the recorder
+  // runs on guest threads with no lock, so the buffer must not move.
+  g_entries = static_cast<Entry*>(std::calloc(g_capacity, sizeof(Entry)));
+  if (g_entries == nullptr) {
+    g_capacity = 0;
+    REXLOG_ERROR("skate3 trace: could not allocate {} entries", REXCVAR_GET(skate3_trace_capacity));
+    return;
+  }
+  EnsureTables();
+  REXLOG_INFO("skate3 trace: enabled ({} mode, {} entries, arm={}) -> {}",
+              g_ring ? "ring" : "first", g_capacity, REXCVAR_GET(skate3_trace_arm), TracePath());
+  std::thread(ControllerMain).detach();
+}
+
+}  // namespace skate3::guest_trace
+
+// Recording hook, called from REX_FUNC_PROLOGUE in generated/skate3_init.h.
+// Only ever reached while armed.
+extern "C" {
+
+void skate3_trace_enter(const char* fn, const PPCContext& ctx, uint8_t* base) {
+  using namespace skate3::guest_trace;
+  const size_t capacity = g_capacity;
+  if (capacity == 0) {
+    return;
+  }
+  const uint64_t slot = g_next.fetch_add(1, std::memory_order_relaxed);
+  if (!g_ring && slot >= capacity) {
+    return;
+  }
+  Entry& e = g_entries[slot % capacity];
+  e.fn = fn;
+  e.r3 = ctx.r3.u32;
+  e.r4 = ctx.r4.u32;
+  e.r5 = ctx.r5.u32;
+  e.stamp = Stamp();
+  e.thread = uint32_t(ThreadIndex());
+  // Resolved here rather than at dump time: by then the pointer is stale.
+  ReadGuestString(base, e.r3, e.text[0], kStringPreview);
+  ReadGuestString(base, e.r4, e.text[1], kStringPreview);
+  ReadGuestString(base, e.r5, e.text[2], kStringPreview);
+}
+
+}  // extern "C"

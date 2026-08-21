@@ -1,3 +1,4 @@
+#include "skate3_loader_overlay.h"
 #include "skate3_native_render.h"
 
 #include "native/skate3_native_diag.h"
@@ -5,6 +6,7 @@
 #include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_palette.h"
+#include "skate3_crash_report.h"
 #include "skate3_native_scene.h"
 
 #include "generated/skate3_init.h"
@@ -14,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -35,6 +38,16 @@ REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
+REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
+                    "Diagnostic: watch the guest D3D command-ring write pointer at every "
+                    "deferred render-state flush (D3D::SetPending_RenderStates). The pointer at "
+                    "device+0x30 is read-modify-written by guest code with no null check, no "
+                    "range check and no synchronization. NOTE device+0x34 is a MOVING WATERMARK, "
+                    "not the end of the buffer - the guest legitimately writes past it, so do "
+                    "not treat that as corruption (an earlier version of this check did, and "
+                    "fired constantly on healthy sessions). Logs an implausible pointer, and "
+                    "whether a second thread ever touches the ring. Two loads per flush.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
                       "Pace the guest render loop to this frame rate (0 = uncapped). The "
                       "guest produces frames at irregular 2-9 ms intervals; the display "
@@ -80,6 +93,83 @@ uint64_t g_frame_index = 0;
 std::atomic<bool> g_announced{false};
 
 bool Enabled() { return REXCVAR_GET(skate3_native_render); }
+
+// ---- Guest D3D command-ring watch -----------------------------------------
+// D3D::SetPending_RenderStates (sub_82B83C48) sits on the path where one face
+// of the map-load crash landed: the guest walks the command ring from
+// device+0x30 and writes PM4 type-0 packets through it with no null check, no
+// range check and no synchronization. The crash itself turned out to be
+// emulated-draw suppression corrupting guest state across a load (see
+// skate3_native_render_scene_menu_unsuppress); this watch is kept because it is
+// the only visibility into the ring if it ever misbehaves again.
+//
+// The loads here are raw REX_LOAD_U32 rather than the guarded GuestTryLoadU32:
+// the guest performs the identical loads three instructions later, so a fault
+// here is a fault that was going to happen anyway - only now the crash reporter
+// describes it. Guarding would cost a sigsetjmp per state flush, and this runs
+// several times per Clear.
+std::atomic<uint32_t> g_ring_dev{0};
+std::atomic<uint32_t> g_ring_prev_write{0};
+std::atomic<uint32_t> g_ring_prev_end{0};
+std::atomic<uint64_t> g_ring_prev_tid{0};
+std::atomic<bool> g_ring_first_logged{false};
+std::atomic<bool> g_ring_multi_thread_logged{false};
+std::atomic<int64_t> g_ring_last_bad_ns{0};
+
+void CheckD3DRing(uint8_t* base, uint32_t dev, uint64_t mask, uint32_t bank, uint32_t shadow) {
+  if (!REXCVAR_GET(skate3_d3d_ring_check)) {
+    return;
+  }
+  const uint64_t tid =
+      uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+  if (dev < 0x10000) {
+    REXLOG_ERROR("d3d-ring: DEVICE pointer implausible dev={:08X} mask={:016X} bank={} tid={:X}",
+                 dev, mask, bank, tid);
+    return;
+  }
+  const uint32_t write = REX_LOAD_U32(dev + 48);
+  const uint32_t end = REX_LOAD_U32(dev + 52);
+  const uint32_t prev_write = g_ring_prev_write.exchange(write, std::memory_order_relaxed);
+  const uint32_t prev_end = g_ring_prev_end.exchange(end, std::memory_order_relaxed);
+  const uint64_t prev_tid = g_ring_prev_tid.exchange(tid, std::memory_order_relaxed);
+  const uint32_t prev_dev = g_ring_dev.exchange(dev, std::memory_order_relaxed);
+
+  if (!g_ring_first_logged.exchange(true, std::memory_order_relaxed)) {
+    REXLOG_INFO("d3d-ring: first flush dev={:08X} write={:08X} end={:08X} bank={} tid={:X}", dev,
+                write, end, bank, tid);
+  }
+
+  // The one fact that decides "two guest threads share the ring" versus "one
+  // thread computed a bad pointer". Once is enough - it is a property of the
+  // session, not of the moment.
+  if (prev_tid != 0 && prev_tid != tid && prev_dev == dev &&
+      !g_ring_multi_thread_logged.exchange(true, std::memory_order_relaxed)) {
+    REXLOG_WARN(
+        "d3d-ring: SECOND THREAD on device {:08X} - this tid={:X} previous tid={:X} "
+        "(write={:08X} prev_write={:08X})",
+        dev, tid, prev_tid, write, prev_write);
+  }
+
+  // Only genuinely impossible values. `write > end` is NOT one of them: 0x34 is
+  // a watermark the guest crosses in normal operation.
+  const bool bad = write < 0x10000 || end < 0x10000 || (write & 3u) != 0 || (end & 3u) != 0;
+  if (!bad) {
+    return;
+  }
+  // Rate-limited: once the ring is wrong every subsequent flush is wrong too.
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  const int64_t last = g_ring_last_bad_ns.load(std::memory_order_relaxed);
+  if (last != 0 && now_ns - last < 1'000'000'000) {
+    return;
+  }
+  g_ring_last_bad_ns.store(now_ns, std::memory_order_relaxed);
+  REXLOG_ERROR(
+      "d3d-ring: CORRUPT dev={:08X} write={:08X} end={:08X} | prev dev={:08X} write={:08X} "
+      "end={:08X} tid={:X} | mask={:016X} bank={} shadow={:08X} tid={:X}",
+      dev, write, end, prev_dev, prev_write, prev_end, prev_tid, mask, bank, shadow, tid);
+}
 
 
 void OnRenderMesh(uint8_t* base, uint32_t mesh_context, uint32_t vertex_program_state,
@@ -432,6 +522,21 @@ extern "C" REX_FUNC(sub_827FAF50) {
 
 // Guest D3D Swap: frame boundary.
 extern "C" REX_FUNC(sub_82B82E08) {
+  // Install point for the guest fault reporter: this runs on the guest render
+  // thread every frame whatever else is switched off, and by the first Swap the
+  // runtime's own fault handlers (MMIO write watches, the guarded-read
+  // recovery armed by the capture hooks earlier in the same frame) have all
+  // registered - so the reporter lands LAST on the chain and they keep first
+  // refusal. Idempotent; not gated on Enabled() so a --no-skate3_native_render
+  // session still reports its crashes.
+  skate3::crash_report::EnsureInstalled(base);
+  // Liveness for the hang watchdog: this is the guest's own frame boundary, so
+  // it stops exactly when the game stops producing frames.
+  skate3::crash_report::Heartbeat();
+  // Publish the guest base for the level picker, which reads the frontend's
+  // selection cursor so it can walk menus with feedback instead of pressing
+  // 'down' a fixed number of times.
+  skate3::SetLoaderGuestBase(base);
   if (skate3::native_render::Enabled()) {
     skate3::native_render::OnFrameEnd(base);
   }
@@ -966,6 +1071,8 @@ extern "C" REX_FUNC(sub_82B83C48) {
   if (skate3::native_render::Enabled()) {
     skate3::native_scene::OnRenderStateUpload(ctx.r4.u64, ctx.r5.u32, ctx.r6.u32);
   }
+  // Last look at the ring before the guest walks it; see CheckD3DRing.
+  skate3::native_render::CheckD3DRing(base, ctx.r3.u32, ctx.r4.u64, ctx.r5.u32, ctx.r6.u32);
   __imp__sub_82B83C48(ctx, base);
 }
 

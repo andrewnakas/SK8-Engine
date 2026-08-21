@@ -5159,6 +5159,14 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   {
     static bool s_unsup_forced = false;
     static bool s_unsup_saved = false;
+    // The WHOLE menu context, not just the loading screen. Narrowing this to
+    // `in_menus && !pause_native` (the loading state alone) was tried and
+    // MEASURED TO NOT FIX THE CRASH: 2/4 runs still crashed, against 0/3 for
+    // the full window and 3/4 for no un-suppression at all. So the corruption
+    // is not confined to the loading screen - suppression has to be off from
+    // the moment the menu comes up (before the map switch is even chosen)
+    // through to gameplay resuming. Do not re-narrow this without re-running
+    // that arm.
     const bool want =
         in_menus && REXCVAR_GET(skate3_native_render_scene_menu_unsuppress);
     if (want && !s_unsup_forced) {
@@ -5169,6 +5177,13 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
             "native-scene: menu context - emulated draw suppression OFF "
             "(one-shot render-to-texture passes execute; restored on "
             "gameplay)");
+      } else {
+        // Worth saying out loud: a silent no-op here reads exactly like the
+        // un-suppression having been applied, which cost a whole ambiguous
+        // bisect arm.
+        REXLOG_INFO(
+            "native-scene: menu context - un-suppression requested but "
+            "suppression was already off; nothing to do");
       }
       s_unsup_forced = true;
     } else if (!want && s_unsup_forced) {
