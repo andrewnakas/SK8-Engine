@@ -7,6 +7,23 @@ This is an experimental preview rather than a finished standalone game engine.
   and HDR pipelines are created from the committed offline SPIR-V, and owned
   `.skate` maps load - but sustained gameplay has not been signed off. macOS
   still inherits upstream support without any Custom Engine Layer validation.
+- A correct binary cannot be generated from a clean checkout on any platform.
+  The runtime applies TU3 at load time, so the generated code must contain the
+  TU3 function roots, but codegen can only consume a whole image:
+  `patched_file_path` replaces it, and `patch_file_path` - which would apply
+  the patch while keeping the base layout - is parsed but unimplemented
+  ("XexPatcher not available"). Stable-base codegen therefore registers 45 of
+  1,727 roots and dies on the first TU3-only call, while the patched image
+  reaches 1727/1727 but discards every boundary override in
+  `skate3_functions.toml`. This is why `AGENTS.md` requires building from a
+  previously validated `generated/` tree. Wiring XexPatcher into codegen would
+  remove the requirement.
+- Built from the patched image (the only configuration that boots), the game is
+  playable but takes an intermittent SIGSEGV in guest code at `sub_82B7C500`,
+  storing through a pointer into the `0xA0000000` physical alias whose page was
+  never allocated. The runtime's own access-violation recovery declines it, so
+  the pointer is bad rather than merely unmapped - consistent with the missing
+  base-image boundary overrides.
 - Linux builds currently cannot use the stable-base codegen path that the layer
   is designed around. `generate-all` aborts inside the recompiler with a heap
   buffer overflow in `BuilderContext::emit_function_call`: a `CallTarget` holds
