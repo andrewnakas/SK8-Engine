@@ -1,6 +1,7 @@
 #include "skate3_app_common.h"
 
 #include "skate3_demo_path.h"
+#include "skate3_dlc_trace.h"
 #include "skate3_fov.h"
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
@@ -839,6 +840,8 @@ void Skate3BaseApp::OnPostSetup() {
   auto* dispatcher = runtime()->function_dispatcher();
   skate3::native_render::Install();
   skate3::demo_path::InstallHooks(dispatcher);
+  // Diagnostic only, and gated on its own cvar inside.
+  skate3::dlc_trace::InstallHooks(dispatcher);
   // Guest call trace: no-op unless --skate3_trace=true. Installed after the
   // demo path because its controller reads that macro's progress milestones.
   skate3::guest_trace::Install();
