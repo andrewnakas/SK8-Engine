@@ -4668,6 +4668,35 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   g_prewarm_out.push_back(std::move(res));
 }
 
+// Everything held from the map being left. Arena addresses are REUSED across
+// map loads, so anything keyed by guest address outlives its meaning the moment
+// a new world streams into the same arena.
+//
+// Called on entering the loading presence context, and by the induced map
+// change (skate3_warp_request_world), which never enters that context. Missing
+// it there was visible as texture decodes whose fetch words were plainly
+// file-path text - the renderer reading descriptors out of memory the guest had
+// already handed to the streamer - and as a world that arrived with untextured
+// ground and missing props.
+void DropOutgoingMapState() {
+  // Let the next load's registrations re-queue meshes (and re-stage textures)
+  // at reused addresses, and drop the cached item cores built from them.
+  ClearItemCache();
+  // Off-screen retention holds guest-address-keyed copies too.
+  g_retained_clear.store(true, std::memory_order_relaxed);
+  // The static-caster cache holds world-positioned records from the OUTGOING
+  // map; different maps share coordinate ranges, so stale records whose meshes
+  // survive the transition would keep casting (an entire arriving area sat
+  // under the previous map's building shadows). Invalidate the sun map with it.
+  g_r.static_casters.clear();
+  g_r.nsm_dirty = true;
+  g_r.static_sun_valid = false;
+  g_r.nsm_built_radius = 0.0f;
+  std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+  g_prewarm_seen.clear();
+  g_prewarm_tex_seen.clear();
+}
+
 void PrewarmWorkerLoop() {
 #if defined(_WIN32)
   // Below-normal priority: the workers flood in exactly when the guest's
@@ -5283,24 +5312,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
           "native-scene: menus/loading - {} (presence context)",
           loading_native ? "rendering the loading screen NATIVELY"
                          : "yielding to emulated output");
-      // Arena addresses are reused across map loads: let the next load's
-      // registrations re-queue meshes (and re-stage textures) at reused
-      // addresses, and drop the cached item cores built from them.
-      ClearItemCache();
-      // Off-screen retention holds guest-address-keyed copies too.
-      g_retained_clear.store(true, std::memory_order_relaxed);
-      // The static-caster cache holds world-positioned records from the
-      // OUTGOING map; different maps share coordinate ranges, so stale
-      // records whose meshes survive the transition would keep casting
-      // (an entire arriving area sat under the previous map's building
-      // shadows). Invalidate the sun map with it.
-      g_r.static_casters.clear();
-      g_r.nsm_dirty = true;
-      g_r.static_sun_valid = false;
-      g_r.nsm_built_radius = 0.0f;
-      std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-      g_prewarm_seen.clear();
-      g_prewarm_tex_seen.clear();
+      DropOutgoingMapState();
     } else {
       size_t queued = 0;
       {
@@ -11617,6 +11629,22 @@ void Install() {
 // from the boot takeover and the new world is rendered by nobody even though it
 // streamed and prewarmed completely. Measured before this existed: 3565 of 3988
 // meshes decoded, "0 still queued", and a black screen.
+// The other half: drop the outgoing map's state at the START of an induced
+// change, the way entering the loading context does. Arming and resetting have
+// to be separate here - the presence route can do both at once because g_scene
+// stops publishing behind the loading screen, whereas an induced change keeps
+// rendering gameplay throughout, so an arm taken at the start is spent on the
+// teardown's own generation bump.
+void BeginInducedMapChange() {
+  REXLOG_INFO("native-scene: dropping the outgoing map's cached state for an induced change");
+  DropOutgoingMapState();
+  // NOT armed here, twice measured: the outgoing world is still fully resident
+  // at this point, so the very next frame is a big fresh scene and the arm is
+  // spent on it 8 ms later - "taking over natively (787 items)" while the new
+  // world had not started loading. The arm belongs at the far end of the
+  // change, where the scene being built is the new world's.
+}
+
 void ArmTakeoverForInducedLoad() {
   g_warmup_armed.store(true, std::memory_order_relaxed);
   {
@@ -11636,6 +11664,7 @@ void Install() {}
 bool SceneFailed() { return false; }
 void ResetSceneFailure() {}
 void ArmTakeoverForInducedLoad() {}
+void BeginInducedMapChange() {}
 
 }  // namespace skate3::native_scene
 

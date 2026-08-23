@@ -113,9 +113,11 @@ REXCVAR_DEFINE_INT32(skate3_warp_trace_loader_limit, 4, "Skate 3",
                      "few, so raise this to also capture the menu confirm's load - the one "
                      "that actually works, and therefore the one worth copying.")
     .range(1, 200);
-REXCVAR_DEFINE_INT32(skate3_warp_induce_delay_frames, 120, "Skate 3",
-                     "Frames of gameplay to wait before asking for the world, so the stock "
-                     "world has finished settling first.")
+REXCVAR_DEFINE_INT32(skate3_warp_induce_delay_frames, 0, "Skate 3",
+                     "Frames of gameplay to wait before asking for the world. Zero: the "
+                     "change goes as soon as presence says gameplay, which is as early as "
+                     "the worker and the session are both known. The wait was insurance "
+                     "against a half-settled stock world and costs 3.3 s of a 22 s run.")
     .range(0, 100000);
 REXCVAR_DEFINE_BOOL(skate3_warp_request_world, false, "Skate 3",
                     "ASK for the world instead of loading it. The game keeps a global pair "
@@ -1455,6 +1457,13 @@ void MaybeRequestWorld(PPCContext& ctx, uint8_t* base) {
   const uint32_t vec = (ctx.r1.u32 - 0x900) & ~uint32_t(0xF);
   std::memcpy(base + vec, base + node_obj + uint32_t(REXCVAR_GET(skate3_warp_spawn_offset)),
               16);
+  // Drop the outgoing map's cached state FIRST, the way entering the loading
+  // presence context does. This route never enters that context, and without
+  // the drop the renderer keeps item cores and prewarm records keyed by guest
+  // arena addresses the new world is about to reuse - which showed up as
+  // texture decodes whose fetch words were file-path TEXT, and as a world that
+  // arrived with untextured ground and no ramp.
+  skate3::native_scene::BeginInducedMapChange();
   REXLOG_INFO("skate3 warp switch: kicking sub_828A3928(mgr=0x{:08X}, vec=0x{:08X} "
               "[{:08X} {:08X} {:08X} {:08X}])",
               session, vec, LoadGuestU32BE(base, vec), LoadGuestU32BE(base, vec + 4),
@@ -1515,12 +1524,12 @@ void AdvanceWorldTask(PPCContext& ctx, uint8_t* base) {
   // manager. Handing either the other's argument is a wild pointer.
   const uint32_t arg = boot ? g_switch_arg.load(std::memory_order_relaxed) : session;
   if (step >= count) {
-    // Done. The takeover gate re-arms on a LOADING presence context, which the
-    // menu route passes through and this one never does - measured: not one
-    // presence line for the whole change - so arm it here, at the far end,
-    // where the scene that gets built is the NEW world's. Arming any earlier
-    // spends the arm on the outgoing world's teardown: an arm at submit time
-    // took over on "569 items" against the 3532 already prewarmed.
+    // Arm the takeover HERE, at the far end. The gate re-arms on a LOADING
+    // presence context, which the menu route passes through and this one never
+    // does - measured: not one presence line for the whole change. Arming any
+    // earlier is spent on the outgoing world, which is still fully resident:
+    // both an arm at submit time and an arm at the kick took over within
+    // milliseconds, on 569 and 787 of the old world's items.
     if (LoadGuestU32BE(base, worker + 56) == 0) {
       g_chain_step.store(-1, std::memory_order_relaxed);
       REXLOG_INFO("skate3 warp switch: the change is done - current world {:016X}",

@@ -533,6 +533,11 @@ bool LoadingOrFrontendActive();
 // meshes decoded and a black screen.
 void ArmTakeoverForInducedLoad();
 
+// Drop everything held from the map being left, at the START of an induced map
+// change. Guest arena addresses are reused across loads, so anything keyed by
+// one is stale the moment a new world streams in.
+void BeginInducedMapChange();
+
 // Sentinel for "the frontend stack is empty, or has not been read yet".
 constexpr uint32_t kFrontEndStackEmpty = 0xFFFFFFFFu;
 
