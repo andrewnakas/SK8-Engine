@@ -353,7 +353,7 @@ void PaceGuestFrame() {
   // not free time, it is time taken from the command processor sharing those
   // cores. Sleep closer and spin briefly; sleep_for's overshoot is what the
   // spin covers, and it does not need milliseconds of runway.
-  constexpr auto kSpinWindow = std::chrono::microseconds(500);
+  constexpr auto kSpinWindow = std::chrono::milliseconds(2);
   while (true) {
     const auto remaining = s_next - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero()) {
