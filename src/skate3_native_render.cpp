@@ -360,8 +360,48 @@ void PaceGuestFrame() {
   s_next += interval;
 }
 
+// Delivered-frame pacing summary. The guest render thread is the only caller,
+// so the window state needs no synchronization. This measures what the player
+// actually sees - the interval between swaps - rather than the cost of any one
+// subsystem, which is what makes it the number to compare across builds.
+void ReportPacing() {
+  using Clock = std::chrono::steady_clock;
+  static Clock::time_point s_prev{};
+  static Clock::time_point s_window_start{};
+  static std::vector<double> s_intervals_ms;
+
+  const auto now = Clock::now();
+  if (s_prev.time_since_epoch().count() == 0) {
+    s_prev = now;
+    s_window_start = now;
+    s_intervals_ms.reserve(4096);
+    return;
+  }
+  s_intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - s_prev).count());
+  s_prev = now;
+
+  const auto elapsed = now - s_window_start;
+  if (elapsed < std::chrono::seconds(30) || s_intervals_ms.empty()) {
+    return;
+  }
+  std::vector<double> sorted = s_intervals_ms;
+  std::sort(sorted.begin(), sorted.end());
+  const auto pct = [&sorted](double p) {
+    const size_t i = std::min(sorted.size() - 1,
+                              size_t(p * double(sorted.size() - 1) + 0.5));
+    return sorted[i];
+  };
+  const double secs = std::chrono::duration<double>(elapsed).count();
+  REXLOG_INFO("[pace] {:.0f}s: frames={} fps={:.1f} p50={:.1f}ms p95={:.1f}ms max={:.1f}ms",
+              secs, sorted.size(), double(sorted.size()) / secs, pct(0.50), pct(0.95),
+              sorted.back());
+  s_intervals_ms.clear();
+  s_window_start = now;
+}
+
 void OnFrameEnd(uint8_t* base) {
   PaceGuestFrame();
+  ReportPacing();
   // EMULATED-mode guest frame breakdown (emulated gameplay once regressed
   // from 140 to 66 fps while native stayed at cap; the native-scene perf
   // line only prints while the native renderer is active, so emulated
