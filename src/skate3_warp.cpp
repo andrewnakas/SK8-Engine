@@ -1291,21 +1291,48 @@ uint64_t WantedWorldIdentity(uint8_t* base) {
   if (want.empty()) {
     return 0;
   }
+  // Every failure here used to return a bare 0, which reaches the caller as
+  // "wanted=0000000000000000" and says nothing about WHICH step failed. There
+  // are three, and they fail for different reasons: the pack's location table
+  // may not be found, the table may be found but no menu item points at it
+  // (the Locations list is built when the menu is first opened, so before that
+  // no item exists at all), or the item may be there with an empty pair.
   uint32_t slot = 0;
   std::string full;
-  if (skate3::warp::FindPackNode(base, skate3::warp::WorldFolderName(want).substr(5), &slot, &full) == 0 || slot == 0) {
+  const std::string folder = skate3::warp::WorldFolderName(want).substr(5);
+  const uint32_t node = skate3::warp::FindPackNode(base, folder, &slot, &full);
+  if (node == 0 || slot == 0) {
+    REXLOG_WARN("skate3 warp identity: no pack node for '{}' (folder '{}') - "
+                "node=0x{:08X} slot=0x{:08X}",
+                want, folder, node, slot);
     return 0;
   }
+  REXLOG_INFO("skate3 warp identity: '{}' -> node 0x{:08X} slot 0x{:08X} full '{}'",
+              want, node, slot, full);
+
   // The item whose +0x24 points at this world's pack record carries the pair.
   const uint32_t entry = slot - 4;
+  uint32_t hits = 0;
   for (uint32_t a = 0x40000000; a < 0x48000000 - 4; a += 4) {
     if (skate3::warp::LoadGuestU32BE(base, a) == entry) {
       const uint32_t item = a - 0x24;
       const uint64_t hi = skate3::warp::LoadGuestU32BE(base, item + 0x18);
       const uint64_t lo = skate3::warp::LoadGuestU32BE(base, item + 0x1C);
-      return (hi << 32) | lo;
+      const uint64_t identity = (hi << 32) | lo;
+      REXLOG_INFO("skate3 warp identity: entry 0x{:08X} referenced at 0x{:08X} "
+                  "-> item 0x{:08X} pair {:08X}:{:08X}",
+                  entry, a, item, static_cast<uint32_t>(hi), static_cast<uint32_t>(lo));
+      if (identity != 0) {
+        return identity;
+      }
+      ++hits;
     }
   }
+  REXLOG_WARN("skate3 warp identity: entry 0x{:08X} for '{}' is referenced by {} "
+              "heap words, none of which carried a non-zero pair at +0x18/+0x1C. "
+              "If this is 0, the Locations list has not been built yet - the items "
+              "that carry the identity only exist once the menu has been opened.",
+              entry, want, hits);
   return 0;
 }
 
