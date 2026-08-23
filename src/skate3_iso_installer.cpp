@@ -40,7 +40,9 @@
 
 namespace skate3 {
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+std::filesystem::path PickIsoFileIOS();
+#elif defined(__APPLE__)
 std::filesystem::path PickIsoFileMacOS();
 #endif
 
@@ -109,9 +111,7 @@ std::filesystem::path PickIsoFile() {
 }
 #elif defined(__APPLE__) && TARGET_OS_IPHONE
 std::filesystem::path PickIsoFile() {
-  // No file picker on iOS; the ISO is expected to be staged in the
-  // app's Documents directory already, so report nothing selected.
-  return {};
+  return skate3::PickIsoFileIOS();
 }
 #elif defined(__APPLE__)
 std::filesystem::path PickIsoFile() {

@@ -275,8 +275,11 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )
-if(APPLE AND NOT SKATE3_IOS)
-    # NSOpenPanel; there is no file picker on iOS and the disc is pre-extracted.
+if(SKATE3_IOS)
+    # UIDocumentPickerViewController, so the disc can be chosen from Files.
+    list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_ios.mm)
+elseif(APPLE)
+    # NSOpenPanel.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_macos.mm)
 endif()
 
@@ -382,7 +385,36 @@ if(APPLE)
         # UIKit rather than AppKit. -stack_size applies to the main thread of an
         # executable; on iOS the main thread stack is fixed at 1 MB and SDL runs
         # the app on its own thread anyway, so it is omitted here.
-        target_link_libraries(skate3 PRIVATE "-framework UIKit" "-framework Foundation")
+        # UniformTypeIdentifiers backs the content-type filter in the Files picker.
+        target_link_libraries(skate3 PRIVATE
+            "-framework UIKit" "-framework Foundation" "-framework UniformTypeIdentifiers")
+
+        # Ship as a real .app: iOS will not install a bare executable, and the
+        # Info.plist carries the file-sharing keys the 6 GB disc is staged
+        # through. SKATE3_IOS_BUNDLE_ID and SKATE3_IOS_DEVELOPMENT_TEAM are the
+        # two values a different signer has to change.
+        set(SKATE3_IOS_BUNDLE_ID "com.example.skate3" CACHE STRING
+            "CFBundleIdentifier for the iOS app")
+        set(SKATE3_IOS_DEVELOPMENT_TEAM "" CACHE STRING
+            "Apple Development Team ID used to sign the iOS app")
+
+        set_target_properties(skate3 PROPERTIES
+            MACOSX_BUNDLE TRUE
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ios/Info.plist.in"
+            MACOSX_BUNDLE_BUNDLE_NAME "Skate 3"
+            MACOSX_BUNDLE_GUI_IDENTIFIER "${SKATE3_IOS_BUNDLE_ID}"
+            MACOSX_BUNDLE_EXECUTABLE_NAME "skate3"
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+            MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${SKATE3_IOS_BUNDLE_ID}"
+            XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ios/skate3.entitlements"
+            XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+        )
+        if(SKATE3_IOS_DEVELOPMENT_TEAM)
+            set_target_properties(skate3 PROPERTIES
+                XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${SKATE3_IOS_DEVELOPMENT_TEAM}")
+        endif()
     else()
         target_link_options(skate3 PRIVATE -Wl,-stack_size,0x4000000)
         target_link_libraries(skate3 PRIVATE "-framework Cocoa")

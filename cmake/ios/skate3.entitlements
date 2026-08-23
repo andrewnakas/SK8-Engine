@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Raises the foreground jetsam limit from roughly 2 GB to roughly 3 GB on
+	     a 4 GB device. The recomp's resident set runs well past the default
+	     ceiling, so without this the app is killed rather than slowed. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<!-- Allows large contiguous reservations; the guest mapping is 4.5 GB of
+	     address space (kGuestMappingLength), which is virtual rather than
+	     resident but still needs the extended VA allowance. -->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+</dict>
+</plist>

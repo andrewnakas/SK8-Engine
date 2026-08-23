@@ -59,8 +59,11 @@
 #else
 #include <execinfo.h>
 #endif
+#include <pthread.h>
 #include <signal.h>
+#if !defined(__APPLE__)
 #include <sys/prctl.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -290,8 +293,13 @@ uint32_t ChunkOf(uint32_t block) {
 
 const char* ThreadName() {
   static thread_local char name[20] = {0};
+#if defined(__APPLE__)
+  // Darwin has no prctl; pthread_getname_np is the equivalent read.
+  if (name[0] == 0 && pthread_getname_np(pthread_self(), name, sizeof(name)) != 0) {
+#else
   if (name[0] == 0 &&
       prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) != 0) {
+#endif
     name[0] = '?';
     name[1] = 0;
   }

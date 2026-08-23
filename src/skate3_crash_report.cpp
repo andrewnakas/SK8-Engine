@@ -12,8 +12,17 @@
 #include <execinfo.h>
 #endif
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
+#if defined(__APPLE__)
+// mach_vm.h is macOS-only; the vm_* entry points below are the ones the iOS
+// SDK exposes, and they are equivalent for same-task reads.
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <pthread/pthread.h>
+#else
 #include <sys/prctl.h>
+#endif
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -98,6 +107,28 @@ class Report {
   size_t len_ = 0;
 };
 
+// Thread identity, signal-safe on both OSes: Linux names threads through
+// prctl and tids through a syscall; Darwin has no prctl or gettid and exposes
+// both through pthread_np calls instead.
+uint64_t HostTid() {
+#if defined(__APPLE__)
+  uint64_t tid = 0;
+  pthread_threadid_np(nullptr, &tid);
+  return tid;
+#else
+  return uint64_t(syscall(SYS_gettid));
+#endif
+}
+
+bool HostThreadName(char* name, size_t len) {
+#if defined(__APPLE__)
+  return pthread_getname_np(pthread_self(), name, len) == 0 && name[0] != 0;
+#else
+  (void)len;
+  return prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) == 0;
+#endif
+}
+
 // Host backtrace. Not every fault is guest code - a null HOST pointer
 // dereferenced on a guest-named thread looks identical in the register dump,
 // and only the host frames tell the two apart. backtrace_symbols_fd is the
@@ -126,13 +157,13 @@ void WriteHostBacktrace() {
 // this guest code?".
 void WriteGuestState(Report& r) {
   char name[20] = {0};
-  if (prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) == 0) {
+  if (HostThreadName(name, sizeof(name))) {
     r.Str("  thread        ");
     r.Str(name);
     r.Str("\n");
   }
   r.Str("  host tid      ");
-  r.Dec(uint64_t(syscall(SYS_gettid)));
+  r.Dec(HostTid());
   r.Str("\n");
 
   auto* ts = rex::runtime::ThreadState::Get();
@@ -200,12 +231,13 @@ void WriteGuestState(Report& r) {
 std::atomic<uint64_t> g_heartbeat{0};
 std::atomic<bool> g_hang_reported{false};
 
+#if defined(__linux__)
 void ThreadDumpHandler(int, siginfo_t*, void*) {
   Report r;
   char name[20] = {0};
   r.Str("  --- tid ");
-  r.Dec(uint64_t(syscall(SYS_gettid)));
-  if (prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) == 0) {
+  r.Dec(HostTid());
+  if (HostThreadName(name, sizeof(name))) {
     r.Str(" (");
     r.Str(name);
     r.Str(")");
@@ -226,10 +258,12 @@ void ThreadDumpHandler(int, siginfo_t*, void*) {
   r.Flush();
   WriteHostBacktrace();
 }
+#endif  // __linux__
 
 void DumpAllThreads() {
   Report r;
   r.Str("\n=== skate3: HANG detected - no guest frame for the watchdog period ===\n");
+#if defined(__linux__)
   r.Str("  every thread's stack follows; the one holding the lock everyone else\n");
   r.Str("  is waiting on is the interesting one.\n");
   r.Flush();
@@ -258,6 +292,110 @@ void DumpAllThreads() {
     nanosleep(&ts, nullptr);
   }
   ::closedir(d);
+#elif defined(__APPLE__)
+  // Darwin has neither SIGRTMIN nor /proc, and on a device there is no
+  // `sample` to run from outside, so the stacks are collected directly: each
+  // thread is suspended, its saved pc/lr read, and its frame-pointer chain
+  // walked. AArch64 keeps a reliable fp chain ([fp] = caller fp,
+  // [fp+8] = caller lr), which is what makes this practical without an
+  // unwinder. Not signal context - the watchdog owns this thread - so
+  // dladdr and mach calls are fair game.
+  r.Str("  every thread's stack follows; the one holding the lock everyone else\n");
+  r.Str("  is waiting on is the interesting one.\n");
+  r.Flush();
+
+  thread_act_array_t threads = nullptr;
+  mach_msg_type_number_t thread_count = 0;
+  if (task_threads(mach_task_self(), &threads, &thread_count) != KERN_SUCCESS) {
+    Report fail;
+    fail.Str("  (task_threads failed)\n");
+    fail.Flush();
+    return;
+  }
+  const thread_t self_thread = mach_thread_self();
+  for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+    if (threads[i] == self_thread) {
+      continue;  // the watchdog's own stack says nothing
+    }
+    // Suspending keeps the register state and stack coherent while they are
+    // read; without it the walk chases a chain that is still moving.
+    if (thread_suspend(threads[i]) != KERN_SUCCESS) {
+      continue;
+    }
+    arm_thread_state64_t state = {};
+    mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+    const kern_return_t got_state = thread_get_state(
+        threads[i], ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state), &state_count);
+
+    Report t;
+    t.Str("  --- thread ");
+    t.Dec(uint64_t(i));
+    char name[64] = {0};
+    if (pthread_t pt = pthread_from_mach_thread_np(threads[i])) {
+      if (pthread_getname_np(pt, name, sizeof(name)) == 0 && name[0]) {
+        t.Str(" (");
+        t.Str(name);
+        t.Str(")");
+      }
+    }
+    if (got_state != KERN_SUCCESS) {
+      t.Str(" <no state>\n");
+      t.Flush();
+      thread_resume(threads[i]);
+      continue;
+    }
+    t.Str("\n");
+
+    // pc and lr first: for a thread parked in a syscall the pc alone usually
+    // names the wait, and lr names who asked for it.
+    uint64_t pc = arm_thread_state64_get_pc(state);
+    uint64_t fp = arm_thread_state64_get_fp(state);
+    const uint64_t lr = arm_thread_state64_get_lr(state);
+    for (int frame = 0; frame < 24; ++frame) {
+      t.Str("      0x");
+      t.Hex(pc, 16);
+      Dl_info info = {};
+      if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_sname) {
+        t.Str("  ");
+        t.Str(info.dli_sname);
+      } else if (info.dli_fname) {
+        t.Str("  ");
+        t.Str(info.dli_fname);
+      }
+      t.Str("\n");
+      t.Flush();
+
+      if (fp == 0 || (fp & 7) != 0) {
+        break;
+      }
+      // Read through mach_vm_read_overwrite rather than dereferencing: a
+      // garbage fp in a corrupted frame would otherwise fault the watchdog
+      // while it is reporting the original problem.
+      uint64_t frame_data[2] = {0, 0};
+      vm_size_t read_size = 0;
+      if (vm_read_overwrite(mach_task_self(), vm_address_t(fp), sizeof(frame_data),
+                            vm_address_t(&frame_data[0]), &read_size) != KERN_SUCCESS ||
+          read_size != sizeof(frame_data)) {
+        break;
+      }
+      const uint64_t next_fp = frame_data[0];
+      const uint64_t next_pc = frame_data[1];
+      if (next_pc == 0 || next_fp <= fp) {
+        break;  // end of chain, or it stopped ascending: do not loop forever
+      }
+      // Strip pointer authentication bits before symbolizing.
+      pc = next_pc & 0x0000007fffffffffull;
+      fp = next_fp;
+      if (frame == 0 && pc == 0) {
+        pc = lr;
+      }
+    }
+    thread_resume(threads[i]);
+  }
+  mach_port_deallocate(mach_task_self(), self_thread);
+  vm_deallocate(mach_task_self(), vm_address_t(threads),
+                vm_size_t(thread_count * sizeof(thread_t)));
+#endif
   Report tail;
   tail.Str("=== end hang report ===\n");
   tail.Flush();
@@ -290,6 +428,7 @@ void WatchdogMain() {
 }
 
 void StartWatchdog() {
+#if defined(__linux__)
   struct sigaction sa = {};
   sa.sa_sigaction = ThreadDumpHandler;
   sa.sa_flags = SA_SIGINFO | SA_RESTART;  // SA_RESTART: do not break blocking syscalls
@@ -297,6 +436,7 @@ void StartWatchdog() {
   if (sigaction(SIGRTMIN, &sa, nullptr) != 0) {
     return;
   }
+#endif
   std::thread(WatchdogMain).detach();
 }
 

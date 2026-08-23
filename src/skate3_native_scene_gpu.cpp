@@ -1289,7 +1289,13 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
 // The 3D path reads the words from renderengine::Texture objects; the 2D
 // path passes the device fetch-shadow words directly.
 // BC1/DXT1 block decode (both color modes) into 16 RGBA8 texels.
-void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4]) {
+//
+// four_color_only forces the c0 > c1 interpolation regardless of endpoint
+// order: BC2 and BC3 carry alpha in their own half, so their colour half is
+// always the 4-colour mode and must NOT fall into BC1's 3-colour + punch-out
+// branch (doing so turns every block whose endpoints happen to compare the
+// other way transparent).
+void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4], bool four_color_only = false) {
   const uint16_t c0 = uint16_t(b[0] | (b[1] << 8));
   const uint16_t c1 = uint16_t(b[2] | (b[3] << 8));
   uint8_t col[4][4];
@@ -1308,7 +1314,7 @@ void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4]) {
   };
   expand(c0, col[0]);
   expand(c1, col[1]);
-  if (c0 > c1) {
+  if (c0 > c1 || four_color_only) {
     for (int k = 0; k < 3; ++k) {
       col[2][k] = uint8_t((2 * col[0][k] + col[1][k]) / 3);
       col[3][k] = uint8_t((col[0][k] + 2 * col[1][k]) / 3);
@@ -1328,6 +1334,113 @@ void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4]) {
   for (int i = 0; i < 16; ++i) {
     std::memcpy(px[i], col[bits & 3u], 4);
     bits >>= 2;
+  }
+}
+
+// The 8-byte interpolated-alpha block shared by BC3's alpha half, BC4, and
+// both halves of BC5: two endpoints then sixteen 3-bit indices.
+void DecodeBcAlphaBlock(const uint8_t* b, uint8_t out[16]) {
+  const uint8_t a0 = b[0], a1 = b[1];
+  uint8_t a[8];
+  a[0] = a0;
+  a[1] = a1;
+  if (a0 > a1) {
+    for (int i = 0; i < 6; ++i) {
+      a[2 + i] = uint8_t(((6 - i) * a0 + (1 + i) * a1) / 7);
+    }
+  } else {
+    for (int i = 0; i < 4; ++i) {
+      a[2 + i] = uint8_t(((4 - i) * a0 + (1 + i) * a1) / 5);
+    }
+    a[6] = 0;
+    a[7] = 255;
+  }
+  // The indices are a little-endian 48-bit field, 3 bits per texel.
+  uint64_t bits = 0;
+  for (int i = 0; i < 6; ++i) {
+    bits |= uint64_t(b[2 + i]) << (8 * i);
+  }
+  for (int i = 0; i < 16; ++i) {
+    out[i] = a[(bits >> (3 * i)) & 7u];
+  }
+}
+
+// BC2/DXT2-3: 4-bit explicit alpha, then a 4-colour-mode BC1 block.
+void DecodeBc2Block(const uint8_t* b, uint8_t px[16][4]) {
+  DecodeBc1Block(b + 8, px, true);
+  for (int i = 0; i < 16; ++i) {
+    const uint8_t nibble = (b[i >> 1] >> ((i & 1) ? 4 : 0)) & 0xFu;
+    // Replicate rather than scale: 0xF must reach 255.
+    px[i][3] = uint8_t((nibble << 4) | nibble);
+  }
+}
+
+// BC3/DXT4-5: interpolated alpha, then a 4-colour-mode BC1 block.
+void DecodeBc3Block(const uint8_t* b, uint8_t px[16][4]) {
+  DecodeBc1Block(b + 8, px, true);
+  uint8_t alpha[16];
+  DecodeBcAlphaBlock(b, alpha);
+  for (int i = 0; i < 16; ++i) {
+    px[i][3] = alpha[i];
+  }
+}
+
+// Decode one untiled, endian-swapped row of BC blocks straight into the
+// upload mapping as uncompressed texels. Metal on iOS-class GPUs exposes no
+// BC formats at all (VK_ERROR_FORMAT_NOT_SUPPORTED, and MoltenVK then hands
+// Metal pixelFormat 0, which is a hard assert inside the driver), so the
+// blocks are expanded here instead. One block row covers four texel rows;
+// rows past the mip's height are dropped rather than clamped.
+void DecodeBcRowToMapping(const uint8_t* block_row, uint32_t cols, xenos::TextureFormat base_fmt,
+                          uint32_t mip_w, uint32_t mip_h, uint32_t block_y, uint8_t* dst_base,
+                          uint32_t dst_pitch, uint32_t dst_bpp) {
+  const uint32_t bytes_per_block =
+      (base_fmt == xenos::TextureFormat::k_DXT1 || base_fmt == xenos::TextureFormat::k_DXT5A) ? 8u
+                                                                                             : 16u;
+  for (uint32_t bx = 0; bx < cols; ++bx) {
+    const uint8_t* block = block_row + size_t(bx) * bytes_per_block;
+    uint8_t px[16][4] = {};
+    switch (base_fmt) {
+      case xenos::TextureFormat::k_DXT1:
+        DecodeBc1Block(block, px);
+        break;
+      case xenos::TextureFormat::k_DXT2_3:
+        DecodeBc2Block(block, px);
+        break;
+      case xenos::TextureFormat::k_DXT4_5:
+        DecodeBc3Block(block, px);
+        break;
+      case xenos::TextureFormat::k_DXT5A: {
+        // BC4 -> single channel; the view swizzle already broadcasts it.
+        uint8_t red[16];
+        DecodeBcAlphaBlock(block, red);
+        for (int i = 0; i < 16; ++i) {
+          px[i][0] = red[i];
+        }
+        break;
+      }
+      case xenos::TextureFormat::k_DXN: {
+        // BC5 -> two channels, stored as two independent alpha blocks.
+        uint8_t red[16], green[16];
+        DecodeBcAlphaBlock(block, red);
+        DecodeBcAlphaBlock(block + 8, green);
+        for (int i = 0; i < 16; ++i) {
+          px[i][0] = red[i];
+          px[i][1] = green[i];
+        }
+        break;
+      }
+      default:
+        return;
+    }
+    for (uint32_t t = 0; t < 16; ++t) {
+      const uint32_t x = bx * 4u + (t & 3u);
+      const uint32_t y = block_y * 4u + (t >> 2);
+      if (x >= mip_w || y >= mip_h) {
+        continue;
+      }
+      std::memcpy(dst_base + size_t(y) * dst_pitch + size_t(x) * dst_bpp, px[t], dst_bpp);
+    }
   }
 }
 
@@ -1784,6 +1897,15 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     }
   }
 
+  // On a GPU without BC support the blocks are expanded before upload, so the
+  // footprint is texel-based rather than block-based: full texel rows, and a
+  // pitch measured in decoded bytes per texel.
+  const bool decode_bc = kDecodeBcOnCpu && IsBcGuestFormat(info.format);
+  const uint32_t decoded_bpp = !decode_bc                                              ? 0u
+                               : host.resource_format == nrhi::Format::kR8_UNORM       ? 1u
+                               : host.resource_format == nrhi::Format::kR8G8_UNORM     ? 2u
+                                                                                       : 4u;
+
   // Per-mip upload footprints (D3D12 alignment rules).
   struct MipPlan {
     uint32_t offset, pitch, cols, rows;
@@ -1796,6 +1918,18 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     MipPlan& p = plans[m];
     p.cols = (mw + block_w - 1) / block_w;
     p.rows = (mh + block_h - 1) / block_h;
+    if (decode_bc) {
+      // Sized against the host (block-aligned) extent, because that is what
+      // the CopyBufferToTexture calls below hand the driver for each mip.
+      const uint32_t hmw = std::max(host_width >> m, 1u);
+      const uint32_t hmh = std::max(host_height >> m, 1u);
+      p.pitch = (hmw * decoded_bpp + (nrhi::kRowPitchAlignment - 1u)) &
+                ~(nrhi::kRowPitchAlignment - 1u);
+      p.offset = (upload_size + (kUploadPlacementAlignment - 1u)) &
+                 ~(kUploadPlacementAlignment - 1u);
+      upload_size = p.offset + p.pitch * hmh;
+      continue;
+    }
     p.pitch = (p.cols * bytes_per_block + (nrhi::kRowPitchAlignment - 1u)) &
               ~(nrhi::kRowPitchAlignment - 1u);
     p.offset = (upload_size + (kUploadPlacementAlignment - 1u)) &
@@ -1914,13 +2048,23 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
           std::memcpy(out_row + i, &value, sizeof(value));
         }
       }
-      std::memcpy(mapping + p.offset + size_t(by) * p.pitch, out_row, row_bytes);
+      if (decode_bc) {
+        // One block row expands to four texel rows; the helper clamps against
+        // the mip's real extent so padded blocks do not write past it.
+        DecodeBcRowToMapping(out_row, p.cols, rex::graphics::GetBaseFormat(info.format),
+                             std::max(host_width >> m, 1u), std::max(host_height >> m, 1u), by,
+                             mapping + p.offset, p.pitch, decoded_bpp);
+      } else {
+        std::memcpy(mapping + p.offset + size_t(by) * p.pitch, out_row, row_bytes);
+      }
     }
     // Half-black-mip diagnostic (PCU Library banners): discriminate "the
     // guest pool genuinely holds zeros for this mip" from "our addressing
     // zeroed/misread it". Samples 32 uploaded blocks spread over the mip;
     // guard_zeroed separates range-guard zeroing from zero CONTENT.
-    if (m > 0) {
+    // Skipped when decoding: the mapping holds texels, not blocks, so the
+    // block-strided sampling below would read the wrong bytes.
+    if (m > 0 && !decode_bc) {
       uint32_t zero_samples = 0;
       const uint32_t total_blocks = p.rows * p.cols;
       for (uint32_t s = 0; s < 32; ++s) {
@@ -2066,6 +2210,13 @@ bool UpdateGuestTexture2DInPlace(const NativeGuestOutputRenderContext& context,
   }
   HostTextureFormat host;
   if (!GetHostTextureFormat(info.format, host)) {
+    return false;
+  }
+  // This path rewrites block rows straight into an existing texture. Where BC
+  // has to be expanded on the CPU the destination is uncompressed and the
+  // strides no longer line up, so decline and let the caller take the full
+  // decode path in EnsureGuestTextureFromWords instead.
+  if (kDecodeBcOnCpu && IsBcGuestFormat(info.format)) {
     return false;
   }
   if (info.dimension != xenos::DataDimension::k2DOrStacked || info.is_stacked ||
@@ -2277,6 +2428,12 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   }
   HostTextureFormat host;
   if (!GetHostTextureFormat(info.format, host)) {
+    return false;
+  }
+  // Cube faces still upload raw blocks; without BC support that would land
+  // compressed bytes in an uncompressed texture. Skip rather than draw
+  // garbage - the sky falls back to its untextured path.
+  if (kDecodeBcOnCpu && IsBcGuestFormat(info.format)) {
     return false;
   }
   const rex::graphics::FormatInfo* format_info = info.format_info();

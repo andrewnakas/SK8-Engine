@@ -54,7 +54,9 @@ REXCVAR_DEFINE_STRING(skate3_title_update_url,
 
 namespace skate3 {
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+std::filesystem::path PickTitleUpdateFileIOS();
+#elif defined(__APPLE__)
 std::filesystem::path PickTitleUpdateFileMacOS();
 #endif
 
@@ -544,6 +546,20 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
   return ok;
 }
 
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+
+// iOS apps cannot spawn subprocesses at all, so the curl path below is not
+// available. The title update is applied at build time (the generated code is
+// produced with it), and the disc is staged into Documents by hand, so there is
+// nothing for a runtime downloader to do here except say so.
+bool DownloadToFile(const std::string& /*url*/, const std::filesystem::path& /*destination*/,
+                    std::atomic<uint64_t>& /*copied_bytes*/, std::atomic<uint64_t>& /*total_bytes*/,
+                    std::string& error) {
+  error = "Downloading is not supported on iOS. Copy the title update into the app's Documents "
+          "folder over file sharing instead.";
+  return false;
+}
+
 #else
 
 bool DownloadToFile(const std::string& url, const std::filesystem::path& destination,
@@ -615,9 +631,7 @@ std::filesystem::path PickTitleUpdateFile() {
 }
 #elif defined(__APPLE__) && TARGET_OS_IPHONE
 std::filesystem::path PickTitleUpdateFile() {
-  // No file picker on iOS; the title update is expected to be staged in the
-  // app's Documents directory already, so report nothing selected.
-  return {};
+  return skate3::PickTitleUpdateFileIOS();
 }
 #elif defined(__APPLE__)
 std::filesystem::path PickTitleUpdateFile() {
