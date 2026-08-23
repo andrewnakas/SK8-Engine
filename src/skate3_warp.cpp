@@ -20,6 +20,7 @@
 
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -105,6 +106,11 @@ REXCVAR_DEFINE_BOOL(skate3_warp_substitute_loader, false, "Skate 3",
                     "at [session+2192], and loads when they differ. Hand it the wanted "
                     "world's identity - the hash pair the menu item carries at +0x18/+0x1C - "
                     "and the game loads that world with no menu involved.");
+REXCVAR_DEFINE_INT32(skate3_warp_trace_loader_limit, 4, "Skate 3",
+                     "How many world-load backtraces to log. The boot load eats the first "
+                     "few, so raise this to also capture the menu confirm's load - the one "
+                     "that actually works, and therefore the one worth copying.")
+    .range(1, 200);
 REXCVAR_DEFINE_BOOL(skate3_warp_trace_loader, false, "Skate 3",
                     "Log a host backtrace the first few times a world stream folder is "
                     "requested. Host frames name guest functions one-for-one, so this is "
@@ -859,6 +865,19 @@ uint32_t FindPointerToNear(const uint8_t* base, uint32_t target, uint32_t anchor
 // The pack blob's own copy of the node name, not the frontend's heap copies:
 // only the blob's is in the location table, and only the table entry is what
 // sub_82864628 takes.
+bool EqualsNoCase(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 uint32_t FindPackNode(const uint8_t* base, const std::string& bare, uint32_t* slot_out,
                       std::string* full) {
   const std::string prefix = "Z_" + bare + "_";
@@ -869,7 +888,23 @@ uint32_t FindPackNode(const uint8_t* base, const std::string& bare, uint32_t* sl
       continue;
     }
     const std::string text = GuestString(base, a, 64);
-    if (text.size() <= prefix.size() || text.compare(0, prefix.size(), prefix) != 0 ||
+    // CASE-INSENSITIVE, and this is the whole reason the warp never fired on a
+    // community pack. World ids come from the `DIST_` folder name and keep its
+    // capitalisation - "DMJumpline" - while the spawn nodes inside the archive
+    // are lower case: Z_dmjumpline_startline_Start. Built literally, the prefix
+    // "Z_DMJumpline_" matches nothing, FindPackNode returns 0, the identity
+    // lookup gives up before its heap scan, and the substitution is skipped
+    // because it is gated on a non-zero identity.
+    //
+    // Every note about this warp was written against SkateIT, whose ids are
+    // already lower case ("sk8itbareclona" -> Z_sk8itbareclona_barcelona_Start),
+    // so the mismatch never showed.
+    //
+    // Insensitive but still LITERAL: no normalisation. Stripping separators
+    // makes "San Vanelona" match "san_vanelona_artgallery", which is a
+    // different location - the loader learned that one the same way.
+    if (text.size() <= prefix.size() ||
+        !EqualsNoCase(text.substr(0, prefix.size()), prefix) ||
         text.compare(text.size() - 6, 6, "_Start") != 0) {
       continue;
     }
@@ -1367,7 +1402,11 @@ void MaybeTraceWorldLoadCallers(const char* tag) {
   if (!REXCVAR_GET(skate3_warp_trace_loader)) {
     return;
   }
-  static std::atomic<int> remaining{4};
+  // Four was enough to see the BOOT world load and nothing else - the boot
+  // load consumes every slot before the menu is ever opened, so the confirm's
+  // own chain (the one that matters, because it is the load that works) was
+  // never captured. A cvar so both can be taken in one run and diffed.
+  static std::atomic<int> remaining{REXCVAR_GET(skate3_warp_trace_loader_limit)};
   if (remaining.fetch_sub(1, std::memory_order_relaxed) <= 0) {
     return;
   }
