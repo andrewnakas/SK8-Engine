@@ -671,7 +671,11 @@ extern "C" __attribute__((noinline)) void skate3_heap_watch_hit(uint32_t ea,
 // Sizes over 2048 and the wrapper entry points (sub_8298D078/sub_8298D098 add 8
 // to r3 and tail-call into here) all funnel through this one function.
 extern "C" REX_FUNC(sub_82990768) {
-  if (!HooksActive()) {
+  // Enabled(), not HooksActive(): nothing below serves the free-defer fix -
+  // it neither reads nor writes the defer queue - so with only the fix asked
+  // for, every allocation would pay a full bin sweep and a poison-map lookup
+  // under a global mutex for a diagnostic nobody switched on.
+  if (!Enabled()) {
     __imp__sub_82990768(ctx, base);
     return;
   }
@@ -777,6 +781,14 @@ extern "C" REX_FUNC(sub_82990A58) {
   const uint32_t guest_lr = uint32_t(ctx.lr);
   g_frees.fetch_add(1, std::memory_order_relaxed);
 
+  // Only a free issued from an instance teardown can be deferred, and that is
+  // a thread-local flag - test it before walking the pool to price the block.
+  const bool deferrable = tl_in_instance_dtor && DeferMs() != 0;
+  if (!Enabled() && !deferrable) {
+    __imp__sub_82990A58(ctx, base);
+    return;
+  }
+
   uint32_t chunk = 0, bsize = 0;
   const bool ours = BlockExtent(base, pool, block, &chunk, &bsize);
 
@@ -785,7 +797,7 @@ extern "C" REX_FUNC(sub_82990A58) {
   // interior pointer into them keeps writing after teardown; holding the
   // memory means those writes land somewhere nobody has reused, instead of on
   // a free-list link word.
-  if (ours && tl_in_instance_dtor && DeferMs() != 0) {
+  if (ours && deferrable) {
     std::vector<DeferredBlock> release;
     const uint64_t now = NowMs();
     if (Enabled()) {
