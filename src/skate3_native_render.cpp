@@ -345,14 +345,22 @@ void PaceGuestFrame() {
     s_next = now + interval;
     return;
   }
-  // Coarse sleep to ~1.5 ms before the target, then spin for precision.
+  // Coarse sleep to just before the target, then spin for precision.
+  //
+  // The spin window was 2 ms, chosen against a 33 ms period. At 16.6 ms that
+  // is an eighth of the frame spent yielding on the guest render thread - and
+  // on a phone with two performance cores, that thread yielding in a loop is
+  // not free time, it is time taken from the command processor sharing those
+  // cores. Sleep closer and spin briefly; sleep_for's overshoot is what the
+  // spin covers, and it does not need milliseconds of runway.
+  constexpr auto kSpinWindow = std::chrono::microseconds(500);
   while (true) {
     const auto remaining = s_next - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero()) {
       break;
     }
-    if (remaining > std::chrono::milliseconds(2)) {
-      std::this_thread::sleep_for(remaining - std::chrono::milliseconds(2));
+    if (remaining > kSpinWindow) {
+      std::this_thread::sleep_for(remaining - kSpinWindow);
     } else if (remaining > std::chrono::microseconds(50)) {
       std::this_thread::yield();
     }
