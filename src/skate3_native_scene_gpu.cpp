@@ -134,6 +134,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_transparents);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_world_v2);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_world_v2_vulkan);
 REXCVAR_DECLARE(double, skate3_menu_blur_sigma);
 REXCVAR_DECLARE(double, skate3_native_render_scene_2d_sharp);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_intensity);
@@ -2947,6 +2948,19 @@ nrhi::ShaderDesc MakeShaderDesc(nrhi::ShaderStage stage, const char* file,
   return sd;
 }
 
+// World-shading v2 samples the material's per-pixel maps through the t8/t9
+// pair. On the Vulkan backend that path shades the static world black while
+// dynamic objects, the HUD and the sky render correctly, so v2 is held off
+// there and the world falls back to the v1 flat response. D3D12 keeps v2.
+// skate3_native_render_scene_world_v2_vulkan re-enables it for debugging.
+bool WorldShadingV2AllowedOnBackend() {
+  if (g_r.device == nullptr ||
+      g_r.device->backend() != nrhi::Backend::kVulkan) {
+    return true;
+  }
+  return REXCVAR_GET(skate3_native_render_scene_world_v2_vulkan);
+}
+
 bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
   if (g_r.layout) {
     return true;
@@ -3007,6 +3021,15 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
     ld.static_samplers[1] = {1, nrhi::Filter::kLinear,
                              nrhi::AddressMode::kClamp, 1};
     ld.allow_input_layout = true;
+    if (context.device->backend() == nrhi::Backend::kVulkan) {
+      REXLOG_INFO(
+          "native-scene: world-shading v2 {} on Vulkan (it shades the static "
+          "world black there, so the v1 flat response is the default; set "
+          "skate3_native_render_scene_world_v2_vulkan=true to override)",
+          REXCVAR_GET(skate3_native_render_scene_world_v2_vulkan)
+              ? "FORCED ON"
+              : "held off");
+    }
     g_r.layout = context.device->CreateBindingLayout(ld);
     if (g_r.layout == nullptr) {
       REXLOG_ERROR("native-scene: root signature creation failed");
@@ -15310,7 +15333,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     uint32_t v2_flags = 0;
     if (item.env_family >= 1 && item.env_family <= 4 && !item.transparent &&
         !item.water && debug_mode == 0 && scene.shadow_valid &&
-        REXCVAR_GET(skate3_native_render_scene_world_v2)) {
+        REXCVAR_GET(skate3_native_render_scene_world_v2) &&
+        WorldShadingV2AllowedOnBackend()) {
       if (item.water_normal != 0) {
         const GuestTexture* nrm = resolve_texture(item.water_normal, 3);
         if (nrm != &g_r.white && nrm->valid && nrm->srv_mips != 0) {

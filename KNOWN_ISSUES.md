@@ -18,6 +18,17 @@ This is an experimental preview rather than a finished standalone game engine.
   `-DSKATE3_CODEGEN_PATCHED_TITLE_UPDATE=ON` path - and note that path replaces
   the function-boundary config, so the overrides in `skate3_functions.toml` are
   not applied and the result is not a supported configuration.
+- On Vulkan the static world renders black under world-shading v2, while
+  dynamic objects, the skater, the sky and the HUD all render correctly. The
+  geometry is drawn - it occludes the sky along the horizon - so this is the
+  v2 shading path evaluating to zero, not missing draws. v2 is therefore held
+  off on Vulkan and the world falls back to the v1 flat response, which is
+  visible and skateable; `skate3_native_render_scene_world_v2_vulkan=true`
+  restores v2 for anyone debugging it. D3D12 is unaffected and still uses v2.
+  The underlying defect is not yet understood: it is not MSAA resolve, the
+  lightmaps, HDR, the GPU selected, the shader/SPIR-V table, or presentation -
+  each of those was ruled out by A/B test. With v1 the ground still shades
+  black, which may be the same defect or a second one.
 - The raytraced mirrors and puddles are D3D12-only. The rexglue RHI has no
   ray-tracing abstraction, so on Linux the pass is compiled out and the
   authored planes are simply not drawn, exactly as on D3D12 hardware below

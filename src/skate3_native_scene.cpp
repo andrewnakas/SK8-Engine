@@ -105,6 +105,13 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_v2, true, "Skate 3",
                     "terms; v1 folded them to the flat-map constants). Off = the v1 "
                     "flat response, for A/B comparison.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_v2_vulkan, false, "Skate 3",
+                    "Allow world-shading v2 on the Vulkan backend. Off by default: on "
+                    "Vulkan v2 shades the static world black while dynamic objects, the "
+                    "HUD and the sky render correctly, so Vulkan falls back to the v1 "
+                    "flat response and the world stays visible. D3D12 is unaffected and "
+                    "still uses v2. Set this true to reproduce the defect.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dynobj_v2, true, "Skate 3",
                     "Dynamicobject shading v2: per-pixel normal/detail/spec maps on the "
                     "exact dynamicobject families (mapped world normal, the game's "
