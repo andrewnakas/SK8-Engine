@@ -111,6 +111,17 @@ REXCVAR_DEFINE_INT32(skate3_warp_trace_loader_limit, 4, "Skate 3",
                      "few, so raise this to also capture the menu confirm's load - the one "
                      "that actually works, and therefore the one worth copying.")
     .range(1, 200);
+REXCVAR_DEFINE_BOOL(skate3_warp_induce_load, false, "Skate 3",
+                    "Call the world loader OURSELVES once gameplay is up, instead of "
+                    "substituting the identity on the boot load. Substituting at boot makes "
+                    "the world load PARTIALLY - 249 meshes against 3988 - and never "
+                    "activate, because that load runs while the frontend still owns the "
+                    "session. The menu confirm induces its load from gameplay with the "
+                    "renderer already live, which is the state this reproduces.");
+REXCVAR_DEFINE_INT32(skate3_warp_induce_delay_frames, 120, "Skate 3",
+                     "Frames of gameplay to wait before inducing the load, so the stock "
+                     "world has finished settling first.")
+    .range(0, 100000);
 REXCVAR_DEFINE_BOOL(skate3_warp_trace_loader, false, "Skate 3",
                     "Log a host backtrace the first few times a world stream folder is "
                     "requested. Host frames name guest functions one-for-one, so this is "
@@ -180,6 +191,9 @@ REXCVAR_DEFINE_INT32(skate3_warp_max_substitutions, 0, "Skate 3",
                      "world is looked up many times in a burst; a limit is for bisecting "
                      "which of those calls actually decides the world.")
     .range(0, 10000);
+
+// Defined at file scope further down, next to the world-stream entry points.
+uint64_t WantedWorldIdentity(uint8_t* base);
 
 namespace skate3::warp {
 namespace {
@@ -1209,6 +1223,66 @@ void ForceReplayFrom(PPCContext& ctx, uint8_t* base) {
   MaybeReplayLocationChange(ctx, base, /*force=*/true);
 }
 
+std::atomic<uint32_t> g_loader_session{0};
+std::atomic<bool> g_induced{false};
+std::atomic<bool> g_induce_logged{false};
+std::atomic<uint64_t> g_induce_frames{0};
+
+// Induce the world load from GAMEPLAY, the way the menu confirm does.
+//
+// Substituting the identity on the boot load reaches the loader with the right
+// world and still fails: 249 meshes decode against 3988 for a real load, no
+// takeover, black screen. That load runs while the frontend still owns the
+// session. The confirm's load is the one that works, and the difference is not
+// the argument - it is WHEN, and what else is up at the time.
+//
+// So call the same function, with the same session it was called with at boot
+// and the same identity the confirm would pass, once gameplay is live.
+void MaybeInduceLoad(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(skate3_warp_induce_load) || base == nullptr ||
+      g_induced.load(std::memory_order_relaxed)) {
+    return;
+  }
+  if (rex::kernel::guest_presence::GameplayContextValue() != 1) {
+    return;
+  }
+  if (g_induce_frames.fetch_add(1) <
+      uint64_t(REXCVAR_GET(skate3_warp_induce_delay_frames))) {
+    return;
+  }
+  const uint32_t session = g_loader_session.load(std::memory_order_relaxed);
+  if (session == 0) {
+    if (!g_induce_logged.exchange(true)) {
+      REXLOG_WARN("skate3 warp induce: no session seen yet - the world loader has not "
+                  "been called, so there is nothing to call it on");
+    }
+    return;
+  }
+  const uint64_t wanted = ::WantedWorldIdentity(base);
+  if (wanted == 0) {
+    if (!g_induce_logged.exchange(true)) {
+      REXLOG_WARN("skate3 warp induce: no identity for '{}' - see the warp identity lines",
+                  REXCVAR_GET(skate3_warp_world));
+    }
+    return;
+  }
+  if (g_induced.exchange(true)) {
+    return;
+  }
+  const uint64_t current = LoadGuestU64BE(base, session + 2192);
+  REXLOG_INFO("skate3 warp induce: calling the world loader from gameplay - "
+              "session 0x{:08X} current={:016X} -> {:016X}",
+              session, current, wanted);
+
+  // Scratch well below the live frame, the same discipline the replay uses.
+  PPCContext call = ctx;
+  call.r1.u64 = uint64_t(ctx.r1.u32 - 0x1000);
+  call.r3.u64 = session;
+  call.r4.u64 = wanted;
+  __imp__sub_828A3270(call, base);
+  REXLOG_INFO("skate3 warp induce: the loader returned r3={:08X}", call.r3.u32);
+}
+
 }  // namespace
 
 void Install(rex::runtime::FunctionDispatcher* dispatcher) {
@@ -1374,6 +1448,10 @@ uint64_t WantedWorldIdentity(uint8_t* base) {
 std::atomic<bool> g_loader_substituted{false};
 
 extern "C" REX_FUNC(sub_828A3270) {
+  // The session is the loader's own first argument, and there is no other way
+  // to get it - so remember it here for the induced load below, which needs the
+  // same session but runs from a completely different call site.
+  skate3::warp::g_loader_session.store(ctx.r3.u32, std::memory_order_relaxed);
   if (REXCVAR_GET(skate3_warp_substitute_loader) && !g_loader_substituted.load()) {
     const uint64_t current = skate3::warp::LoadGuestU64BE(base, ctx.r3.u32 + 2192);
     const uint64_t requested = ctx.r4.u64;
@@ -1690,6 +1768,7 @@ extern "C" REX_FUNC(sub_828A42F0) {
   // this one, so its members come along.
   using namespace skate3::warp;
   MaybeReplayLocationChange(ctx, base);
+  MaybeInduceLoad(ctx, base);
   const std::string& requested = REXCVAR_GET(skate3_warp_world);
   if (requested.empty() || !REXCVAR_GET(skate3_warp_substitute_query)) {
     __imp__sub_828A42F0(ctx, base);
