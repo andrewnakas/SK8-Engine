@@ -10,6 +10,10 @@
 
 #include <array>
 #include <atomic>
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
+
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -4835,6 +4839,15 @@ void PrewarmWorkerLoop() {
   // window at the loading->gameplay boundary. At below-normal they only
   // soak idle cores and the guest always wins the contention.
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__APPLE__)
+  // The same reasoning, and it matters far more here. Darwin ignores the
+  // priority the thread layer tries to set (SCHED_FIFO needs privilege the app
+  // does not have, so it fails silently), and this phone has two performance
+  // cores: at default quality of service the decode workers contend directly
+  // with the command processor and the guest render thread for both of them.
+  // Utility parks the workers on the efficiency cores, where soaking spare
+  // capacity is exactly what they should be doing.
+  pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
   for (;;) {
     if (!SceneEnabled()) {
