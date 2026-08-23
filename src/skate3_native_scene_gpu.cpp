@@ -340,6 +340,8 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
       }
     }
     g_tex_store_bytes = total;
+    REXLOG_INFO("native-scene: store sizes tex={}MB/{} mesh={}MB/{}", g_tex_store_bytes >> 20,
+                g_r.tex_store.size(), g_mesh_store_bytes >> 20, g_r.meshes.size());
   }
   const uint64_t byte_cap =
       uint64_t(std::max(256, REXCVAR_GET(skate3_native_render_scene_tex_store_mb)))
