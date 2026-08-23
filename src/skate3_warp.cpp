@@ -1783,6 +1783,23 @@ extern "C" REX_FUNC(sub_828A42F0) {
   using namespace skate3::warp;
   MaybeReplayLocationChange(ctx, base);
   MaybeInduceLoad(ctx, base);
+  // Watch the session's CURRENT world. sub_828A3270 compares its r4 against
+  // [session+2192] and loads when they differ, so this field is the guest's own
+  // answer to "which world am I in". After an induced load the data streams
+  // (3671 meshes) and the renderer takes over, yet the stock world is still on
+  // screen - so the question is whether the loader ever committed the switch
+  // here, or only moved bytes.
+  {
+    const uint32_t session = skate3::warp::g_loader_session.load(std::memory_order_relaxed);
+    if (session != 0) {
+      static std::atomic<uint64_t> s_last{0};
+      const uint64_t now = skate3::warp::LoadGuestU64BE(base, session + 2192);
+      const uint64_t was = s_last.exchange(now, std::memory_order_relaxed);
+      if (now != was) {
+        REXLOG_INFO("skate3 warp: session current world {:016X} -> {:016X}", was, now);
+      }
+    }
+  }
   const std::string& requested = REXCVAR_GET(skate3_warp_world);
   if (requested.empty() || !REXCVAR_GET(skate3_warp_substitute_query)) {
     __imp__sub_828A42F0(ctx, base);
