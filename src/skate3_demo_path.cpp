@@ -618,36 +618,6 @@ bool InterruptibleSleepMs(int64_t total_ms) {
 // Safety: only retries while the frontend stack is actually readable. If it
 // never reads (sentinel), this degrades to exactly the old single press rather
 // than hammering `start` and toggling the menu back shut.
-bool PressStartUntilPaused(int32_t attempts, int32_t wait_ms) {
-  for (int32_t attempt = 1; attempt <= attempts; ++attempt) {
-    rex::kernel::xam::QueueSyntheticInput(rex::input::X_INPUT_GAMEPAD_START, 8);
-    bool observed = false;
-    for (int32_t waited = 0; waited < wait_ms; waited += 20) {
-      if (!InterruptibleSleepMs(20)) {
-        return false;
-      }
-      const uint32_t top = native_scene::FrontEndTopScreen();
-      if (top == kPauseRootScreen) {
-        if (attempt > 1) {
-          REXLOG_INFO("Skate 3 demo path: pause menu opened on start press {}", attempt);
-        }
-        return true;
-      }
-      if (top != native_scene::kFrontEndStackEmpty) {
-        observed = true;
-      }
-    }
-    if (!observed) {
-      // No readable frontend, so there is no evidence to act on. One press,
-      // as before.
-      return true;
-    }
-    REXLOG_WARN("Skate 3 demo path: start press {} did not open the pause menu "
-                "(top screen {}); retrying",
-                attempt, native_scene::FrontEndTopScreen());
-  }
-  return false;
-}
 
 // Macro progress, published for the loading overlay. Written only by the input
 // worker, read from the UI thread; relaxed atomics are enough because these
@@ -773,6 +743,37 @@ void StartGameplayInputWorkerIfNeeded() {
 }
 
 }  // namespace
+
+bool PressStartUntilPaused(int32_t attempts, int32_t wait_ms) {
+  for (int32_t attempt = 1; attempt <= attempts; ++attempt) {
+    rex::kernel::xam::QueueSyntheticInput(rex::input::X_INPUT_GAMEPAD_START, 8);
+    bool observed = false;
+    for (int32_t waited = 0; waited < wait_ms; waited += 20) {
+      if (!InterruptibleSleepMs(20)) {
+        return false;
+      }
+      const uint32_t top = native_scene::FrontEndTopScreen();
+      if (top == kPauseRootScreen) {
+        if (attempt > 1) {
+          REXLOG_INFO("Skate 3 demo path: pause menu opened on start press {}", attempt);
+        }
+        return true;
+      }
+      if (top != native_scene::kFrontEndStackEmpty) {
+        observed = true;
+      }
+    }
+    if (!observed) {
+      // No readable frontend, so there is no evidence to act on. One press,
+      // as before.
+      return true;
+    }
+    REXLOG_WARN("Skate 3 demo path: start press {} did not open the pause menu "
+                "(top screen {}); retrying",
+                attempt, native_scene::FrontEndTopScreen());
+  }
+  return false;
+}
 
 void InstallHooks(rex::runtime::FunctionDispatcher* dispatcher) {
   if (!dispatcher || !ProbeEnabled()) {

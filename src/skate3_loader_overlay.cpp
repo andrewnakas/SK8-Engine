@@ -136,6 +136,11 @@ void Press(uint16_t buttons, int polls = 6) {
   rex::kernel::xam::QueueSyntheticInput(buttons, 0, 0, polls);
 }
 
+// 12 polls, and DO NOT SHORTEN IT. Tried 8 - the width the buttons use - and
+// the tab strip stopped responding altogether: watched on screen, RT did not
+// step once. An analog trigger has to read high for longer than a digital
+// button before the strip counts it. The GAP between presses was the part
+// that was safe to cut.
 void PressTrigger(uint8_t right_trigger) {
   rex::kernel::xam::QueueSyntheticInput(0, 0, right_trigger, 12);
 }
@@ -145,12 +150,32 @@ constexpr uint16_t kPadA = 0x1000;
 constexpr uint16_t kPadStart = 0x0010;
 constexpr uint16_t kPadDown = 0x0002;
 
-// Tab presses to reach the Locations tab. Three is the exact count; the strip
-// clamps there, so pressing more is free and covers a swallowed input.
-constexpr int kTabPresses = 10;
+// Tab presses to reach the Locations tab. Three is the exact count and the
+// strip clamps there, so extra presses were free insurance against a swallowed
+// one - at 760 ms each, ten of them cost 7.6 s of an 11 s walk.
+//
+// SIX at 400 ms: 2.4 s, down from 7.6. Three is the exact count and was tried -
+// it lands WRONG (distance 207 from the target, against 9 for this
+// configuration). The reason is in the same logs: "pause menu opened on start
+// press 2" appears on every run, i.e. the FIRST synthetic press after gameplay
+// is routinely swallowed. Three presses is therefore two, which is one tab
+// short, and the walk then clamps down a similar-length list on the wrong tab.
+//
+// Detecting the miss does not help here: the wrong tab's list moves too, so the
+// cursor feedback is happy. Distinguishing them needs the list's LENGTH (the
+// Locations list is six rows with one pack staged) - the count field next to
+// the cursor at cursor_object+0x210 is the obvious candidate and is not yet
+// verified. Until it is, margin is what keeps this correct.
+constexpr int kTabPresses = 6;
+constexpr int kTabDelayMs = 400;
+
+//: the walk pressed but the selection never moved, so we were not on the list.
+constexpr int kListNeverMoved = -1;
 
 // Step `down` until the selection stops changing, i.e. the list has clamped.
-// Returns the number of presses actually used.
+// Returns the number of presses used, or kListNeverMoved if the cursor never
+// responded at all - which means the tabs did not land and we are walking some
+// other screen.
 int ClampToListEnd(int max_steps, int step_ms) {
   int last = ReadListCursor();
   if (last < 0) {
@@ -189,7 +214,7 @@ int ClampToListEnd(int max_steps, int step_ms) {
       last = now;
     }
   }
-  return max_steps;
+  return ever_moved ? max_steps : kListNeverMoved;
 }
 
 std::vector<std::string> SplitLevels(const std::string& packed) {
@@ -248,8 +273,26 @@ void NavigateToMap(int sub_index) {
   }
   g_nav_thread = std::thread([sub_index] {
     // Pause -> challenge map -> tab right to Locations.
-    Press(kPadStart);
-    SleepMs(420);
+    //
+    // The opening START is CONFIRMED, not fired once and assumed. A single
+    // press is swallowed often enough to matter - the gameplay presence context
+    // flips before the game will take input, and how long before varies per map
+    // - and when it is, every input after it runs against GAMEPLAY rather than a
+    // menu. The list never moves, the cursor this walk steers by honestly reads
+    // 0 the whole way, and the confirm at the end does nothing. That is what
+    // made this path look like a broken sensor for a day: measured with the
+    // cursor flat at 0 across eight presses at both 130 ms and 260 ms spacing,
+    // until someone watched the screen and said the pause menu never opened.
+    //
+    // The macro path has always confirmed this press
+    // (skate3_demo_path_confirm_pause); this one now uses the same evidence.
+    if (!skate3::demo_path::PressStartUntilPaused(6, 400)) {
+      REXLOG_WARN("Skate 3 level select: the pause menu never opened; abandoning "
+                  "rather than pressing blindly into gameplay");
+      g_nav_running.store(false);
+      return;
+    }
+    SleepMs(120);
     Press(kPadA);
     SleepMs(520);
     // Ten presses, not the three it takes to get there. The tab strip CLAMPS
@@ -259,14 +302,37 @@ void NavigateToMap(int sub_index) {
     // Measured on the launcher's macro path (screenshot-verified, and
     // confirmed by eye): 3, 6 and 10 presses all reach the same map, which
     // could not happen if the strip wrapped. See loader/navigate.py.
-    for (int i = 0; i < kTabPresses; ++i) {
-      PressTrigger(255);
-      SleepMs(760);
+    auto tab_right = [](int presses) {
+      for (int i = 0; i < presses; ++i) {
+        PressTrigger(255);
+        SleepMs(kTabDelayMs);
+      }
+    };
+    tab_right(kTabPresses);
+
+    // Clamp onto the staged pack (the list holds one entry per pack). Six is
+    // the whole Locations list with one pack staged, so this never scrolls past
+    // the end; the cursor feedback lets it stop as soon as the list clamps.
+    //
+    // 260 ms is the CAP per press, not the wait: a press is held ~130 ms and the
+    // list responds within a frame or two of that, so ClampToListEnd polls and
+    // moves on the instant the cursor changes.
+    int used = ClampToListEnd(8, 260);
+    if (used == kListNeverMoved) {
+      // The cursor did not respond at all, so the tabs did not land and this is
+      // not the Locations list. Tab again and retry once - cheaper and more
+      // honest than pressing RT ten times on every single launch to insure
+      // against a case that can now be detected.
+      REXLOG_WARN("Skate 3 level select: the list never moved; tabbing again");
+      tab_right(kTabPresses);
+      used = ClampToListEnd(8, 260);
     }
-    // Clamp onto the staged pack (the list holds one entry per pack).
-    // Six is the whole Locations list with one pack staged, so this never
-    // scrolls past the end; the cursor feedback just lets it stop even sooner.
-    const int used = ClampToListEnd(6, 130);
+    if (used == kListNeverMoved) {
+      REXLOG_WARN("Skate 3 level select: still not on the Locations list; "
+                  "abandoning rather than confirming something unknown");
+      g_nav_running.store(false);
+      return;
+    }
     SleepMs(220);
     Press(kPadA);  // open the pack's map list
     SleepMs(900);
