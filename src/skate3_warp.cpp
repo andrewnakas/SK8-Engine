@@ -135,6 +135,16 @@ REXCVAR_DEFINE_BOOL(skate3_warp_induce_switch, false, "Skate 3",
                     "sub_828A39C8 (enter, which spawns the player from the transform at "
                     "[mgr+2224]) - each submitted as the previous one finishes. Without "
                     "this, skate3_warp_request_world writes a request nothing polls.");
+REXCVAR_DEFINE_BOOL(skate3_warp_at_boot, false, "Skate 3",
+                    "Load the requested world INSTEAD of the stock one, rather than after "
+                    "it. Two thirds of a warp is the stock world booting first, and the "
+                    "boot switch (sub_826D95E8) takes the world to load from "
+                    "[0x830B7AE8+48] - so writing the wanted identity there before it reads "
+                    "it skips the stock load entirely. MEASURED: the identity IS resolvable "
+                    "that early, contrary to the long-standing note that the menu items "
+                    "carrying it only exist once the Locations list has been opened. The "
+                    "player still has to be put at the start node, which is the spawn kick "
+                    "on its own once gameplay is up - no second load.");
 REXCVAR_DEFINE_STRING(skate3_warp_chain, "boot", "Skate 3",
                       "Which route runs the load: 'confirm' submits the three jobs a real "
                       "menu confirm's driver submits (sub_828A3700 / sub_828A36D0 / "
@@ -1308,6 +1318,10 @@ std::atomic<uint32_t> g_switch_arg{0};
 // the worker holds ONE job and clears the pair after calling it, so a step
 // queued from inside the previous step would be wiped.
 std::atomic<int> g_chain_step{-1};
+// Set when the boot switch was handed the wanted world instead of the stock
+// one. The world is then already right by the time gameplay starts, and all
+// that is left is to put the player at the start node.
+std::atomic<bool> g_boot_substituted{false};
 
 // THE MAP CHANGE, as the game does it.
 //
@@ -1411,10 +1425,13 @@ void MaybeRequestWorld(PPCContext& ctx, uint8_t* base) {
   // game's own record of where it is and where it is going, kept up to date on
   // the way; this field is the argument. MEASURED at a real confirm: by the
   // time the map change is kicked off, both already hold the new world.
+  const bool already_there = LoadGuestU64BE(base, session + 2192) == wanted;
   const uint64_t pending = LoadGuestU64BE(base, session + kSessionPendingWorld);
   StoreGuestU64BE(base, session + kSessionPendingWorld, wanted);
-  REXLOG_INFO("skate3 warp switch: [session 0x{:08X} + 2200] {:016X} -> {:016X}", session,
-              pending, wanted);
+  REXLOG_INFO("skate3 warp switch: [session 0x{:08X} + 2200] {:016X} -> {:016X}{}", session,
+              pending, wanted,
+              already_there ? " (the boot load already brought this world - spawn only)"
+                            : "");
 
   // THE KICK. A host backtrace through a real menu confirm ends at
   //
@@ -1457,13 +1474,19 @@ void MaybeRequestWorld(PPCContext& ctx, uint8_t* base) {
   const uint32_t vec = (ctx.r1.u32 - 0x900) & ~uint32_t(0xF);
   std::memcpy(base + vec, base + node_obj + uint32_t(REXCVAR_GET(skate3_warp_spawn_offset)),
               16);
+  // Nothing to drop and nothing to load when the boot load already brought this
+  // world: the renderer's caches are the arriving world's own, and a second
+  // load of a world the session is already in is the one case sub_828A3270
+  // skips anyway. All that is missing is the player.
+  if (!already_there) {
   // Drop the outgoing map's cached state FIRST, the way entering the loading
   // presence context does. This route never enters that context, and without
   // the drop the renderer keeps item cores and prewarm records keyed by guest
   // arena addresses the new world is about to reuse - which showed up as
   // texture decodes whose fetch words were file-path TEXT, and as a world that
   // arrived with untextured ground and no ramp.
-  skate3::native_scene::BeginInducedMapChange();
+    skate3::native_scene::BeginInducedMapChange();
+  }
   REXLOG_INFO("skate3 warp switch: kicking sub_828A3928(mgr=0x{:08X}, vec=0x{:08X} "
               "[{:08X} {:08X} {:08X} {:08X}])",
               session, vec, LoadGuestU32BE(base, vec), LoadGuestU32BE(base, vec + 4),
@@ -1483,6 +1506,10 @@ void MaybeRequestWorld(PPCContext& ctx, uint8_t* base) {
   // third job SPAWNS the player from [mgr+2224], and only the kick fills that
   // in. Jobs without the kick spawn nowhere; the kick without jobs teleports
   // into the world that is still loaded - a fall through a blue void.
+  if (already_there) {
+    REXLOG_INFO("skate3 warp switch: kicked - the world is already loaded, so that is all");
+    return;
+  }
   g_chain_step.store(0, std::memory_order_relaxed);
   REXLOG_INFO("skate3 warp switch: kicked - now running prepare / load / enter");
 }
@@ -1866,6 +1893,27 @@ extern "C" REX_FUNC(sub_826D95E8) {
     static std::atomic<int> remaining{4};
     if (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
       skate3::guest_trace::LogHostBacktrace("world-switch sub_826D95E8");
+    }
+  }
+  // Can the requested world be named THIS early? Two thirds of the 17.5 s a
+  // warp takes is the stock world booting first, and the only way to skip it is
+  // to hand this call the wanted world instead - which needs the identity and
+  // the start node to already be resolvable before any world has loaded. The
+  // identity comes out of a menu item, and the note this file has carried for
+  // months is that those items only exist once the Locations list has been
+  // opened. Ask, once, rather than assume.
+  if (REXCVAR_GET(skate3_warp_at_boot) && !REXCVAR_GET(skate3_warp_world).empty() &&
+      !skate3::warp::g_boot_substituted.load(std::memory_order_relaxed)) {
+    const uint64_t early = ::WantedWorldIdentity(base);
+    if (early == 0) {
+      REXLOG_WARN("skate3 warp boot: the wanted identity does not resolve yet - booting the "
+                  "stock world and switching after it");
+    } else if (early != current) {
+      skate3::warp::StoreGuestU64BE(base, 0x830B7AE8 + 48, early);
+      skate3::warp::g_boot_substituted.store(true, std::memory_order_relaxed);
+      REXLOG_INFO("skate3 warp boot: the stock world is skipped - loading {:016X} instead "
+                  "of {:016X}",
+                  early, wanted);
     }
   }
   __imp__sub_826D95E8(ctx, base);
