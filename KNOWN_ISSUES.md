@@ -7,17 +7,25 @@ This is an experimental preview rather than a finished standalone game engine.
   and HDR pipelines are created from the committed offline SPIR-V, and owned
   `.skate` maps load - but sustained gameplay has not been signed off. macOS
   still inherits upstream support without any Custom Engine Layer validation.
-- A correct binary cannot be generated from a clean checkout on any platform.
-  The runtime applies TU3 at load time, so the generated code must contain the
-  TU3 function roots, but codegen can only consume a whole image:
-  `patched_file_path` replaces it, and `patch_file_path` - which would apply
-  the patch while keeping the base layout - is parsed but unimplemented
-  ("XexPatcher not available"). Stable-base codegen therefore registers 45 of
-  1,727 roots and dies on the first TU3-only call, while the patched image
-  reaches 1727/1727 but discards every boundary override in
-  `skate3_functions.toml`. This is why `AGENTS.md` requires building from a
-  previously validated `generated/` tree. Wiring XexPatcher into codegen would
-  remove the requirement.
+- A correct binary cannot currently be generated from a clean checkout on any
+  platform. Codegen loads the entrypoint through the runtime, which applies a
+  sibling `.xexp` in place (`UserModule::LoadFromFile` resolves `path + "p"`,
+  gated on `xex_apply_patches`), so the image it sees already carries TU3 at
+  stable base addresses - codegen logs `XEX patch applied successfully`.
+  Appending `skate3_tu_functions.toml` to the base config then reaches
+  1727/1727 roots and 49,882 registrations, a strict superset that keeps every
+  base boundary override. But `sub_82B7C500` is miscompiled either way: with
+  the base overrides applied the guest makes a null indirect call about four
+  seconds in, and without them it takes a SIGSEGV storing through a bad
+  pointer after roughly eighty seconds. Both failures originate in that same
+  function. `sub_82B7C500` is introduced by TU3: generated against an image
+  with no sibling `.xexp` it is neither defined nor registered, so it exists
+  only once the patch is applied. The eight interior boundary overrides
+  `skate3_functions.toml` carries at `0x82B7C530`-`0x82B7C5C0` therefore split
+  a TU3-only function, and the recompiler does not produce working code for it
+  in any configuration reachable from a clean checkout. This is what building
+  from a previously validated `generated/` tree, as `AGENTS.md` requires,
+  papers over.
 - Built from the patched image (the only configuration that boots), the game is
   playable but takes an intermittent SIGSEGV in guest code at `sub_82B7C500`,
   storing through a pointer into the `0xA0000000` physical alias whose page was
