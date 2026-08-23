@@ -11609,6 +11609,24 @@ void Install() {
               SceneEnabled() ? "on" : "off");
 }
 
+// Re-arm the native takeover for a map change that never entered LOADING.
+//
+// The gate re-arms when the presence context enters loading - the menu route,
+// gameplay -> loading -> gameplay. A world load INDUCED from gameplay
+// (skate3_warp_induce_load) never leaves gameplay, so the gate stays disarmed
+// from the boot takeover and the new world is rendered by nobody even though it
+// streamed and prewarmed completely. Measured before this existed: 3565 of 3988
+// meshes decoded, "0 still queued", and a black screen.
+void ArmTakeoverForInducedLoad() {
+  g_warmup_armed.store(true, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(g_scene_mutex);
+    g_warmup_fresh_generation = (g_scene ? g_scene->generation : 0) + 1;
+  }
+  REXLOG_INFO("native-scene: takeover re-armed for an induced load (fresh generation {})",
+              g_warmup_fresh_generation);
+}
+
 }  // namespace skate3::native_scene
 
 #else  // !(REX_HAS_D3D12 || REX_HAS_VULKAN)
@@ -11617,6 +11635,8 @@ namespace skate3::native_scene {
 void Install() {}
 bool SceneFailed() { return false; }
 void ResetSceneFailure() {}
+void ArmTakeoverForInducedLoad() {}
+
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12 || REX_HAS_VULKAN

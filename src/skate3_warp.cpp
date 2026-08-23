@@ -16,6 +16,8 @@
 
 #include "skate3_warp.h"
 
+#include "skate3_native_scene.h"
+
 #include "generated/skate3_init.h"
 
 #include <array>
@@ -1279,8 +1281,20 @@ void MaybeInduceLoad(PPCContext& ctx, uint8_t* base) {
   call.r1.u64 = uint64_t(ctx.r1.u32 - 0x1000);
   call.r3.u64 = session;
   call.r4.u64 = wanted;
+  // ARM BEFORE CALLING. sub_828A3270 does not return - measured across every
+  // induced run, the "loader returned" line never once appears, so it parks on
+  // this thread and drives the load from here. Anything sequenced after it is
+  // dead code.
+  //
+  // The gate itself re-arms on a LOADING presence context, which the menu route
+  // passes through and an induced load never does; without it the new world
+  // streams and prewarms completely ("0 still queued") and is then rendered by
+  // nobody. That is the black screen.
+  skate3::native_scene::ArmTakeoverForInducedLoad();
+
   __imp__sub_828A3270(call, base);
-  REXLOG_INFO("skate3 warp induce: the loader returned r3={:08X}", call.r3.u32);
+  REXLOG_INFO("skate3 warp induce: the loader returned r3={:08X} (it usually does not)",
+              call.r3.u32);
 }
 
 }  // namespace
