@@ -51,9 +51,10 @@ REXCVAR_DEFINE_STRING(skate3_loader_current_pack, "", "Skate 3",
                       "need a relaunch, which is requested through the launcher.");
 REXCVAR_DEFINE_INT32(skate3_loader_boot_index, -1, "Skate 3",
                      "Navigate to this map index in the staged pack as soon as the game "
-                     "reaches gameplay. -1 leaves the boot path alone. Uses the same "
-                     "feedback-driven navigation as the in-game picker, so it walks the "
-                     "menu only as far as it actually needs to.");
+                     "reaches gameplay. -1 leaves the boot path alone. DOES NOT WORK - "
+                     "see NavigateToMap: the cursor it steers by never moves, so the walk "
+                     "stops on a stock district. Left in place for the investigation, not "
+                     "for use.");
 REXCVAR_DEFINE_BOOL(skate3_loader_open_picker, false, "Skate 3",
                     "Open the level picker as soon as the game reaches gameplay, so a "
                     "session starts at 'choose a map' rather than booting into one.");
@@ -161,19 +162,29 @@ int ClampToListEnd(int max_steps, int step_ms) {
     return max_steps;
   }
   int unchanged = 0;
+  bool ever_moved = false;
   for (int i = 0; i < max_steps; ++i) {
     Press(kPadDown);
     SleepMs(step_ms);
     const int now = ReadListCursor();
+    REXLOG_INFO("Skate 3 level select: clamp press {} cursor {} -> {}", i, last, now);
     if (now < 0) {
       continue;
     }
     if (now == last) {
-      // Two stationary presses in a row means the end, not a dropped input.
-      if (++unchanged >= 2) {
+      // Two stationary presses in a row means the end, not a dropped input -
+      // but ONLY once this cursor has been seen to move at all. Without that
+      // guard a cursor we are reading WRONGLY (a stale field, the wrong screen
+      // object, a value that updates slower than step_ms) reads as "already at
+      // the end" on the first two presses, and the walk stops four rows short
+      // on a stock district. The confirm then loads Port Carverton and the run
+      // looks like a map that would not load. Measured: 2 clamp presses where
+      // the blind macro needs 8, landing in the stock world every time.
+      if (ever_moved && ++unchanged >= 2) {
         return i + 1;
       }
     } else {
+      ever_moved = true;
       unchanged = 0;
       last = now;
     }
@@ -196,6 +207,29 @@ std::vector<std::string> SplitLevels(const std::string& packed) {
   return out;
 }
 
+// DO NOT ENABLE THIS PATH (measured 2026-08-23). Three defects, and the first
+// is fatal on its own:
+//
+//   1. `ReadListCursor()` reads 0 on EVERY press - logged six times in a row
+//      walking the Locations list. The "feedback-driven navigation" this and
+//      `skate3_loader_boot_index` advertise does not exist: the field at
+//      manager+kCursorObjectOffset/+kCursorOffset is not the row index. That
+//      was already suspected in Choose() below ("clamps at 0 and does not move
+//      on `up`"); this confirms it from the boot path too.
+//   2. The clamp presses are 130 ms apart. A synthetic press is HELD for ~130 ms
+//      (8 guest input polls at 60 Hz), so at that spacing presses run
+//      back-to-back with no release between them and the menu swallows some.
+//      The launcher's macro measured 260 ms as the floor.
+//   3. Six clamp presses where the macro uses eight.
+//
+// Screenshot-verified against the Maloof reference: every attempt landed in the
+// STOCK world (distance 404-443 against a threshold of 75), while the launcher's
+// macro on the same map matches at distance 2-8. It is also no faster - ten tab
+// presses at 760 ms is 7.6 s, against 3.0 s for the macro's ten at 300 ms.
+//
+// Fixing it means finding the real row-index field in guest memory first. Until
+// then the launcher's macro is the only route that lands.
+//
 // The pause-menu route to a map, expanded: the game's own parser has no `*N`
 // repeat (freeskate expands that before launch), so the downs are written out.
 //
