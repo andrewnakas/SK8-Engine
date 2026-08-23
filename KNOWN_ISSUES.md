@@ -2,9 +2,30 @@
 
 This is an experimental preview rather than a finished standalone game engine.
 
-- The Custom Engine Layer is currently validated only on Windows with D3D12.
-  Vulkan, Linux, and macOS builds inherit upstream support but have not been
-  validated with the custom renderer and owned-world shaders.
+- The Custom Engine Layer is fully validated only on Windows with D3D12. It
+  builds and runs on Linux with Vulkan - the layer activates, the scene, shadow
+  and HDR pipelines are created from the committed offline SPIR-V, and owned
+  `.skate` maps load - but sustained gameplay has not been signed off. macOS
+  still inherits upstream support without any Custom Engine Layer validation.
+- Linux builds currently cannot use the stable-base codegen path that the layer
+  is designed around. `generate-all` aborts inside the recompiler with a heap
+  buffer overflow in `BuilderContext::emit_function_call`: a `CallTarget` holds
+  a raw `FunctionNode*`, and `FunctionGraph::addFunction` frees the superseded
+  node when a higher-authority add replaces it, leaving those edges dangling.
+  This is very likely the same defect behind the partial TU3 root registration
+  recorded in `AGENTS.md`. Until it is fixed, a Linux build needs either a
+  previously validated `generated/` tree or the experimental
+  `-DSKATE3_CODEGEN_PATCHED_TITLE_UPDATE=ON` path - and note that path replaces
+  the function-boundary config, so the overrides in `skate3_functions.toml` are
+  not applied and the result is not a supported configuration.
+- The raytraced mirrors and puddles are D3D12-only. The rexglue RHI has no
+  ray-tracing abstraction, so on Linux the pass is compiled out and the
+  authored planes are simply not drawn, exactly as on D3D12 hardware below
+  raytracing tier 1.1.
+- On Linux, Steam multiplayer, screenshots, memory snapshots, the in-game
+  updater, procedural thunder audio, the input-lab command pipe, "Open Maps
+  Folder", and ultrawide monitor auto-detection are inert. Each is guarded and
+  degrades quietly rather than failing.
 - Native AI/NPC route records export in SKATE v8, but reliable route following
   is shelved. Maps should request zero AI skaters for release use.
 - Very large maps currently load complete visual and collision packages.

@@ -137,6 +137,11 @@ bool LoadFunction(HMODULE module, const char* name, T& output) {
 struct Api {
 #if defined(_WIN32)
   HMODULE module = nullptr;
+#else
+  // Kept on every platform so the shared initialize path can test whether
+  // the API is already loaded without a guard. The non-Windows LoadApi
+  // never assigns it, so it stays null and Steam stays unavailable.
+  void* module = nullptr;
 #endif
   using InitFlat = int (*)(char*);
   using Shutdown = void (*)();

@@ -274,6 +274,7 @@ set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
     src/skate3_cac_gesture.cpp
+    src/skate3_debug_input.cpp
     src/skate3_dlc_runtime.cpp
     src/skate3_custom_trick.cpp
     src/skate3_demo_path.cpp
@@ -444,6 +445,14 @@ endif()
 if(WIN32)
     target_link_libraries(skate3 PRIVATE
         advapi32 comdlg32 winhttp d3d12 d3dcompiler dxgi dxguid gdiplus winmm ws2_32)
+elseif(UNIX AND NOT APPLE)
+    # The Linux ISO and title-update pickers call GTK directly (see the
+    # non-Windows branches of skate3_iso_installer.cpp and
+    # skate3_title_update_installer.cpp). rexui links GTK publicly but keeps
+    # its include directories private, so the headers are located again here.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+    target_include_directories(skate3 PRIVATE ${GTK3_INCLUDE_DIRS})
 endif()
 
 set(SKATE3_REXRUNTIME_TARGET rexruntime)

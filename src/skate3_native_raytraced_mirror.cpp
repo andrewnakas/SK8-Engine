@@ -4,6 +4,8 @@
 
 #include "skate3_native_raytraced_mirror.h"
 
+#if defined(_WIN32)
+
 #include "skate3_mechanics_sandbox.h"
 #include "skate3_mechanics_sandbox_map.h"
 #include "skate3_native_scene.h"
@@ -1502,3 +1504,32 @@ RaytracedMirrorTelemetry GetRaytracedMirrorTelemetry() {
 }
 
 }  // namespace skate3::native_scene
+
+#else  // !_WIN32
+
+// The authored planar mirrors and wet puddles are recorded with DXR 1.1 inline
+// ray queries, built directly on the D3D12 device through the backend's RHI
+// extension hook. The rexglue RHI has no ray-tracing abstraction, so the pass
+// cannot be expressed on the Vulkan-only platforms. The scene renderer already
+// handles the pass being unavailable: it takes the same path as D3D12 hardware
+// below raytracing tier 1.1 and simply does not draw the authored planes.
+
+namespace skate3::native_scene {
+
+bool RenderRaytracedMirror(
+    const rex::graphics::NativeGuestOutputRenderContext& /*context*/,
+    rex::graphics::nrhi::Cmd* /*cmd*/, const FrameScene& /*scene*/,
+    rex::graphics::nrhi::Texture* /*scene_color*/,
+    rex::graphics::nrhi::Texture* /*scene_depth*/,
+    std::uint32_t /*scene_sample_count*/,
+    const RaytracedDynamicScene* /*dynamic_scene*/) {
+  return false;
+}
+
+RaytracedMirrorTelemetry GetRaytracedMirrorTelemetry() {
+  return RaytracedMirrorTelemetry{};
+}
+
+}  // namespace skate3::native_scene
+
+#endif  // _WIN32

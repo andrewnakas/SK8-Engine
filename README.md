@@ -12,9 +12,12 @@ grind paths, PBR materials, baked and dynamic lighting, day/night settings,
 weather, mirrors, water, and contact-driven hinged doors. The project is
 unofficial and is not affiliated with Electronic Arts.
 
-The first public preview is Windows/D3D12 only. The upstream recompilation
-supports additional platforms, but the Custom Engine Layer changes have not
-yet been validated on its Vulkan or macOS paths.
+The first public preview targets Windows/D3D12. The Custom Engine Layer also
+builds and runs on Linux/Vulkan: the layer activates, creates its Vulkan
+pipelines from the committed offline SPIR-V, and loads owned `.skate` maps.
+Sustained Linux gameplay is not yet signed off - see [Known
+Issues](KNOWN_ISSUES.md) for the current limits and for the codegen defect that
+still blocks the stable-base build path. macOS remains unvalidated.
 
 Run the normal executable with no special launch flags. Once Skate 3 reaches
 gameplay, the Custom Engine Layer activates automatically, loads the selected
@@ -66,8 +69,9 @@ distributed by this project.
 
 The remainder of this README retains the upstream project information and
 installation guidance. Release filenames have been adjusted for this fork.
-Platform claims below describe upstream Skate3Recomp; this fork's initial
-Custom Engine Layer preview is validated only on Windows/D3D12.
+Platform claims below describe upstream Skate3Recomp; this fork's Custom
+Engine Layer preview is validated on Windows/D3D12 and builds and runs on
+Linux/Vulkan.
 
 ---
 

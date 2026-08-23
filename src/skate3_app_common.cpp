@@ -2,6 +2,7 @@
 
 #include "skate3_demo_path.h"
 #include "skate3_custom_trick.h"
+#include "skate3_debug_input.h"
 #include "skate3_fov.h"
 #include "skate3_input_lab.h"
 #include "skate3_iso_installer.h"
@@ -1030,6 +1031,9 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // skate3_native_render.cpp) needs the window without an app pointer.
   skate3::screenshot::RememberWindow(window() ? window()->GetNativeWindowHandle()
                                               : nullptr);
+  // Held-key and look-drag source for the freecam and the debug hotkeys.
+  // A no-op on Windows, which keeps reading the async key state directly.
+  skate3::debug_input::Install(window());
   rex::ui::RegisterBind("bind_skate3_screenshot", "F6",
                         "Save screenshot to screenshots/", [this] {
                           skate3::screenshot::CaptureWindow(

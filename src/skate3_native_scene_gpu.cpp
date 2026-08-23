@@ -2932,6 +2932,18 @@ nrhi::ShaderDesc MakeShaderDesc(nrhi::ShaderStage stage, const char* file,
       break;
     }
   }
+  if (sd.spirv == nullptr && g_r.device != nullptr &&
+      g_r.device->backend() == nrhi::Backend::kVulkan) {
+    // The Vulkan backend has no runtime HLSL compiler, so this shader cannot
+    // be created at all. Name the exact tuple here: downstream this surfaces
+    // only as an unexplained pipeline-creation failure, and it never
+    // reproduces on D3D12, which compiles the embedded HLSL instead.
+    REXLOG_ERROR(
+        "native-scene: no offline SPIR-V for {}:{} variant \"{}\"; the table "
+        "and the shader sources have drifted - regenerate "
+        "src/native/shaders/spirv with scripts/compile_shaders.py",
+        file, entry, variant);
+  }
   return sd;
 }
 

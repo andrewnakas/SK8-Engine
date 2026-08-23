@@ -4,6 +4,7 @@
 // skate3_native_scene_gpu.cpp; state shared between the two is in
 // skate3_native_scene_state.h.
 
+#include "skate3_debug_input.h"
 #include "skate3_native_scene.h"
 #include "skate3_mechanics_sandbox.h"
 
@@ -6201,10 +6202,6 @@ struct FreecamState {
   float sign_right = 1.0f, sign_up = 1.0f;
   double look_sign_x = 1.0, look_sign_y = 1.0;
   double last_t = 0.0;
-#if defined(_WIN32)
-  bool mouse_anchored = false;
-  POINT mouse_last = {};
-#endif
 };
 FreecamState g_freecam;
 
@@ -6256,9 +6253,6 @@ bool UpdateFreecam(FrameScene& scene, const float cam_view[16], double now) {
     fc.yaw_vel = fc.pitch_vel = 0.0;
     fc.zoom = 1.0;
     fc.last_t = now;
-#if defined(_WIN32)
-    fc.mouse_anchored = false;
-#endif
     fc.engaged = true;
     REXLOG_INFO(
         "native-scene freecam: ENGAGED at ({:.1f}, {:.1f}, {:.1f}); WASD fly, "
@@ -6273,35 +6267,29 @@ bool UpdateFreecam(FrameScene& scene, const float cam_view[16], double now) {
   double lk_yaw = 0.0, lk_pitch = 0.0;        // arrow-key look intent
   double mouse_yaw = 0.0, mouse_pitch = 0.0;  // right-drag deltas (radians)
   double speed_mult = 1.0, zoom_dir = 0.0;
-#if defined(_WIN32)
-  const auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-  mv_f = (down('W') ? 1.0 : 0.0) - (down('S') ? 1.0 : 0.0);
-  mv_r = (down('D') ? 1.0 : 0.0) - (down('A') ? 1.0 : 0.0);
-  mv_u = ((down('E') || down(VK_SPACE)) ? 1.0 : 0.0) -
-         ((down('Q') || down('C')) ? 1.0 : 0.0);
-  lk_yaw = (down(VK_RIGHT) ? 1.0 : 0.0) - (down(VK_LEFT) ? 1.0 : 0.0);
-  lk_pitch = (down(VK_UP) ? 1.0 : 0.0) - (down(VK_DOWN) ? 1.0 : 0.0);
-  zoom_dir = (down('Z') ? 1.0 : 0.0) - (down('X') ? 1.0 : 0.0);
-  if (down(VK_SHIFT)) {
+  using rex::ui::VirtualKey;
+  const auto down = [](VirtualKey vk) { return debug_input::IsKeyDown(vk); };
+  mv_f = (down(VirtualKey::kW) ? 1.0 : 0.0) - (down(VirtualKey::kS) ? 1.0 : 0.0);
+  mv_r = (down(VirtualKey::kD) ? 1.0 : 0.0) - (down(VirtualKey::kA) ? 1.0 : 0.0);
+  mv_u = ((down(VirtualKey::kE) || down(VirtualKey::kSpace)) ? 1.0 : 0.0) -
+         ((down(VirtualKey::kQ) || down(VirtualKey::kC)) ? 1.0 : 0.0);
+  lk_yaw =
+      (down(VirtualKey::kRight) ? 1.0 : 0.0) - (down(VirtualKey::kLeft) ? 1.0 : 0.0);
+  lk_pitch =
+      (down(VirtualKey::kUp) ? 1.0 : 0.0) - (down(VirtualKey::kDown) ? 1.0 : 0.0);
+  zoom_dir = (down(VirtualKey::kZ) ? 1.0 : 0.0) - (down(VirtualKey::kX) ? 1.0 : 0.0);
+  if (down(VirtualKey::kShift)) {
     speed_mult = 4.0;
-  } else if (down(VK_CONTROL)) {
+  } else if (down(VirtualKey::kControl)) {
     speed_mult = 0.2;
   }
-  if (down(VK_RBUTTON)) {
-    POINT p;
-    if (GetCursorPos(&p)) {
-      if (fc.mouse_anchored) {
-        constexpr double kRadPerPixel = 0.0022;  // ~0.13 deg per pixel
-        mouse_yaw = (p.x - fc.mouse_last.x) * kRadPerPixel;
-        mouse_pitch = -(p.y - fc.mouse_last.y) * kRadPerPixel;
-      }
-      fc.mouse_last = p;
-      fc.mouse_anchored = true;
-    }
-  } else {
-    fc.mouse_anchored = false;
+  double drag_dx = 0.0;
+  double drag_dy = 0.0;
+  if (debug_input::PollLookDrag(drag_dx, drag_dy)) {
+    constexpr double kRadPerPixel = 0.0022;  // ~0.13 deg per pixel
+    mouse_yaw = drag_dx * kRadPerPixel;
+    mouse_pitch = -drag_dy * kRadPerPixel;
   }
-#endif
 
   // Look: arrow keys drive a smoothed angular velocity (cinematic ease-in/
   // out); mouse deltas apply directly. Pitch is clamped short of the poles.

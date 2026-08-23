@@ -5,9 +5,10 @@ Skate-specific rexglue runtime as a Git submodule, matching upstream's
 architecture. End users still receive one normal application archive; source
 builders clone with `--recursive`.
 
-The initial Custom Engine Layer preview is supported only on Windows/D3D12.
-Upstream platform support is retained, but the custom shaders and renderer
-changes must be validated before publishing Linux, Vulkan, or macOS builds.
+The Custom Engine Layer preview is supported on Windows/D3D12. It builds and
+runs on Linux/Vulkan, but sustained gameplay has not been signed off and there
+is no Linux packaging script, so Linux builds are developer builds rather than
+published releases. macOS is still unvalidated.
 
 Before publishing a source or binary revision:
 

@@ -68,3 +68,5 @@ steam_api64.dll
 !/scripts/Package-Windows-Release.ps1
 !/scripts/Launch-Local-Multiplayer.ps1
 !/scripts/Test-LocalMultiplayerLoad.ps1
+!/scripts/compile_shaders.py
+!/scripts/check_native_shader_spirv.py
