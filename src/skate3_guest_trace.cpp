@@ -18,8 +18,14 @@
 //
 // The recording hook is a local edit to generated/skate3_init.h (which is
 // gitignored and regenerated away by codegen - the same arrangement as the
-// heap store watch). Disarmed, it costs two loads of a hot global and a
-// not-taken branch per guest call:
+// heap store watch).
+//
+// IT IS COMPILED OUT BY DEFAULT. Disarmed it still cost two loads of a hot
+// global and a not-taken branch at every one of 47,889 guest function entries,
+// on every call, in every shipping frame - for a debugging aid that is off.
+// The edit now wraps the macro in `#if SKATE3_GUEST_TRACE`, with an empty
+// definition otherwise, so --skate3_trace does nothing unless the build sets
+// -DSKATE3_GUEST_TRACE=1. Reapply it in that form:
 //
 //   extern "C" uint32_t g_skate3_trace_gen;   // 0 = off, bumped on each arm
 //   extern "C" uint32_t g_skate3_trace_all;   // ring mode
@@ -38,6 +44,14 @@
 //           skate3_trace_enter(__func__, ctx, base);                         \
 //       }                                                                    \
 //     } while (0)
+//
+// wrapped as:
+//
+//   #if SKATE3_GUEST_TRACE
+//   ... the definition above ...
+//   #else
+//   #define REX_TRACE_ENTER() ((void)0)
+//   #endif
 //
 // The per-function `static uint32_t` is what makes `first` mode cheap: no set,
 // no hashing, one word per function. A generation counter rather than a bool

@@ -129,6 +129,20 @@ REXCVAR_DEFINE_BOOL(skate3_heap_watch, false, "Skate 3",
 // so the writer is caught in the act instead of being inferred from a poison
 // diff hundreds of thousands of pool ops later.
 //
+// COMPILED OUT BY DEFAULT. Disarmed the check still cost two loads of a global,
+// a subtract, a compare and a branch on every one of 415,256 guest stores, in
+// every shipping frame, for a tool that is off. The local edit in
+// generated/skate3_init.h now reads:
+//
+//   #if SKATE3_HEAP_WATCH
+//   static inline void REX_WATCH_CHECK(u32 addr, u32 n) { ...as before... }
+//   #else
+//   static inline void REX_WATCH_CHECK(u32, u32) {}
+//   #endif
+//
+// so skate3_heap_watch below needs -DSKATE3_HEAP_WATCH=1 in the build to do
+// anything at all.
+//
 // Nothing legitimate writes to a free block: the allocator only writes word 0
 // when it PUSHES a block (before we mark it) and when it re-carves a released
 // chunk (we clear the whole chunk's bits then). Any hit is the bug.
