@@ -68,10 +68,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_act.h>
+#include <mach/thread_status.h>
+#include <pthread.h>
+#endif
 
 #if defined(__linux__)
 #if defined(__ANDROID__)
@@ -517,6 +526,185 @@ void ControllerMain() {
 }
 
 }  // namespace
+
+// ---- sampling profiler -----------------------------------------------------
+//
+// Per-thread CPU accounting says render_thread is at 99% of a core and that it
+// is what sets the frame rate. It does not say what the thread is doing, and
+// the thread is machine-translated PowerPC: 47,889 functions named after their
+// guest addresses, any of which could be the expensive one. Guessing which to
+// optimise from a call trace does not work either - a trace says what ran, not
+// what ran for a long time, and the two are barely related.
+//
+// So: suspend the thread, read its pc, resume, and count. This file already
+// owns the host-pc-to-guest-function mapping the crash reporter uses, so a raw
+// pc becomes `sub_82B298E0 +2172` without a symbol file that goes stale on the
+// next relink.
+//
+// Two rules keep it from deadlocking against the thread it is watching. The
+// sample is a suspend, one register read, and a resume - no allocation, no
+// logging, no lock that the suspended thread could be holding, because it is
+// suspended at an arbitrary instruction and may hold anything. And pcs are
+// resolved afterwards, off the suspended path, when nothing is stopped.
+#if defined(__APPLE__)
+
+REXCVAR_DEFINE_BOOL(skate3_guest_profile, false, "Skate 3",
+                    "Sample the busiest guest threads and report the guest functions they spend "
+                    "their time in. Costs one suspend/resume per thread per interval.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(skate3_guest_profile_interval_us, 1000, "Skate 3",
+                     "Sampling interval, microseconds.")
+    .range(200, 100000);
+
+REXCVAR_DEFINE_INT32(skate3_guest_profile_report_s, 30, "Skate 3",
+                     "Seconds between profile reports.")
+    .range(5, 600);
+
+REXCVAR_DEFINE_STRING(skate3_guest_profile_thread, "render_thread", "Skate 3",
+                      "Name (prefix) of the thread to sample.");
+
+namespace {
+
+struct SampleCounts {
+  // Keyed by guest function entry address; 0 means the pc was not in generated
+  // code at all, which is worth seeing as its own bucket - it is the runtime,
+  // the kernel imports, or libc underneath the guest.
+  std::map<uint32_t, uint64_t> by_function;
+  uint64_t total = 0;
+};
+
+mach_port_t FindThreadByName(const std::string& wanted) {
+  thread_act_array_t threads = nullptr;
+  mach_msg_type_number_t thread_count = 0;
+  if (task_threads(mach_task_self(), &threads, &thread_count) != KERN_SUCCESS) {
+    return MACH_PORT_NULL;
+  }
+  mach_port_t found = MACH_PORT_NULL;
+  for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+    if (found == MACH_PORT_NULL) {
+      char name[64] = {};
+      pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+      if (pt != nullptr && pthread_getname_np(pt, name, sizeof(name)) == 0 &&
+          std::strncmp(name, wanted.c_str(), wanted.size()) == 0) {
+        // Keep this port; deallocate the rest.
+        found = threads[i];
+        continue;
+      }
+    }
+    mach_port_deallocate(mach_task_self(), threads[i]);
+  }
+  vm_deallocate(mach_task_self(), vm_address_t(threads),
+                vm_size_t(thread_count * sizeof(thread_act_t)));
+  return found;
+}
+
+void SamplerMain() {
+  const std::string wanted = REXCVAR_GET(skate3_guest_profile_thread);
+  const auto interval = std::chrono::microseconds(REXCVAR_GET(skate3_guest_profile_interval_us));
+  const auto report_every = std::chrono::seconds(REXCVAR_GET(skate3_guest_profile_report_s));
+
+  EnsureTables();
+
+  mach_port_t target = MACH_PORT_NULL;
+  SampleCounts counts;
+  auto next_report = std::chrono::steady_clock::now() + report_every;
+  // Raw pcs, resolved after the target is running again.
+  std::vector<uintptr_t> pending;
+  pending.reserve(4096);
+
+  while (true) {
+    if (target == MACH_PORT_NULL) {
+      target = FindThreadByName(wanted);
+      if (target == MACH_PORT_NULL) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        continue;
+      }
+      REXLOG_INFO("skate3 profile: sampling '{}' every {}us", wanted, interval.count());
+    }
+
+    // The whole suspended window: suspend, read pc, resume. Nothing else.
+    arm_thread_state64_t state = {};
+    mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+    bool got_state = false;
+    if (thread_suspend(target) == KERN_SUCCESS) {
+      got_state = thread_get_state(target, ARM_THREAD_STATE64,
+                                   reinterpret_cast<thread_state_t>(&state),
+                                   &state_count) == KERN_SUCCESS;
+      thread_resume(target);
+    } else {
+      // The thread went away - find it again next time round.
+      mach_port_deallocate(mach_task_self(), target);
+      target = MACH_PORT_NULL;
+      continue;
+    }
+    if (got_state) {
+      pending.push_back(uintptr_t(arm_thread_state64_get_pc(state)));
+    }
+
+    // Resolve off the suspended path.
+    if (pending.size() >= 256) {
+      for (uintptr_t pc : pending) {
+        counts.by_function[GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr)]++;
+        counts.total++;
+      }
+      pending.clear();
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_report) {
+      for (uintptr_t pc : pending) {
+        counts.by_function[GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr)]++;
+        counts.total++;
+      }
+      pending.clear();
+      next_report = now + report_every;
+
+      if (counts.total) {
+        std::vector<std::pair<uint64_t, uint32_t>> ranked;
+        ranked.reserve(counts.by_function.size());
+        for (const auto& [guest, hits] : counts.by_function) {
+          ranked.emplace_back(hits, guest);
+        }
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string line;
+        for (size_t i = 0; i < ranked.size() && i < 12; ++i) {
+          const double percent = 100.0 * double(ranked[i].first) / double(counts.total);
+          if (percent < 0.5) {
+            break;
+          }
+          if (!line.empty()) {
+            line += ' ';
+          }
+          if (ranked[i].second == 0) {
+            line += fmt::format("<host>={:.1f}%", percent);
+          } else {
+            line += fmt::format("sub_{:08X}={:.1f}%", ranked[i].second, percent);
+          }
+        }
+        REXLOG_INFO("skate3 profile: {} samples of '{}' | {}", counts.total, wanted, line);
+        counts.by_function.clear();
+        counts.total = 0;
+      }
+    }
+
+    std::this_thread::sleep_for(interval);
+  }
+}
+
+}  // namespace
+
+void InstallSampler() {
+  if (!REXCVAR_GET(skate3_guest_profile)) {
+    return;
+  }
+  std::thread(SamplerMain).detach();
+}
+
+#else
+void InstallSampler() {}
+#endif
 
 void Install() {
   if (!REXCVAR_GET(skate3_trace)) {

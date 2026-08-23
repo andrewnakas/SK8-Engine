@@ -842,6 +842,7 @@ void Skate3BaseApp::OnPostSetup() {
   // Guest call trace: no-op unless --skate3_trace=true. Installed after the
   // demo path because its controller reads that macro's progress milestones.
   skate3::guest_trace::Install();
+  skate3::guest_trace::InstallSampler();
   // Direct level load and its probe: no-op unless one of its cvars is set.
   // Last, so a probe chains to whatever hook the features above installed
   // rather than replacing it.
