@@ -113,17 +113,46 @@ REXCVAR_DEFINE_INT32(skate3_warp_trace_loader_limit, 4, "Skate 3",
                      "few, so raise this to also capture the menu confirm's load - the one "
                      "that actually works, and therefore the one worth copying.")
     .range(1, 200);
-REXCVAR_DEFINE_BOOL(skate3_warp_induce_load, false, "Skate 3",
-                    "Call the world loader OURSELVES once gameplay is up, instead of "
-                    "substituting the identity on the boot load. Substituting at boot makes "
-                    "the world load PARTIALLY - 249 meshes against 3988 - and never "
-                    "activate, because that load runs while the frontend still owns the "
-                    "session. The menu confirm induces its load from gameplay with the "
-                    "renderer already live, which is the state this reproduces.");
 REXCVAR_DEFINE_INT32(skate3_warp_induce_delay_frames, 120, "Skate 3",
-                     "Frames of gameplay to wait before inducing the load, so the stock "
+                     "Frames of gameplay to wait before asking for the world, so the stock "
                      "world has finished settling first.")
     .range(0, 100000);
+REXCVAR_DEFINE_BOOL(skate3_warp_request_world, false, "Skate 3",
+                    "ASK for the world instead of loading it. The game keeps a global pair "
+                    "at 0x830B7AE8 - +40 the world it is IN, +48 the world it WANTS - and "
+                    "the whole load is driven by them disagreeing; sub_82864E10 is that "
+                    "comparison and nothing else. Writing the wanted identity into +48 "
+                    "leaves every decision after it to the game, which is the half "
+                    "skate3_warp_induce_load skips: calling sub_828A3270 by hand loads a "
+                    "world nothing else in the title believes it is going to.");
+REXCVAR_DEFINE_BOOL(skate3_warp_induce_switch, false, "Skate 3",
+                    "Run the map change the way the game runs it. Logging every job the "
+                    "title's worker thread was handed through a real menu confirm showed a "
+                    "world change is three jobs on the world manager - sub_828A3700 "
+                    "(prepare), sub_828A36D0 (load, taking the world from [mgr+2200]), "
+                    "sub_828A39C8 (enter, which spawns the player from the transform at "
+                    "[mgr+2224]) - each submitted as the previous one finishes. Without "
+                    "this, skate3_warp_request_world writes a request nothing polls.");
+REXCVAR_DEFINE_STRING(skate3_warp_chain, "boot", "Skate 3",
+                      "Which route runs the load: 'confirm' submits the three jobs a real "
+                      "menu confirm's driver submits (sub_828A3700 / sub_828A36D0 / "
+                      "sub_828A39C8), 'boot' submits the two boot task-list steps that "
+                      "reach the same loader (sub_826DAAE8 / sub_826DAB18). MEASURED: both "
+                      "commit the world, and only 'boot' renders it - the confirm's three "
+                      "leave a black screen with the UI still drawing, so they are not the "
+                      "whole of what the driver does.");
+REXCVAR_DEFINE_INT32(skate3_warp_spawn_offset, 0x30, "Skate 3",
+                     "Byte offset of the spawn POSITION inside the start node's object. "
+                     "The node carries a 4x4 transform and the position is its last row, "
+                     "but the row is worth being able to move without a rebuild: the "
+                     "logged dump of the node object next to the position a real confirm "
+                     "passes (C2BEDAA0 43B0113C C30FC1CB 3F800000 for DMJumpline) settles "
+                     "it in one run.")
+    .range(0, 240);
+REXCVAR_DEFINE_BOOL(skate3_warp_watch_request, true, "Skate 3",
+                    "Log the world-request pair whenever either half changes. Cheap (it "
+                    "only speaks on a change) and it is the one instrument that says "
+                    "whether a warp was ever ASKED for, as opposed to whether data moved.");
 REXCVAR_DEFINE_BOOL(skate3_warp_trace_loader, false, "Skate 3",
                     "Log a host backtrace the first few times a world stream folder is "
                     "requested. Host frames name guest functions one-for-one, so this is "
@@ -549,6 +578,44 @@ uint64_t LoadGuestU64BE(const uint8_t* base, uint32_t address) {
   return (uint64_t(LoadGuestU32BE(base, address)) << 32) |
          uint64_t(LoadGuestU32BE(base, address + 4));
 }
+
+void StoreGuestU64BE(uint8_t* base, uint32_t address, uint64_t value) {
+  uint8_t* p = base + address;
+  for (int i = 0; i < 8; ++i) {
+    p[i] = uint8_t(value >> (56 - 8 * i));
+  }
+}
+
+// ---- the world-request block ----------------------------------------------
+//
+// READ OUT OF THE CODE (not a trace): sub_826D95E8, the world-switch step,
+// opens with
+//
+//     lis  r11,-31989
+//     addi r31,r11,31464        -> 0x830B7AE8
+//     ld   r11,48(r31)          REQUESTED world identity
+//     ld   r10,40(r31)          CURRENT  world identity
+//     cmpld / beq <return>      equal - nothing to do
+//
+// and sub_82864E10 is that comparison on its own, as a predicate returning
+// "requested == current". So this one global pair, not the session field at
+// +2192, is the game's own statement of "which world do I want, and which one
+// am I in".
+//
+// The menu confirm's carrier writes the REQUESTED half: sub_828646E0 copies
+// its node-name argument into +64 and then does `std r11,48(r31)` with the
+// 64-bit identity its `out` argument holds. Boot writes the pair too -
+// sub_826DA6C8 sets current = -1 and requested = the default world - which is
+// exactly the FFFFFFFFFFFFFFFF the loader was first seen with.
+//
+// This is the state the induced load never had. Calling sub_828A3270 directly
+// hands the loader a world while the block still says the stock one is both
+// current and requested, so nothing else in the game agrees a change is
+// happening.
+constexpr uint32_t kWorldRequest = 0x830B7AE8;
+constexpr uint32_t kWorldRequestCurrent = kWorldRequest + 40;
+constexpr uint32_t kWorldRequestWanted = kWorldRequest + 48;
+constexpr uint32_t kWorldRequestNode = kWorldRequest + 64;
 
 // Resolve, once, the pair the location change needs: the requested world's
 // start-node string AND the table slot that points at it. The string alone is
@@ -1226,75 +1293,268 @@ void ForceReplayFrom(PPCContext& ctx, uint8_t* base) {
 }
 
 std::atomic<uint32_t> g_loader_session{0};
-std::atomic<bool> g_induced{false};
-std::atomic<bool> g_induce_logged{false};
-std::atomic<uint64_t> g_induce_frames{0};
+// The world-switch JOB, captured from the game's own submission at boot: the
+// worker to hand it to, the function pointer, and its argument. Nothing else
+// hands these to us, and all three are needed to submit the job again.
+std::atomic<uint32_t> g_switch_worker{0};
+std::atomic<uint32_t> g_switch_arg{0};
+// The chain after the switch. Boot submits step 16 (sub_826DAB18 ->
+// sub_826D9AC0) 28 ms after the switch step returns, every time; a switch
+// submitted from gameplay gets no such follow-up, and the game then sits
+// silent with the new world loaded and nothing running it. So run the rest of
+// the list ourselves, one step at a time, each only once the worker is idle -
+// the worker holds ONE job and clears the pair after calling it, so a step
+// queued from inside the previous step would be wiped.
+std::atomic<int> g_chain_step{-1};
 
-// Induce the world load from GAMEPLAY, the way the menu confirm does.
+// THE MAP CHANGE, as the game does it.
 //
-// Substituting the identity on the boot load reaches the loader with the right
-// world and still fails: 249 meshes decode against 3988 for a real load, no
-// takeover, black screen. That load runs while the frontend still owns the
-// session. The confirm's load is the one that works, and the difference is not
-// the argument - it is WHEN, and what else is up at the time.
+// Logging every job the title's worker thread was handed through a real menu
+// confirm showed the change is three jobs on the world manager, each submitted
+// as the previous one finishes:
 //
-// So call the same function, with the same session it was called with at boot
-// and the same identity the confirm would pass, once gameplay is live.
-void MaybeInduceLoad(PPCContext& ctx, uint8_t* base) {
-  if (!REXCVAR_GET(skate3_warp_induce_load) || base == nullptr ||
-      g_induced.load(std::memory_order_relaxed)) {
+//   sub_828A3700(mgr)  -> sub_828A3538(mgr)                     prepare
+//   sub_828A36D0(mgr)  -> sub_828A3270(mgr, [mgr+2200])         load
+//   sub_828A39C8(mgr)  -> reads the spawn transform at
+//                         [mgr+2224] under [mgr+2336] and
+//                         calls sub_828A3708                    enter/spawn
+//
+// Submitting those three by hand does work - it lands in the right world - but
+// it is the tail of the change, and a world entered that way came up with no
+// ramp and untextured ground. They are submitted BY something: sub_828A3928
+// sets the spawn transform, sets the state word at [mgr+2208] to 3, and
+// registers a callback pair on the object at [0x83083BCC+17140], which is the
+// driver that then runs them. So the whole map change is that one call, plus
+// the world to load in [mgr+2200].
+//
+// Boot takes a different route entirely: a six-step task list whose fourth
+// step (sub_826D95E8, reached through the vtable thunk sub_826DAAE8) reaches
+// the same loader. It is a good place to CAPTURE the worker and the manager,
+// and a poor one to copy.
+constexpr uint32_t kConfirmChain[] = {0x828A3700, 0x828A36D0, 0x828A39C8};
+constexpr const char* kConfirmName[] = {"prepare", "load", "enter"};
+constexpr uint32_t kBootChain[] = {0x826DAAE8, 0x826DAB18};
+constexpr const char* kBootName[] = {"switch", "finish"};
+constexpr uint32_t kSessionPendingWorld = 2200;
+
+std::atomic<bool> g_requested{false};
+std::atomic<bool> g_request_logged{false};
+std::atomic<uint64_t> g_request_frames{0};
+
+// ASK for the world, then run the map change the game runs.
+//
+// Two earlier shapes are worth keeping in mind because each got exactly half of
+// this. Substituting the identity on the BOOT load reached the loader with the
+// right world and produced 249 meshes of 3988 and a black screen - that load
+// runs while the frontend still owns the session. Calling sub_828A3270 by hand
+// from gameplay streamed the world (3671 meshes) and left the game in the old
+// one, because the loader is the ENGINE of a map change and not the change:
+// worse, it never returns, so it parked whichever guest thread called it and
+// silently killed every instrument sequenced after it.
+//
+// What the game actually does is below: fill in the pending world and let its
+// own worker run prepare / load / enter.
+void MaybeRequestWorld(PPCContext& ctx, uint8_t* base) {
+  if (!REXCVAR_GET(skate3_warp_request_world) || base == nullptr ||
+      g_requested.load(std::memory_order_relaxed)) {
     return;
   }
   if (rex::kernel::guest_presence::GameplayContextValue() != 1) {
     return;
   }
-  if (g_induce_frames.fetch_add(1) <
+  if (g_request_frames.fetch_add(1) <
       uint64_t(REXCVAR_GET(skate3_warp_induce_delay_frames))) {
-    return;
-  }
-  const uint32_t session = g_loader_session.load(std::memory_order_relaxed);
-  if (session == 0) {
-    if (!g_induce_logged.exchange(true)) {
-      REXLOG_WARN("skate3 warp induce: no session seen yet - the world loader has not "
-                  "been called, so there is nothing to call it on");
-    }
     return;
   }
   const uint64_t wanted = ::WantedWorldIdentity(base);
   if (wanted == 0) {
-    if (!g_induce_logged.exchange(true)) {
-      REXLOG_WARN("skate3 warp induce: no identity for '{}' - see the warp identity lines",
+    if (!g_request_logged.exchange(true)) {
+      REXLOG_WARN("skate3 warp request: no identity for '{}' - see the warp identity lines",
                   REXCVAR_GET(skate3_warp_world));
     }
     return;
   }
-  if (g_induced.exchange(true)) {
+  if (g_requested.exchange(true)) {
     return;
   }
-  const uint64_t current = LoadGuestU64BE(base, session + 2192);
-  REXLOG_INFO("skate3 warp induce: calling the world loader from gameplay - "
-              "session 0x{:08X} current={:016X} -> {:016X}",
-              session, current, wanted);
+  const uint64_t current = LoadGuestU64BE(base, kWorldRequestCurrent);
+  const uint64_t was = LoadGuestU64BE(base, kWorldRequestWanted);
 
-  // Scratch well below the live frame, the same discipline the replay uses.
+  // The name too: sub_828646E0 copies its node argument into +64 before it
+  // writes the identity, so writing one without the other would leave the block
+  // describing two different worlds.
+  uint32_t slot = 0;
+  std::string full;
+  const std::string bare = WorldFolderName(REXCVAR_GET(skate3_warp_world)).substr(5);
+  const uint32_t node = FindPackNode(base, bare, &slot, &full);
+  if (!full.empty() && full.size() < 60) {
+    std::memcpy(base + kWorldRequestNode, full.c_str(), full.size() + 1);
+  }
+  StoreGuestU64BE(base, kWorldRequestWanted, wanted);
+  REXLOG_INFO("skate3 warp request: wanted {:016X} -> {:016X} (current {:016X}, node '{}')",
+              was, wanted, current, full);
+
+  if (!REXCVAR_GET(skate3_warp_induce_switch)) {
+    return;
+  }
+  const uint32_t session = g_loader_session.load(std::memory_order_relaxed);
+  if (session == 0 || g_switch_worker.load(std::memory_order_relaxed) == 0) {
+    REXLOG_WARN("skate3 warp switch: no session (0x{:08X}) or no worker was seen at boot - "
+                "the request stands unread",
+                session);
+    return;
+  }
+  // The world to load travels HERE, not in the global block: sub_828A36D0, the
+  // load job, is `r4 = [mgr+2200]; sub_828A3270(mgr, r4)`. The block is the
+  // game's own record of where it is and where it is going, kept up to date on
+  // the way; this field is the argument. MEASURED at a real confirm: by the
+  // time the map change is kicked off, both already hold the new world.
+  const uint64_t pending = LoadGuestU64BE(base, session + kSessionPendingWorld);
+  StoreGuestU64BE(base, session + kSessionPendingWorld, wanted);
+  REXLOG_INFO("skate3 warp switch: [session 0x{:08X} + 2200] {:016X} -> {:016X}", session,
+              pending, wanted);
+
+  // THE KICK. A host backtrace through a real menu confirm ends at
+  //
+  //     sub_827080A0+0x55F:  sub_828A3928(mgr, r31+96, 0x821D2770, 1)
+  //
+  // and sub_828A3928 stores that vector at [mgr+2224], sets [mgr+2208] = 3 and
+  // registers a callback pair on the object at [0x83083BCC+17140]. THAT driver
+  // submits prepare / load / enter to the worker - the three jobs this file
+  // used to submit by hand. Calling the kick instead of the jobs means the
+  // whole change is the game's, in its order, on its threads.
+  //
+  // r31+96 is the frontend's own copy of the spawn position, which no route
+  // without a frontend fills in, so take it from the start NODE - the same
+  // node the identity came from.
+  const uint32_t registry_ptr = uint32_t(int32_t(-2096627712) + 15308);
+  const uint32_t registry = LoadGuestU32BE(base, LoadGuestU32BE(base, registry_ptr) + 168);
   PPCContext call = ctx;
   call.r1.u64 = uint64_t(ctx.r1.u32 - 0x1000);
+  call.r3.u64 = registry;
+  call.r4.u64 = node;
+  __imp__sub_82911068(call, base);
+  const uint32_t node_obj = call.r3.u32;
+  if (!ReadableGuest(node_obj)) {
+    REXLOG_WARN("skate3 warp switch: node object for '{}' not readable (registry 0x{:08X}) - "
+                "no spawn position, so no kick",
+                full, registry);
+    return;
+  }
+  // The whole head of the node object, so the position's offset can be READ off
+  // a run rather than guessed at: a real confirm passes C2BEDAA0 43B0113C
+  // C30FC1CB 3F800000 for DMJumpline, and whichever row that is, is the row.
+  for (uint32_t row = 0; row < 0x40; row += 16) {
+    REXLOG_INFO("skate3 warp switch: node 0x{:08X}+0x{:02X}: {:08X} {:08X} {:08X} {:08X}",
+                node_obj, row, LoadGuestU32BE(base, node_obj + row),
+                LoadGuestU32BE(base, node_obj + row + 4),
+                LoadGuestU32BE(base, node_obj + row + 8),
+                LoadGuestU32BE(base, node_obj + row + 12));
+  }
+  // 16-byte aligned: the setter reads it with lvx, which masks the address.
+  const uint32_t vec = (ctx.r1.u32 - 0x900) & ~uint32_t(0xF);
+  std::memcpy(base + vec, base + node_obj + uint32_t(REXCVAR_GET(skate3_warp_spawn_offset)),
+              16);
+  REXLOG_INFO("skate3 warp switch: kicking sub_828A3928(mgr=0x{:08X}, vec=0x{:08X} "
+              "[{:08X} {:08X} {:08X} {:08X}])",
+              session, vec, LoadGuestU32BE(base, vec), LoadGuestU32BE(base, vec + 4),
+              LoadGuestU32BE(base, vec + 8), LoadGuestU32BE(base, vec + 12));
   call.r3.u64 = session;
-  call.r4.u64 = wanted;
-  // ARM BEFORE CALLING. sub_828A3270 does not return - measured across every
-  // induced run, the "loader returned" line never once appears, so it parks on
-  // this thread and drives the load from here. Anything sequenced after it is
-  // dead code.
+  call.r4.u64 = vec;
+  call.r5.u64 = 0x821D2770;
+  call.r6.u64 = 1;
+  __imp__sub_828A3928(call, base);
+  // MEASURED: the kick on its own registers the spawn and NOTHING ELSE happens
+  // - not one job is submitted afterwards. Its driver is only run by the
+  // frontend state machine closing (the backtrace above runs sub_826DFB30 ->
+  // sub_827080A0 -> here), and there is no frontend on this route. So submit
+  // the three jobs too, in the order the confirm's driver submits them.
   //
-  // The gate itself re-arms on a LOADING presence context, which the menu route
-  // passes through and an induced load never does; without it the new world
-  // streams and prewarms completely ("0 still queued") and is then rendered by
-  // nobody. That is the black screen.
-  skate3::native_scene::ArmTakeoverForInducedLoad();
+  // Order matters, and is why submitting them ALONE gave a black screen: the
+  // third job SPAWNS the player from [mgr+2224], and only the kick fills that
+  // in. Jobs without the kick spawn nowhere; the kick without jobs teleports
+  // into the world that is still loaded - a fall through a blue void.
+  g_chain_step.store(0, std::memory_order_relaxed);
+  REXLOG_INFO("skate3 warp switch: kicked - now running prepare / load / enter");
+}
 
-  __imp__sub_828A3270(call, base);
-  REXLOG_INFO("skate3 warp induce: the loader returned r3={:08X} (it usually does not)",
-              call.r3.u32);
+// Hand one job to the captured worker, if it is idle. Returns false when it is
+// busy, so the caller simply tries again next frame - the worker holds ONE job
+// and clears the pair only after running it, so submitting over a pending job
+// would drop it silently.
+bool SubmitToSwitchWorker(PPCContext& ctx, uint8_t* base, uint32_t fn, uint32_t arg,
+                          const char* what) {
+  const uint32_t worker = g_switch_worker.load(std::memory_order_relaxed);
+  if (worker == 0 || LoadGuestU32BE(base, worker + 56) != 0) {
+    return false;
+  }
+  REXLOG_INFO("skate3 warp switch: {} - job 0x{:08X}(0x{:08X}) to worker 0x{:08X}", what, fn,
+              arg, worker);
+  PPCContext call = ctx;
+  call.r1.u64 = uint64_t(ctx.r1.u32 - 0x1000);
+  call.r3.u64 = worker;
+  call.r4.u64 = fn;
+  call.r5.u64 = arg;
+  __imp__sub_82966C88(call, base);
+  return true;
+}
+
+// Walk the three jobs from the main thread, one per idle worker.
+void AdvanceWorldTask(PPCContext& ctx, uint8_t* base) {
+  const int step = g_chain_step.load(std::memory_order_relaxed);
+  if (base == nullptr || step < 0) {
+    return;
+  }
+  const uint32_t session = g_loader_session.load(std::memory_order_relaxed);
+  const uint32_t worker = g_switch_worker.load(std::memory_order_relaxed);
+  const bool boot = REXCVAR_GET(skate3_warp_chain) != "confirm";
+  const uint32_t* chain = boot ? kBootChain : kConfirmChain;
+  const char* const* names = boot ? kBootName : kConfirmName;
+  const int count = boot ? 2 : 3;
+  // The boot steps take the TASK, not the manager; the confirm's take the
+  // manager. Handing either the other's argument is a wild pointer.
+  const uint32_t arg = boot ? g_switch_arg.load(std::memory_order_relaxed) : session;
+  if (step >= count) {
+    // Done. The takeover gate re-arms on a LOADING presence context, which the
+    // menu route passes through and this one never does - measured: not one
+    // presence line for the whole change - so arm it here, at the far end,
+    // where the scene that gets built is the NEW world's. Arming any earlier
+    // spends the arm on the outgoing world's teardown: an arm at submit time
+    // took over on "569 items" against the 3532 already prewarmed.
+    if (LoadGuestU32BE(base, worker + 56) == 0) {
+      g_chain_step.store(-1, std::memory_order_relaxed);
+      REXLOG_INFO("skate3 warp switch: the change is done - current world {:016X}",
+                  LoadGuestU64BE(base, session + 2192));
+      skate3::native_scene::ArmTakeoverForInducedLoad();
+    }
+    return;
+  }
+  if (SubmitToSwitchWorker(ctx, base, chain[step], arg, names[step])) {
+    g_chain_step.store(step + 1, std::memory_order_relaxed);
+  }
+}
+
+// The world-request pair, watched.
+//
+// Every metric this project has for a warp - mesh counts, takeovers, prewarm -
+// measures whether DATA moved. None of them says whether the game was ever
+// asked to change world. These two words do, and they are the loader's own
+// condition, so a run where they never diverge cannot have loaded anything no
+// matter what else the log says.
+void WatchWorldRequest(uint8_t* base) {
+  if (!REXCVAR_GET(skate3_warp_watch_request) || base == nullptr) {
+    return;
+  }
+  static std::atomic<uint64_t> s_current{0};
+  static std::atomic<uint64_t> s_wanted{0};
+  const uint64_t current = LoadGuestU64BE(base, kWorldRequestCurrent);
+  const uint64_t wanted = LoadGuestU64BE(base, kWorldRequestWanted);
+  const uint64_t was_current = s_current.exchange(current, std::memory_order_relaxed);
+  const uint64_t was_wanted = s_wanted.exchange(wanted, std::memory_order_relaxed);
+  if (current != was_current || wanted != was_wanted) {
+    REXLOG_INFO("skate3 warp block: current {:016X} -> {:016X}  wanted {:016X} -> {:016X}",
+                was_current, current, was_wanted, wanted);
+  }
 }
 
 }  // namespace
@@ -1460,6 +1720,156 @@ uint64_t WantedWorldIdentity(uint8_t* base) {
 }
 
 std::atomic<bool> g_loader_substituted{false};
+
+// THE MAP-CHANGE ENTRY POINTS, logged.
+//
+// The three worker jobs are the tail of the change, not its head: something
+// copies the request into [mgr+2200], sets a state word at [mgr+2208], and
+// registers a callback pair on the object at [0x83083BCC+17140], and THAT is
+// what submits them. Four functions do that -
+//
+//   sub_8271C1C0(r3, r4)   state 1, no spawn transform
+//   sub_8271C2D0(r3, r4)   state 3 via sub_828A3928, with a transform read
+//                          out of [[r3+88]+40..48]
+//   sub_8271C910 / sub_8271C9E8   the same pair again
+//
+// - and rather than guess which one the menu takes, log all four plus the
+// spawn setter and drive the menu once.
+extern "C" REX_FUNC(sub_8271C1C0) {
+  REXLOG_INFO("skate3 warp entry: sub_8271C1C0(r3=0x{:08X}, r4={})", ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_8271C1C0(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_8271C2D0) {
+  REXLOG_INFO("skate3 warp entry: sub_8271C2D0(r3=0x{:08X}, r4={})", ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_8271C2D0(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_8271C910) {
+  REXLOG_INFO("skate3 warp entry: sub_8271C910(r3=0x{:08X}, r4={})", ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_8271C910(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_8271C9E8) {
+  REXLOG_INFO("skate3 warp entry: sub_8271C9E8(r3=0x{:08X}, r4={})", ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_8271C9E8(ctx, base);
+}
+
+// The spawn setter: [mgr+2224] = *r4 (a position), [mgr+2240] = r5,
+// [mgr+2244] = r6, [mgr+2248] = [mgr+2252] = 255, then state 3.
+extern "C" REX_FUNC(sub_828A3928) {
+  const uint32_t v = ctx.r4.u32;
+  REXLOG_INFO("skate3 warp entry: sub_828A3928(mgr=0x{:08X}, vec=0x{:08X} [{:08X} {:08X} "
+              "{:08X} {:08X}], r5=0x{:08X}, r6={})",
+              ctx.r3.u32, v, skate3::warp::LoadGuestU32BE(base, v),
+              skate3::warp::LoadGuestU32BE(base, v + 4),
+              skate3::warp::LoadGuestU32BE(base, v + 8),
+              skate3::warp::LoadGuestU32BE(base, v + 12), ctx.r5.u32, ctx.r6.u32);
+  REXLOG_INFO("skate3 warp entry: at that moment [mgr+2200] = {:016X}, block wanted {:016X}",
+              skate3::warp::LoadGuestU64BE(base, ctx.r3.u32 + 2200),
+              skate3::warp::LoadGuestU64BE(base, 0x830B7AE8 + 48));
+  skate3::guest_trace::LogHostBacktrace("map-change sub_828A3928");
+  __imp__sub_828A3928(ctx, base);
+}
+
+// THE JOB SUBMITTER.
+//
+//     sub_82966C88(worker, fn, arg):  [worker+56] = fn
+//                                     [worker+60] = arg
+//                                     SetEvent([worker+48])
+//
+// and the worker's loop (sub_82966BB8) waits on that event, calls fn(arg),
+// clears the pair, and notifies. Boot submits the world switch through here, so
+// this is where the three values a warp needs are handed over for free - there
+// is no other way to learn which worker owns the switch.
+// The six ordered steps of the world task, by thunk and by target.
+bool IsWorldTaskStep(uint32_t fn) {
+  switch (fn) {
+    case 0x826DAA20: case 0x826D8A28:
+    case 0x826DAA88: case 0x826D9040:
+    case 0x826DAAB8: case 0x826D9470:
+    case 0x826DAB18: case 0x826D9AC0:
+    case 0x826DAB48: case 0x826DA0D8:
+      return true;
+    default:
+      return false;
+  }
+}
+
+extern "C" REX_FUNC(sub_82966C88) {
+  const uint32_t worker = ctx.r3.u32, fn = ctx.r4.u32, arg = ctx.r5.u32;
+  // The thunk is one instruction - `b 0x826d95e8` - so both addresses are the
+  // world switch. Match either: which one boot submits is not worth assuming.
+  if (fn == 0x826DAAE8 || fn == 0x826D95E8) {
+    skate3::warp::g_switch_worker.store(worker, std::memory_order_relaxed);
+    skate3::warp::g_switch_arg.store(arg, std::memory_order_relaxed);
+    REXLOG_INFO("skate3 warp switch: captured the world-switch job - worker 0x{:08X} "
+                "fn 0x{:08X} arg 0x{:08X}",
+                worker, fn, arg);
+  } else if (IsWorldTaskStep(fn)) {
+    // The switch's SIBLINGS. sub_826DAA20/AA88/AAB8/AAE8/AB18/AB48 are six
+    // one-instruction thunks in a row, each paired with a setter storing 3, 6,
+    // 10, 13, 16, 22 into [task+68] - a progress code, so they are the ordered
+    // steps of one job and the switch is the fourth. Running only the fourth
+    // loads the world and leaves the game silent, which is what the two steps
+    // AFTER it are presumably for. Logged unconditionally: the order boot
+    // submits them in is the recipe.
+    REXLOG_INFO("skate3 warp job: world-task step fn 0x{:08X} arg 0x{:08X} on worker 0x{:08X}",
+                fn, arg, worker);
+  } else if (REXCVAR_GET(skate3_warp_trace_loader)) {
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 40) {
+      REXLOG_INFO("skate3 warp job: sub_82966C88(worker=0x{:08X}, fn=0x{:08X}, arg=0x{:08X})",
+                  worker, fn, arg);
+    }
+  }
+  __imp__sub_82966C88(ctx, base);
+}
+
+// THE WORLD-SWITCH STEP, one frame above the loader.
+//
+// Read out of the code: it opens by comparing the world-request block's wanted
+// (+48) and current (+40) halves and RETURNS IMMEDIATELY when they agree. Only
+// when they differ does it resolve the wanted identity to a world record, fall
+// back to a default if that fails, and finally call sub_828A3270. It is reached
+// through sub_826DAAE8, a one-instruction tail-call thunk that lives in a
+// vtable - i.e. it is a STATE the game enters, not a function anything calls by
+// name, which is why hunting for the load's caller kept ending at boot.
+//
+// Logged rather than driven: what is worth knowing is whether asking (see
+// skate3_warp_request_world) makes the game come here on its own.
+extern "C" REX_FUNC(sub_826D95E8) {
+  const uint64_t wanted = skate3::warp::LoadGuestU64BE(base, 0x830B7AE8 + 48);
+  const uint64_t current = skate3::warp::LoadGuestU64BE(base, 0x830B7AE8 + 40);
+  REXLOG_INFO("skate3 warp switch: sub_826D95E8 entered on task 0x{:08X} - wanted {:016X} "
+              "current {:016X}{}",
+              ctx.r3.u32, wanted, current,
+              wanted == current ? " (equal: it will do nothing)" : "");
+  // MEASURED: writing the wanted half from gameplay changes nothing - this
+  // function is never entered again, so nobody POLLS the pair. It is a step in
+  // a task list (its neighbours sub_826D8A28 / sub_826D9040 / sub_826D9470 /
+  // sub_826D9AC0 / sub_826DA0D8 each pair with a setter storing 3, 6, 10, 13,
+  // 16, 22 into [task+68] - a progress code), reached through the vtable thunk
+  // sub_826DAAE8. So the missing half is whatever RUNS that list, and a host
+  // backtrace names it: generated code compiles one host function per guest
+  // function, so the frames above are guest functions by name.
+  if (REXCVAR_GET(skate3_warp_trace_loader)) {
+    static std::atomic<int> remaining{4};
+    if (remaining.fetch_sub(1, std::memory_order_relaxed) > 0) {
+      skate3::guest_trace::LogHostBacktrace("world-switch sub_826D95E8");
+    }
+  }
+  __imp__sub_826D95E8(ctx, base);
+  REXLOG_INFO("skate3 warp switch: sub_826D95E8 returned - wanted {:016X} current {:016X}",
+              skate3::warp::LoadGuestU64BE(base, 0x830B7AE8 + 48),
+              skate3::warp::LoadGuestU64BE(base, 0x830B7AE8 + 40));
+  // The far end of the load, and the only moment the new world is certainly
+  // there: this returns once sub_828A3270's completion loop has finished. The
+  // menu route re-arms the takeover by passing through a LOADING presence
+  // context; a switch submitted from gameplay never changes presence at all
+  // (measured: not one presence line during the whole switch), so the arm has
+  // to be made here or the new world is rendered by nobody.
+}
 
 extern "C" REX_FUNC(sub_828A3270) {
   // The session is the loader's own first argument, and there is no other way
@@ -1718,6 +2128,24 @@ extern "C" REX_FUNC(sub_828646E0) {
   using namespace skate3::warp;
   SubstituteSpawnNode(base, &ctx.r5.u32);
   const uint32_t r5 = ctx.r5.u32;
+  // This is the REQUEST. Reading the code: it copies r5 (the start-node name)
+  // into the world-request block at +64, then does `std r11,48(r31)` with the
+  // 64-bit word its r4 buffer holds - so r4 is not a scratch "out", it is the
+  // wanted world identity, and this one store is what makes the game load.
+  // Logged unconditionally for the first few calls: on a run that works it
+  // names the identity the game chose for itself, which is the value any warp
+  // has to reproduce.
+  const uint64_t asking = LoadGuestU64BE(base, ctx.r4.u32);
+  {
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 8) {
+      REXLOG_INFO("skate3 warp request: sub_828646E0 asks for {:016X} (node '{}') while the "
+                  "block holds wanted {:016X} current {:016X}",
+                  asking, GuestString(base, r5, 64),
+                  LoadGuestU64BE(base, kWorldRequestWanted),
+                  LoadGuestU64BE(base, kWorldRequestCurrent));
+    }
+  }
   __imp__sub_828646E0(ctx, base);
   if (REXCVAR_GET(skate3_warp_trace_ids)) {
     static std::atomic<int> n{0};
@@ -1782,7 +2210,12 @@ extern "C" REX_FUNC(sub_828A42F0) {
   // this one, so its members come along.
   using namespace skate3::warp;
   MaybeReplayLocationChange(ctx, base);
-  MaybeInduceLoad(ctx, base);
+  // BOTH WATCHES RUN FIRST, and that ordering is the point. sub_828A3270 never
+  // returns, so an induced load parks this thread inside it - and every
+  // instrument sequenced after the call therefore stops reporting at the exact
+  // moment it has something to report. "[session+2192] reached the stock world
+  // and never changed again" was that: the watch had died, not the field.
+  WatchWorldRequest(base);
   // Watch the session's CURRENT world. sub_828A3270 compares its r4 against
   // [session+2192] and loads when they differ, so this field is the guest's own
   // answer to "which world am I in". After an induced load the data streams
@@ -1800,6 +2233,8 @@ extern "C" REX_FUNC(sub_828A42F0) {
       }
     }
   }
+  MaybeRequestWorld(ctx, base);
+  AdvanceWorldTask(ctx, base);
   const std::string& requested = REXCVAR_GET(skate3_warp_world);
   if (requested.empty() || !REXCVAR_GET(skate3_warp_substitute_query)) {
     __imp__sub_828A42F0(ctx, base);
