@@ -39,6 +39,9 @@ class Skate3BaseApp : public rex::ReXApp {
  private:
   void InstallRecipeOverlay();
   void InstallBigDeviceAliases();
+  // Moves already-extracted content packs dropped into Documents under the
+  // content tree the game reads.
+  void StageContentPacks();
   void InstallDlcPackages();
   void ToggleSimpleSettings();
   void ToggleNativeDebug();

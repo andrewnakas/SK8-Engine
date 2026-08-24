@@ -1,5 +1,9 @@
 #include "skate3_app_common.h"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
 #include "skate3_guest_trace.h"
@@ -504,6 +508,13 @@ std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
   add_dir(executable_root / std::string(kDlcDirectoryName));
   add_dir(game_data_root / std::string(kDlcDirectoryName));
   add_dir(user_data_root / std::string(kDlcDirectoryName));
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // On a phone the only place a pack can be put is the top of the app's
+  // Documents folder - Finder and the Files app will not drop a folder into a
+  // subdirectory of it. The scan below is recursive, so naming the root is
+  // enough to find DMJUMPLINE/dmjumpline_00000000.big and its header.
+  add_dir(user_data_root.parent_path());
+#endif
   return dirs;
 }
 
@@ -1304,7 +1315,96 @@ void Skate3BaseApp::InstallBigDeviceAliases() {
   big_device_aliases_installed_ = true;
 }
 
+void Skate3BaseApp::StageContentPacks() {
+  // Custom map packs ship as already-extracted marketplace content - a .big
+  // beside its .header - rather than an STFS package the DLC installer could
+  // open. The layout the content manager expects splits the two apart, which
+  // is what the desktop loader produces:
+  //
+  //   <user>/0000000000000000/<title>/00000002/<PKG>/<file>.big
+  //   <user>/0000000000000000/<title>/Headers/00000002/<PKG>.header
+  //
+  // The header is NOT left beside the .big, and its name is the package name,
+  // not the file's own. Putting it in the package folder leaves the content
+  // manager with content it has no descriptor for.
+  //
+  // On a phone a pack can only be dropped at the top of Documents, so this
+  // moves it into place at every start. The folder name is load-bearing: the
+  // id inside the header has to match it or the package is dropped silently.
+  if (!runtime() || !runtime()->kernel_state()) {
+    return;
+  }
+  const uint32_t title_id = runtime()->kernel_state()->title_id();
+  if (title_id == 0) {
+    return;
+  }
+  const auto documents = runtime()->user_data_root().parent_path();
+  const auto title_root = runtime()->user_data_root() / "0000000000000000" /
+                          fmt::format("{:08X}", title_id);
+  const auto content_dir = title_root / "00000002";
+  const auto headers_dir = title_root / "Headers" / "00000002";
+
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(documents, ec)) {
+    if (ec || !entry.is_directory()) {
+      continue;
+    }
+    const std::string package = entry.path().filename().string();
+    if (package == "user" || package == "game") {
+      continue;
+    }
+
+    std::filesystem::path big, header;
+    std::error_code scan_ec;
+    for (const auto& file : std::filesystem::directory_iterator(entry.path(), scan_ec)) {
+      if (scan_ec || !file.is_regular_file()) {
+        continue;
+      }
+      const auto ext = file.path().extension();
+      if (ext == ".big") {
+        big = file.path();
+      } else if (ext == ".header") {
+        header = file.path();
+      }
+    }
+    // Both halves or nothing: content without its descriptor is what the
+    // content manager silently drops, and a descriptor alone names nothing.
+    if (big.empty() || header.empty()) {
+      continue;
+    }
+
+    const auto target_dir = content_dir / package;
+    const auto target_big = target_dir / big.filename();
+    const auto target_header = headers_dir / (package + ".header");
+    if (std::filesystem::exists(target_big, ec) &&
+        std::filesystem::exists(target_header, ec)) {
+      REXLOG_INFO("Skate 3 content pack '{}' already staged", package);
+      continue;
+    }
+
+    std::filesystem::create_directories(target_dir, ec);
+    std::filesystem::create_directories(headers_dir, ec);
+    std::error_code copy_ec;
+    std::filesystem::copy_file(big, target_big,
+                               std::filesystem::copy_options::overwrite_existing, copy_ec);
+    if (copy_ec) {
+      REXLOG_WARN("Could not stage '{}' content: {}", package, copy_ec.message());
+      continue;
+    }
+    std::filesystem::copy_file(header, target_header,
+                               std::filesystem::copy_options::overwrite_existing, copy_ec);
+    if (copy_ec) {
+      REXLOG_WARN("Could not stage '{}' header: {}", package, copy_ec.message());
+      continue;
+    }
+    REXLOG_INFO("Staged Skate 3 content pack '{}' ({} + {})", package,
+                target_big.string(), target_header.string());
+  }
+}
+
 void Skate3BaseApp::InstallDlcPackages() {
+  StageContentPacks();
+
   if (!REXCVAR_GET(skate3_auto_install_dlc) || !runtime() || !runtime()->kernel_state() ||
       !runtime()->kernel_state()->content_manager()) {
     return;
