@@ -5,6 +5,7 @@
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
+#include "skate3_touch_controls.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
@@ -683,6 +684,9 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // skate3_native_render_mode_indicator shows it live). Input-transparent,
   // so it never affects cursor or focus handling.
   render_mode_indicator_ = std::make_unique<skate3::RenderModeIndicator>(drawer);
+  // On-screen pad. Constructed everywhere and inert off-device; it draws only
+  // while the touch driver reports no physical controller attached.
+  touch_controls_ = std::make_unique<skate3::TouchControlsOverlay>(drawer);
   // Loading cover for launcher-driven map selection. Constructed unconditionally
   // (it is inert unless skate3_loader_overlay is set) so the cvar stays live.
   loader_overlay_ = std::make_unique<skate3::LoaderOverlay>(drawer);

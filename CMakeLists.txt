@@ -263,6 +263,7 @@ set(SKATE3_COMMON_SOURCES
     src/native/skate3_native_palette.cpp
     src/skate3_loader_overlay.cpp
     src/skate3_native_debug_dialog.cpp
+    src/skate3_touch_controls.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
     src/skate3_native_scene_gpu.cpp

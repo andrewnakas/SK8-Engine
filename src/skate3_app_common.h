@@ -15,6 +15,7 @@
 
 #include "skate3_loader_overlay.h"
 #include "skate3_native_debug_dialog.h"
+#include "skate3_touch_controls.h"
 
 namespace rex::ui {
 class ImGuiDrawer;
@@ -61,6 +62,7 @@ class Skate3BaseApp : public rex::ReXApp {
   std::unique_ptr<rex::ui::SimpleSettingsDialog> simple_settings_dialog_;
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
+  std::unique_ptr<skate3::TouchControlsOverlay> touch_controls_;
   // Full-screen "loading <map>" cover for launcher-driven map selection.
   std::unique_ptr<skate3::LoaderOverlay> loader_overlay_;
   std::unique_ptr<skate3::LevelSelectDialog> level_select_dialog_;
