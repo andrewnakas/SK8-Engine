@@ -2,9 +2,21 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Raises the foreground jetsam limit from roughly 2 GB to roughly 3 GB on
-	     a 4 GB device. The recomp's resident set runs well past the default
-	     ceiling, so without this the app is killed rather than slowed. -->
+	<!-- BOTH ENTITLEMENTS ARE OPTIONAL as of 2026-08-24, and a build signed
+	     WITHOUT them installs, launches and plays. Verified by re-signing the
+	     same binary with both keys stripped: it ran at a 463 MB footprint
+	     against 1634 MB of headroom. That matters for distribution, because a
+	     free Apple ID cannot be granted either capability - so a personal-team
+	     profile is enough to build and play this.
+
+	     They are kept here because a paid team gets them for free and the
+	     headroom does no harm. If Xcode refuses to mint a profile for your
+	     team, delete both keys rather than paying for an account.
+
+	     Raises the foreground jetsam limit from roughly 2 GB to roughly 3 GB on
+	     a 4 GB device. No longer load-bearing: expanding opaque DXT1 to RGB565
+	     instead of RGBA8 brought the resident set to about 1 GB, under the
+	     default ceiling. -->
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
 	<!-- Allows large contiguous reservations; the guest mapping is 4.5 GB of
