@@ -38,8 +38,6 @@ class Skate3BaseApp : public rex::ReXApp {
 
  private:
   void InstallRecipeOverlay();
-  // Fills the level picker from the staged game folder when no launcher has.
-  void PopulateMapList();
   void InstallBigDeviceAliases();
   void InstallDlcPackages();
   void ToggleSimpleSettings();
@@ -65,7 +63,6 @@ class Skate3BaseApp : public rex::ReXApp {
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
   std::unique_ptr<skate3::TouchControlsOverlay> touch_controls_;
-  bool map_list_populated_ = false;
   // Full-screen "loading <map>" cover for launcher-driven map selection.
   std::unique_ptr<skate3::LoaderOverlay> loader_overlay_;
   std::unique_ptr<skate3::LevelSelectDialog> level_select_dialog_;

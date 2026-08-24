@@ -5,7 +5,6 @@
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
-#include "skate3_ios_maps.h"
 #include "skate3_touch_controls.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
@@ -1287,17 +1286,8 @@ void Skate3BaseApp::InstallRecipeOverlay() {
       "\\Device\\Harddisk0\\Partition1\\data\\state\\livingworldentities\\pedestrian\\plugin",
       "skate3bigdirs:\\data\\state\\livingworldentities\\pedestrian\\plugin");
   recipe_overlay_installed_ = true;
-  PopulateMapList();
   REXLOG_INFO("Installed Skate 3 BIG-directory VFS overlay with {} aliases from {}",
               created, content_root.string());
-}
-
-void Skate3BaseApp::PopulateMapList() {
-  if (map_list_populated_ || !runtime()) {
-    return;
-  }
-  map_list_populated_ = true;
-  skate3::ios_maps::PopulateFromGameFolder(runtime()->game_data_root());
 }
 
 void Skate3BaseApp::InstallBigDeviceAliases() {
