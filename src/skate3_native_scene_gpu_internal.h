@@ -389,16 +389,26 @@ struct HostTextureFormat {
 };
 
 // True where the GPU has no BC/S3TC support and the guest's DXT blocks have to
-// be expanded on the CPU before upload. Metal exposes BC only on Mac-class
-// GPUs; on an iOS device vkCreateImage returns VK_ERROR_FORMAT_NOT_SUPPORTED
-// and MoltenVK then passes Metal pixelFormat 0, which asserts inside the
-// driver rather than failing gracefully.
-inline constexpr bool kDecodeBcOnCpu =
-#if REX_PLATFORM_IOS
-    true;
-#else
-    false;
-#endif
+// be expanded on the CPU before upload. Where the GPU does not support them,
+// vkCreateImage returns VK_ERROR_FORMAT_NOT_SUPPORTED and MoltenVK then passes
+// Metal pixelFormat 0, which asserts inside the driver rather than failing
+// gracefully - so this must be right before the first upload, not discovered.
+//
+// This used to be a compile-time `true` on iOS, on the premise that Metal
+// exposes BC only on Mac-class GPUs. That has not been true since iOS 16.4:
+// A-series GPUs from the A15 answer MTLDevice.supportsBCTextureCompression,
+// and MoltenVK gates its BC formats on exactly that. The premise cost 8x on
+// every DXT1 surface, because the alternative to sampling a 4bpp block is
+// storing a 32bpp expansion of it - which is most of why the texture store
+// runs into its budget and evicts continuously.
+//
+// So ask the device instead. Resolved once, from the render thread, before any
+// texture is uploaded; every caller reads the resolved answer.
+bool DecodeBcOnCpu();
+
+// Asks the device which BC formats it can sample and latches the answer.
+// Safe to call every frame; only the first call with a device does work.
+void ResolveBcSupport(nrhi::Device* device);
 
 // The uncompressed stand-in each BC format decodes to. Kept next to
 // GetHostTextureFormat so the two cannot drift apart.
@@ -418,21 +428,21 @@ inline bool IsBcGuestFormat(xenos::TextureFormat format) {
 inline bool GetHostTextureFormat(xenos::TextureFormat format, HostTextureFormat& out) {
   switch (rex::graphics::GetBaseFormat(format)) {
     case xenos::TextureFormat::k_DXT1:
-      out = kDecodeBcOnCpu ? HostTextureFormat{nrhi::Format::kR8G8B8A8_UNORM,
+      out = DecodeBcOnCpu() ? HostTextureFormat{nrhi::Format::kR8G8B8A8_UNORM,
                                                nrhi::Format::kR8G8B8A8_UNORM,
                                                xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA}
                            : HostTextureFormat{nrhi::Format::kBC1_UNORM, nrhi::Format::kBC1_UNORM,
                                                xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
       return true;
     case xenos::TextureFormat::k_DXT2_3:
-      out = kDecodeBcOnCpu ? HostTextureFormat{nrhi::Format::kR8G8B8A8_UNORM,
+      out = DecodeBcOnCpu() ? HostTextureFormat{nrhi::Format::kR8G8B8A8_UNORM,
                                                nrhi::Format::kR8G8B8A8_UNORM,
                                                xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA}
                            : HostTextureFormat{nrhi::Format::kBC2_UNORM, nrhi::Format::kBC2_UNORM,
                                                xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
       return true;
     case xenos::TextureFormat::k_DXT4_5:
-      out = kDecodeBcOnCpu ? HostTextureFormat{nrhi::Format::kR8G8B8A8_UNORM,
+      out = DecodeBcOnCpu() ? HostTextureFormat{nrhi::Format::kR8G8B8A8_UNORM,
                                                nrhi::Format::kR8G8B8A8_UNORM,
                                                xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA}
                            : HostTextureFormat{nrhi::Format::kBC3_UNORM, nrhi::Format::kBC3_UNORM,
@@ -441,14 +451,14 @@ inline bool GetHostTextureFormat(xenos::TextureFormat format, HostTextureFormat&
     case xenos::TextureFormat::k_DXT5A:
       // BC4 decodes to a single 8-bit channel; the RRRR view swizzle that
       // follows broadcasts it exactly as the compressed form did.
-      out = kDecodeBcOnCpu
+      out = DecodeBcOnCpu()
                 ? HostTextureFormat{nrhi::Format::kR8_UNORM, nrhi::Format::kR8_UNORM,
                                     xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR}
                 : HostTextureFormat{nrhi::Format::kBC4_UNORM, nrhi::Format::kBC4_UNORM,
                                     xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
       return true;
     case xenos::TextureFormat::k_DXN:
-      out = kDecodeBcOnCpu
+      out = DecodeBcOnCpu()
                 ? HostTextureFormat{nrhi::Format::kR8G8_UNORM, nrhi::Format::kR8G8_UNORM,
                                     xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG}
                 : HostTextureFormat{nrhi::Format::kBC5_UNORM, nrhi::Format::kBC5_UNORM,

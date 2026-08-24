@@ -174,6 +174,56 @@ REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 #if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
 
 namespace skate3::native_scene {
+
+// ---- BC texture support ----------------------------------------------------
+// Whether the guest's DXT blocks have to be expanded to RGBA8 before upload.
+// See the note on DecodeBcOnCpu in skate3_native_scene_gpu_internal.h: the
+// answer is worth 4x to 8x on every compressed surface, so it is asked of the
+// device rather than assumed from the platform.
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_bc_gpu, -1, "Skate 3",
+                     "Sample the guest's BC/DXT blocks on the GPU instead of expanding them to "
+                     "RGBA8 on the CPU. -1 asks the device, 0 always expands, 1 forces the "
+                     "compressed path on. Expanding costs 8x the texture memory for DXT1.")
+    .range(-1, 1);
+
+namespace {
+bool g_bc_on_cpu = true;
+bool g_bc_resolved = false;
+}  // namespace
+
+bool DecodeBcOnCpu() { return g_bc_on_cpu; }
+
+void ResolveBcSupport(nrhi::Device* device) {
+  if (g_bc_resolved || device == nullptr) {
+    return;
+  }
+  g_bc_resolved = true;
+  const int32_t forced = REXCVAR_GET(skate3_native_render_scene_bc_gpu);
+  if (forced >= 0) {
+    g_bc_on_cpu = forced == 0;
+    REXLOG_INFO("native-scene: BC textures {} (forced by cvar)",
+                g_bc_on_cpu ? "expanded to RGBA8 on the CPU" : "sampled compressed on the GPU");
+    return;
+  }
+  // Every format the guest can present must work, not just BC1: the upload
+  // path picks per texture, and one unsupported format is a Metal pixelFormat
+  // of 0 inside the driver rather than a failure this code can see.
+  const nrhi::Format required[] = {nrhi::Format::kBC1_UNORM, nrhi::Format::kBC2_UNORM,
+                                   nrhi::Format::kBC3_UNORM, nrhi::Format::kBC4_UNORM,
+                                   nrhi::Format::kBC5_UNORM};
+  bool all = true;
+  for (nrhi::Format format : required) {
+    if (!device->SupportsSampledTextureFormat(format)) {
+      all = false;
+      break;
+    }
+  }
+  g_bc_on_cpu = !all;
+  REXLOG_INFO("native-scene: BC textures {} (device {} sample BC1-BC5)",
+              g_bc_on_cpu ? "expanded to RGBA8 on the CPU" : "sampled compressed on the GPU",
+              all ? "can" : "cannot");
+}
+
 namespace {
 
 // Retire a guest texture's GPU resources AND its view. Destruction is
@@ -1906,7 +1956,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   // On a GPU without BC support the blocks are expanded before upload, so the
   // footprint is texel-based rather than block-based: full texel rows, and a
   // pitch measured in decoded bytes per texel.
-  const bool decode_bc = kDecodeBcOnCpu && IsBcGuestFormat(info.format);
+  const bool decode_bc = DecodeBcOnCpu() && IsBcGuestFormat(info.format);
   const uint32_t decoded_bpp = !decode_bc                                              ? 0u
                                : host.resource_format == nrhi::Format::kR8_UNORM       ? 1u
                                : host.resource_format == nrhi::Format::kR8G8_UNORM     ? 2u
@@ -2222,7 +2272,7 @@ bool UpdateGuestTexture2DInPlace(const NativeGuestOutputRenderContext& context,
   // has to be expanded on the CPU the destination is uncompressed and the
   // strides no longer line up, so decline and let the caller take the full
   // decode path in EnsureGuestTextureFromWords instead.
-  if (kDecodeBcOnCpu && IsBcGuestFormat(info.format)) {
+  if (DecodeBcOnCpu() && IsBcGuestFormat(info.format)) {
     return false;
   }
   if (info.dimension != xenos::DataDimension::k2DOrStacked || info.is_stacked ||
@@ -2439,7 +2489,7 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   // Cube faces still upload raw blocks; without BC support that would land
   // compressed bytes in an uncompressed texture. Skip rather than draw
   // garbage - the sky falls back to its untextured path.
-  if (kDecodeBcOnCpu && IsBcGuestFormat(info.format)) {
+  if (DecodeBcOnCpu() && IsBcGuestFormat(info.format)) {
     return false;
   }
   const rex::graphics::FormatInfo* format_info = info.format_info();
@@ -4317,6 +4367,9 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   if (g_r.failed) return false;
   nrhi::Device* device = context.device;
   g_r.device = device;
+
+  // Before any texture exists: every upload path branches on the answer.
+  ResolveBcSupport(device);
 
   if (!EnsureRootSignature(context)) {
     return false;
