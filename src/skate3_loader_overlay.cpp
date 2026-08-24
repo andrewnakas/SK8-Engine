@@ -1,5 +1,12 @@
 #include "skate3_loader_overlay.h"
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include "skate3_ios_maps.h"
+#endif
+
 #include "skate3_warp.h"
 
 #include <algorithm>
@@ -509,6 +516,20 @@ void LevelSelectDialog::Choose(int entry, const std::string& name) {
     // alive across the switch and re-stages before relaunching.
     const std::string request_path = REXCVAR_GET(skate3_loader_request_path);
     if (request_path.empty()) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+      // No launcher exists on a phone and an app cannot relaunch itself, so
+      // the choice is written where the next launch reads it and the player
+      // reopens the app. Crude, but it lands the right map - which the
+      // in-session switch above still does not.
+      const std::vector<std::string> ids =
+          SplitLevels(REXCVAR_GET(skate3_loader_level_worlds));
+      if (entry < static_cast<int>(ids.size()) && !ids[entry].empty()) {
+        if (skate3::ios_maps::RequestBootWorld(ids[entry]) && overlay_) {
+          overlay_->Restart(name + " - reopen the app to load", "", 0.08f);
+        }
+        return;
+      }
+#endif
       REXLOG_WARN("Skate 3 level select: '{}' is in pack '{}' but no launcher is listening",
                   name, pack);
       return;
