@@ -61,6 +61,7 @@
 #endif
 #endif
 #include "skate3_native_scene_state.h"
+#include "skate3_crash_report.h"
 #include "skate3_native_scene_gpu_internal.h"
 
 // Cvars defined in skate3_native_scene.cpp (and SDK cvars re-declared there).
@@ -7567,6 +7568,12 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     g_warm_tex_log_budget.store(4, std::memory_order_relaxed);
     g_slow_frame_log_budget.store(3, std::memory_order_relaxed);
   }
+  // Liveness for the stall watchdog, every frame rather than every window: a
+  // guest deadlock keeps presenting frames at full rate while submitting
+  // nothing, which the frame heartbeat cannot distinguish from a healthy idle.
+  skate3::crash_report::NoteGuestWork(g_draws_2d.load(std::memory_order_relaxed) +
+                                      g_draws_spline.load(std::memory_order_relaxed) + drawn);
+
   if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     uint32_t lw_ctxs = 0, lw_ents = 0;
     skate3::native_lw::QueryLwStats(&lw_ctxs, &lw_ents);

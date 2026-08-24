@@ -29,6 +29,7 @@ namespace skate3::crash_report {
 #if defined(_WIN32)
 inline void EnsureInstalled(uint8_t* /*guest_base*/) {}
 inline void Heartbeat() {}
+inline void NoteGuestWork(uint64_t /*submitted*/) {}
 #else
 // guest_base is the runtime's virtual membase, used to render the faulting
 // host address as a guest address (the only form that means anything when
@@ -39,6 +40,15 @@ void EnsureInstalled(uint8_t* guest_base);
 // skate3_hang_watchdog_seconds, every thread's stack is dumped - a freeze
 // raises no signal, so this is the only way to see one from the inside.
 void Heartbeat();
+
+// Called at the guest frame boundary with a monotonically rising count of the
+// work the guest has SUBMITTED (draws and 2D draws). A guest can go on
+// presenting frames at full rate while submitting nothing at all - that is
+// what a deadlock between two guest threads looks like from here, and the
+// frame heartbeat above cannot see it because the frames never stopped. When
+// this count stops moving while frames keep arriving, the same thread dump
+// fires.
+void NoteGuestWork(uint64_t submitted);
 #endif
 
 }  // namespace skate3::crash_report

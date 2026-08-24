@@ -229,6 +229,9 @@ void WriteGuestState(Report& r) {
 // tid in /proc/self/task and each one dumps itself from the signal handler.
 // SIGRTMIN carries no default meaning and is not used by the runtime.
 std::atomic<uint64_t> g_heartbeat{0};
+// Work the guest has submitted, as reported at the frame boundary. Distinct
+// from the heartbeat: frames can keep arriving while this stands still.
+std::atomic<uint64_t> g_guest_work{0};
 std::atomic<bool> g_hang_reported{false};
 
 #if defined(__linux__)
@@ -404,6 +407,8 @@ void DumpAllThreads() {
 void WatchdogMain() {
   uint64_t last_seen = 0;
   int stalled_ticks = 0;
+  uint64_t last_work = 0;
+  int idle_ticks = 0;
   for (;;) {
     struct timespec ts = {1, 0};
     nanosleep(&ts, nullptr);
@@ -411,11 +416,31 @@ void WatchdogMain() {
     if (limit <= 0) {
       continue;
     }
+    // Frames still arriving but the guest submitting no work: two guest
+    // threads deadlocked against each other, with the render thread happily
+    // presenting an unchanging scene. The frame heartbeat below cannot see
+    // this, because the frames never stopped - so it is checked separately,
+    // and given a longer grace period since a legitimate load screen submits
+    // nothing for a while too.
+    const uint64_t work = g_guest_work.load(std::memory_order_relaxed);
+    if (work != last_work) {
+      last_work = work;
+      idle_ticks = 0;
+    } else if (work != 0 && ++idle_ticks >= limit * 3 &&
+               !g_hang_reported.exchange(true, std::memory_order_relaxed)) {
+      Report r;
+      r.Str("\n=== skate3: STALL - frames still presenting, guest submitting no draws ===\n");
+      r.Flush();
+      DumpAllThreads();
+    }
+
     const uint64_t now = g_heartbeat.load(std::memory_order_relaxed);
     if (now != last_seen) {
       last_seen = now;
       stalled_ticks = 0;
-      g_hang_reported.store(false, std::memory_order_relaxed);
+      if (idle_ticks == 0) {
+        g_hang_reported.store(false, std::memory_order_relaxed);
+      }
       continue;
     }
     // The heartbeat legitimately stops while the game is not presenting
@@ -547,6 +572,10 @@ void EnsureInstalled(uint8_t* guest_base) {
 }
 
 void Heartbeat() { g_heartbeat.fetch_add(1, std::memory_order_relaxed); }
+
+void NoteGuestWork(uint64_t submitted) {
+  g_guest_work.store(submitted, std::memory_order_relaxed);
+}
 
 }  // namespace skate3::crash_report
 
