@@ -436,20 +436,19 @@ add_custom_target(skate3_stage_runtime_library
 )
 add_dependencies(skate3 skate3_stage_runtime_library)
 
-if(NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
-    add_custom_target(skate3_stage_title_update_patches
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-            "$<TARGET_FILE_DIR:skate3>/game/data/webkit"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${SKATE3_TITLE_UPDATE_DEFAULT_XEXP}"
-            "$<TARGET_FILE_DIR:skate3>/game/default.xexp"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${SKATE3_TITLE_UPDATE_EAWEBKIT_XEXP}"
-            "$<TARGET_FILE_DIR:skate3>/game/data/webkit/EAWebkit.xexp"
-        DEPENDS skate3-title-update-codegen-inputs
-        VERBATIM
-    )
-    add_dependencies(skate3 skate3_stage_title_update_patches)
+# The title-update patches are NOT staged into the app bundle. They are the
+# publisher's data, and putting them next to the executable would make the
+# shipped app carry game content - the one thing that has to stay on the
+# player's side of the line.
+#
+# Nothing is lost by leaving them out: the recompiler consumed the title update
+# at BUILD time (that is what SKATE3_TITLE_UPDATE_PACKAGE is for, and why the
+# link fails without it), and at RUN time the patches are read from the game
+# root the player supplies - Documents/game on iOS, which is also where
+# skate3_title_update_installer.cpp stages them. A bundled copy was redundant
+# with the player's own.
+if(FALSE AND NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
+    # Intentionally disabled; see above.
 endif()
 
 if(MSVC)
