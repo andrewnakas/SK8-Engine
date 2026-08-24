@@ -33,6 +33,33 @@
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 
+	<!-- Icons are loose PNGs in the bundle root rather than a compiled asset
+	     catalog: the build is driven by Ninja, and actool is an Xcode build
+	     phase we do not have. iOS resolves the @2x/@3x variants itself from
+	     these base names. -->
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon20x20</string>
+				<string>AppIcon29x29</string>
+				<string>AppIcon40x40</string>
+				<string>AppIcon60x60</string>
+			</array>
+			<key>UIPrerenderedIcon</key>
+			<false/>
+		</dict>
+	</dict>
+	<key>CFBundleIconFiles</key>
+	<array>
+		<string>AppIcon20x20</string>
+		<string>AppIcon29x29</string>
+		<string>AppIcon40x40</string>
+		<string>AppIcon60x60</string>
+	</array>
+
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>

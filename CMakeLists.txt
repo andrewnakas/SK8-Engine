@@ -436,6 +436,20 @@ add_custom_target(skate3_stage_runtime_library
 )
 add_dependencies(skate3 skate3_stage_runtime_library)
 
+# App icons. Loose PNGs beside the executable - see the note in Info.plist.in
+# about why there is no asset catalog here.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    file(GLOB SKATE3_IOS_ICONS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ios/icon/AppIcon*.png")
+    if(SKATE3_IOS_ICONS)
+        add_custom_target(skate3_stage_icons
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${SKATE3_IOS_ICONS} "$<TARGET_FILE_DIR:skate3>"
+            VERBATIM
+        )
+        add_dependencies(skate3 skate3_stage_icons)
+    endif()
+endif()
+
 # The title-update patches are NOT staged into the app bundle. They are the
 # publisher's data, and putting them next to the executable would make the
 # shipped app carry game content - the one thing that has to stay on the
