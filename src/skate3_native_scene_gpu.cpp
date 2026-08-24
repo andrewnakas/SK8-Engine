@@ -193,6 +193,13 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_dxt1_565, -1, "Skate 3",
                      "it on. Textures using DXT1's punch-out alpha stay RGBA8 either way.")
     .range(-1, 1);
 
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_tex_base_mip_px, 0, "Skate 3",
+                     "Drop guest mip 0 for scene textures at least this many texels on their "
+                     "longest side, uploading from mip 1 down. 0 disables. Quarters the bytes of "
+                     "exactly the textures that dominate the store; costs the top level of "
+                     "detail, which at phone resolution is largely unreachable.")
+    .range(0, 8192);
+
 namespace {
 bool g_bc_on_cpu = true;
 bool g_bc_resolved = false;
@@ -1824,9 +1831,12 @@ thread_local uint64_t g_tex_dec_create_ns = 0;
 thread_local uint64_t g_tex_dec_gen_ns = 0;
 thread_local uint64_t g_tex_dec_copy_ns = 0;
 
+// allow_base_mip_shift is false for the 2D/HUD resolver: overlay2d.hlsl reads
+// the texture's own dimensions to decide whether to magnify with Catmull-Rom,
+// so halving one silently changes that decision.
 bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
                                  uint8_t* base, const uint32_t words[6],
-                                 GuestTexture& out) {
+                                 GuestTexture& out, bool allow_base_mip_shift = true) {
   g_tex_dec_create_ns = 0;
   g_tex_dec_gen_ns = 0;
   g_tex_dec_copy_ns = 0;
@@ -1928,7 +1938,23 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   MipSrc srcs[16] = {};
   static thread_local std::vector<uint8_t> tex_scratch;
   uint32_t scratch_total = 0;
-  for (uint32_t m = 0; m < mip_count; ++m) {
+
+  // Start the upload at guest mip 1 for large textures: at this screen size
+  // the top level is largely unreachable, and NOT ALLOCATING it is 4x on
+  // exactly the textures that fill the store. The host texture is created at
+  // mip-1 dimensions rather than viewed through a base_mip, because only the
+  // smaller allocation saves anything. Requires a real chain, which single-mip
+  // content (non-pow2 HUD art, composed lightmap pages) does not have.
+  uint32_t base_mip = 0;
+  {
+    const int32_t shift_px = REXCVAR_GET(skate3_native_render_scene_tex_base_mip_px);
+    if (allow_base_mip_shift && shift_px > 0 && mip_count >= 2 &&
+        std::max(width, height) >= uint32_t(shift_px)) {
+      base_mip = 1;
+    }
+  }
+
+  const auto fill_src = [&](uint32_t g, MipSrc& s) {
     uint32_t ox = 0, oy = 0;
     // Mip 0 through GetMipLocation too: textures <= 16 texels on a side
     // store their BASE level packed inside a 32x32 tile at a block offset.
@@ -1937,12 +1963,13 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     // blobs over every wall whose material uses it (validated: with the
     // packed offset it decodes pure white). Non-packed textures return the
     // plain base address with zero offsets.
-    const uint32_t mip_addr = info.GetMipLocation(m, &ox, &oy, true);
-    const auto ext = info.GetMipExtent(m, true);
-    MipSrc& s = srcs[m];
+    const uint32_t mip_addr = info.GetMipLocation(g, &ox, &oy, true);
+    const auto ext = info.GetMipExtent(g, true);
     s.addr = mip_addr;
-    s.pitch_blocks = m == 0 ? info.extent.block_pitch_h : ext.block_pitch_h;
-    s.size = m == 0 ? info.memory.base_size : ext.all_blocks() * bytes_per_block;
+    // These special cases belong to GUEST mip 0, so they key on g - with the
+    // shift on, the level they describe is simply never uploaded.
+    s.pitch_blocks = g == 0 ? info.extent.block_pitch_h : ext.block_pitch_h;
+    s.size = g == 0 ? info.memory.base_size : ext.all_blocks() * bytes_per_block;
     s.min_size = s.size;
     if (info.is_tiled) {
       // Tiled addressing swizzles across 32x32-BLOCK macro tiles AND, for
@@ -1959,8 +1986,8 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
       // Size the copy with the SDK's swizzle-aware upper bound instead; if
       // that over-reaches the committed allocation the copy loop below
       // falls back to the reported size and marks the decode incomplete.
-      const uint32_t mw = std::max(width >> m, 1u);
-      const uint32_t mh = std::max(height >> m, 1u);
+      const uint32_t mw = std::max(width >> g, 1u);
+      const uint32_t mh = std::max(height >> g, 1u);
       const uint32_t right = (mw + block_w - 1) / block_w + ox;
       const uint32_t bottom = (mh + block_h - 1) / block_h + oy;
       s.size = std::max(
@@ -1969,9 +1996,25 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     }
     s.ox = ox;
     s.oy = oy;
+  };
+
+  // Guest mip 0 is still DESCRIBED even when it is not uploaded: the payload
+  // probes below derive their grid from the mip-0 dimensions and revalidate
+  // against guest memory, not against the uploaded texture, so feeding them
+  // mip 1's pitch and offsets would misalign the tear-heal machinery.
+  MipSrc mip0_src = {};
+  if (base_mip != 0) {
+    fill_src(0, mip0_src);
+  }
+  mip_count -= base_mip;
+  for (uint32_t m = 0; m < mip_count; ++m) {
+    MipSrc& s = srcs[m];
+    fill_src(m + base_mip, s);
     s.scratch_off = scratch_total;
     scratch_total += s.size;
   }
+  const uint32_t host_width_base = std::max(host_width >> base_mip, 1u);
+  const uint32_t host_height_base = std::max(host_height >> base_mip, 1u);
   const auto copy_t0 = PerfClock::now();
   tex_scratch.resize(scratch_total);
   uint32_t mips_copied = 0;
@@ -2036,8 +2079,8 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     const uint32_t run_blocks = std::clamp(16u >> bytes_per_block_log2, 1u, 8u);
     bool punch_out = false;
     for (uint32_t m = 0; m < mip_count && !punch_out; ++m) {
-      const uint32_t mw = std::max(width >> m, 1u);
-      const uint32_t mh = std::max(height >> m, 1u);
+      const uint32_t mw = std::max(width >> (m + base_mip), 1u);
+      const uint32_t mh = std::max(height >> (m + base_mip), 1u);
       const uint32_t cols = (mw + block_w - 1) / block_w;
       const uint32_t rows = (mh + block_h - 1) / block_h;
       const MipSrc& s = srcs[m];
@@ -2091,16 +2134,16 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   MipPlan plans[16] = {};
   uint32_t upload_size = 0;
   for (uint32_t m = 0; m < mip_count; ++m) {
-    const uint32_t mw = std::max(width >> m, 1u);
-    const uint32_t mh = std::max(height >> m, 1u);
+    const uint32_t mw = std::max(width >> (m + base_mip), 1u);
+    const uint32_t mh = std::max(height >> (m + base_mip), 1u);
     MipPlan& p = plans[m];
     p.cols = (mw + block_w - 1) / block_w;
     p.rows = (mh + block_h - 1) / block_h;
     if (decode_bc) {
       // Sized against the host (block-aligned) extent, because that is what
       // the CopyBufferToTexture calls below hand the driver for each mip.
-      const uint32_t hmw = std::max(host_width >> m, 1u);
-      const uint32_t hmh = std::max(host_height >> m, 1u);
+      const uint32_t hmw = std::max(host_width_base >> m, 1u);
+      const uint32_t hmh = std::max(host_height_base >> m, 1u);
       p.pitch = (hmw * decoded_bpp + (nrhi::kRowPitchAlignment - 1u)) &
                 ~(nrhi::kRowPitchAlignment - 1u);
       p.offset = (upload_size + (kUploadPlacementAlignment - 1u)) &
@@ -2118,8 +2161,8 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   nrhi::Device* device = context.device;
   nrhi::TextureDesc desc;
   desc.kind = nrhi::TextureKind::k2D;
-  desc.width = host_width;
-  desc.height = host_height;
+  desc.width = host_width_base;
+  desc.height = host_height_base;
   desc.mip_levels = mip_count;
   desc.format = host.resource_format;
   desc.initial_state = nrhi::ResourceState::kCopyDest;
@@ -2230,8 +2273,9 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
         // One block row expands to four texel rows; the helper clamps against
         // the mip's real extent so padded blocks do not write past it.
         DecodeBcRowToMapping(out_row, p.cols, rex::graphics::GetBaseFormat(info.format),
-                             std::max(host_width >> m, 1u), std::max(host_height >> m, 1u), by,
-                             mapping + p.offset, p.pitch, decoded_bpp, pack_rgb565);
+                             std::max(host_width_base >> m, 1u),
+                             std::max(host_height_base >> m, 1u), by, mapping + p.offset,
+                             p.pitch, decoded_bpp, pack_rgb565);
       } else {
         std::memcpy(mapping + p.offset + size_t(by) * p.pitch, out_row, row_bytes);
       }
@@ -2302,16 +2346,16 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     ComposeSrvSwizzle(fetch.swizzle, host.host_swizzle, sc.swizzle);
     sc.mip_count = std::min<uint32_t>(mip_count, 16);
     for (uint32_t m = 0; m < sc.mip_count; ++m) {
-      sc.mips[m] = {plans[m].offset, plans[m].pitch, std::max(host_width >> m, 1u),
-                    std::max(host_height >> m, 1u)};
+      sc.mips[m] = {plans[m].offset, plans[m].pitch, std::max(host_width_base >> m, 1u),
+                    std::max(host_height_base >> m, 1u)};
     }
   } else {
     // Record the upload copies into the deferred command list.
     for (uint32_t m = 0; m < mip_count; ++m) {
       const MipPlan& p = plans[m];
       context.cmd->CopyBufferToTexture(out.texture, m, 0, out.upload, p.offset,
-                                       p.pitch, std::max(host_width >> m, 1u),
-                                       std::max(host_height >> m, 1u), 1);
+                                       p.pitch, std::max(host_width_base >> m, 1u),
+                                       std::max(host_height_base >> m, 1u), 1);
     }
     context.cmd->Barrier(out.texture, nrhi::ResourceState::kCopyDest,
                          nrhi::ResourceState::kPixelShaderResource);
@@ -2334,10 +2378,11 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
     }
   }
   // Payload sample for content revalidation (see GuestTexture).
+  const MipSrc& probe_src = base_mip == 0 ? srcs[0] : mip0_src;
   out.payload_addr = 0xA0000000u | info.memory.base_address;
-  out.payload_size = srcs[0].size;
-  BuildPayloadProbes(info, srcs[0].addr, srcs[0].ox, srcs[0].oy,
-                     srcs[0].pitch_blocks, srcs[0].size, out);
+  out.payload_size = probe_src.size;
+  BuildPayloadProbes(info, probe_src.addr, probe_src.ox, probe_src.oy,
+                     probe_src.pitch_blocks, probe_src.size, out);
   out.payload_fp = SampleProbeFingerprint(base, out);
   out.near_black = SampleProbeNearBlack(base, out);
   out.recheck_frame = 0;
@@ -10637,7 +10682,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // HUD elements for no gain).
       const auto hud_t0 = PerfClock::now();
       GuestTexture gt;
-      EnsureGuestTextureFromWords(context, base, fetch, gt);
+      EnsureGuestTextureFromWords(context, base, fetch, gt,
+                                  /*allow_base_mip_shift=*/false);
       const uint64_t decode_ns = perf_ns_since(hud_t0);
       hot_inline_budget_ns -= int64_t(decode_ns);
       g_pw_tex_decode.Add(decode_ns);
