@@ -113,11 +113,12 @@ REXCVAR_DEFINE_INT32(skate3_warp_trace_loader_limit, 4, "Skate 3",
                      "few, so raise this to also capture the menu confirm's load - the one "
                      "that actually works, and therefore the one worth copying.")
     .range(1, 200);
-REXCVAR_DEFINE_INT32(skate3_warp_induce_delay_frames, 0, "Skate 3",
-                     "Frames of gameplay to wait before asking for the world. Zero: the "
-                     "change goes as soon as presence says gameplay, which is as early as "
-                     "the worker and the session are both known. The wait was insurance "
-                     "against a half-settled stock world and costs 3.3 s of a 22 s run.")
+REXCVAR_DEFINE_INT32(skate3_warp_induce_delay_frames, 120, "Skate 3",
+                     "Frames of gameplay to wait before asking for the world. Zero was "
+                     "tried for speed and cost 28 of 38 maps: the identity lookup is two "
+                     "heap scans, and starting them on the first gameplay frame starves "
+                     "the guest before the pack's location table is registered. Two "
+                     "seconds, and the lookup then retries once a second.")
     .range(0, 100000);
 REXCVAR_DEFINE_BOOL(skate3_warp_request_world, false, "Skate 3",
                     "ASK for the world instead of loading it. The game keeps a global pair "
@@ -135,6 +136,17 @@ REXCVAR_DEFINE_BOOL(skate3_warp_induce_switch, false, "Skate 3",
                     "sub_828A39C8 (enter, which spawns the player from the transform at "
                     "[mgr+2224]) - each submitted as the previous one finishes. Without "
                     "this, skate3_warp_request_world writes a request nothing polls.");
+REXCVAR_DEFINE_STRING(skate3_warp_node, "", "Skate 3",
+                      "The EXACT spawn node to warp to, e.g. Z_DWMegaCompound_Start. When "
+                      "empty the node is guessed as Z_<world id>_..._Start, which is the "
+                      "community convention and is wrong for a large minority of packs: "
+                      "the official DLC name the node after the map rather than the world "
+                      "(DW_MegaCompund -> Z_DWMegaCompound_Start, MaloofMoneyCupDLC -> "
+                      "Z_MaloofMCNYC_Start), and any world id containing a SPACE is spelled "
+                      "with underscores in its node (San Vanelona -> "
+                      "Z_san_vanelona_artgallery_Start). Nothing has to be guessed: the "
+                      "launcher scans the real node out of the pack's own archive, so it "
+                      "can simply say which one it wants.");
 REXCVAR_DEFINE_BOOL(skate3_warp_at_boot, false, "Skate 3",
                     "Load the requested world INSTEAD of the stock one, rather than after "
                     "it. Two thirds of a warp is the stock world booting first, and the "
@@ -975,7 +987,11 @@ bool EqualsNoCase(const std::string& a, const std::string& b) {
 
 uint32_t FindPackNode(const uint8_t* base, const std::string& bare, uint32_t* slot_out,
                       std::string* full) {
-  const std::string prefix = "Z_" + bare + "_";
+  // An exact node, when the caller knows it. The prefix guess below encodes a
+  // convention rather than a rule, and the packs that break it are not exotic -
+  // every official DLC does, and so does every world id with a space in it.
+  const std::string& exact = REXCVAR_GET(skate3_warp_node);
+  const std::string prefix = exact.empty() ? "Z_" + bare + "_" : exact;
   constexpr uint32_t kPackLo = 0x41000000;
   constexpr uint32_t kPackHi = 0x43000000;
   for (uint32_t a = kPackLo; a < kPackHi; ++a) {
@@ -998,9 +1014,13 @@ uint32_t FindPackNode(const uint8_t* base, const std::string& bare, uint32_t* sl
     // Insensitive but still LITERAL: no normalisation. Stripping separators
     // makes "San Vanelona" match "san_vanelona_artgallery", which is a
     // different location - the loader learned that one the same way.
-    if (text.size() <= prefix.size() ||
-        !EqualsNoCase(text.substr(0, prefix.size()), prefix) ||
-        text.compare(text.size() - 6, 6, "_Start") != 0) {
+    if (exact.empty()) {
+      if (text.size() <= prefix.size() ||
+          !EqualsNoCase(text.substr(0, prefix.size()), prefix) ||
+          text.compare(text.size() - 6, 6, "_Start") != 0) {
+        continue;
+      }
+    } else if (!EqualsNoCase(text, exact)) {
       continue;
     }
     const uint32_t slot = FindPointerToNear(base, a, a);
@@ -1378,18 +1398,45 @@ void MaybeRequestWorld(PPCContext& ctx, uint8_t* base) {
   if (rex::kernel::guest_presence::GameplayContextValue() != 1) {
     return;
   }
-  if (g_request_frames.fetch_add(1) <
-      uint64_t(REXCVAR_GET(skate3_warp_induce_delay_frames))) {
+  // RATE-LIMITED, and that is not a nicety. The identity lookup is two heap
+  // SCANS - 32 MB byte-wise in FindPackNode, then 128 MB word-wise for the menu
+  // item that carries the pair - and this runs from a per-frame hook. Retrying
+  // it on every frame of a 60 Hz loop starves the guest so badly that the very
+  // registration it is waiting for never completes: measured, 28 of 38 worlds
+  // never resolved, and a world that failed for 90 s resolved on the first
+  // attempt once the scan was given room. So: first try after the delay, then
+  // once a second, and say so when it never comes.
+  constexpr uint64_t kRetryFrames = 60;
+  constexpr uint64_t kMaxAttempts = 30;
+  const uint64_t n = g_request_frames.fetch_add(1);
+  const uint64_t delay = uint64_t(REXCVAR_GET(skate3_warp_induce_delay_frames));
+  if (n < delay || ((n - delay) % kRetryFrames) != 0) {
+    return;
+  }
+  const uint64_t attempt = (n - delay) / kRetryFrames;
+  if (attempt >= kMaxAttempts) {
+    if (!g_request_logged.exchange(true)) {
+      REXLOG_WARN("skate3 warp request: '{}' never resolved in {} attempts over {} s - "
+                  "the pack's location table is not in guest memory, so there is nothing "
+                  "to warp to",
+                  REXCVAR_GET(skate3_warp_world), kMaxAttempts,
+                  (kMaxAttempts * kRetryFrames) / 60);
+    }
     return;
   }
   const uint64_t wanted = ::WantedWorldIdentity(base);
   if (wanted == 0) {
-    if (!g_request_logged.exchange(true)) {
-      REXLOG_WARN("skate3 warp request: no identity for '{}' - see the warp identity lines",
+    // Not latched: the table arrives late on most packs, so this is a "not yet"
+    // far more often than a "never". The give-up message above is the one that
+    // latches.
+    if (attempt == 0) {
+      REXLOG_INFO("skate3 warp request: '{}' has no identity yet - retrying once a second",
                   REXCVAR_GET(skate3_warp_world));
     }
     return;
   }
+  REXLOG_INFO("skate3 warp request: '{}' resolved on attempt {} ({} s after gameplay)",
+              REXCVAR_GET(skate3_warp_world), attempt + 1, (n - delay) / 60);
   if (g_requested.exchange(true)) {
     return;
   }
@@ -1721,9 +1768,14 @@ uint64_t WantedWorldIdentity(uint8_t* base) {
   const std::string folder = skate3::warp::WorldFolderName(want).substr(5);
   const uint32_t node = skate3::warp::FindPackNode(base, folder, &slot, &full);
   if (node == 0 || slot == 0) {
-    REXLOG_WARN("skate3 warp identity: no pack node for '{}' (folder '{}') - "
-                "node=0x{:08X} slot=0x{:08X}",
-                want, folder, node, slot);
+    // First few only: this is retried until the table shows up, and an
+    // unguarded warning here wrote ~60 lines a second into the log.
+    static std::atomic<int> missing{0};
+    if (missing.fetch_add(1) < 3) {
+      REXLOG_WARN("skate3 warp identity: no pack node for '{}' (folder '{}') - "
+                  "node=0x{:08X} slot=0x{:08X}",
+                  want, folder, node, slot);
+    }
     return 0;
   }
   REXLOG_INFO("skate3 warp identity: '{}' -> node 0x{:08X} slot 0x{:08X} full '{}'",
