@@ -186,23 +186,46 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_bc_gpu, -1, "Skate 3",
                      "compressed path on. Expanding costs 8x the texture memory for DXT1.")
     .range(-1, 1);
 
+// See DecodeDxt1To565 in skate3_native_scene_gpu_internal.h.
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_dxt1_565, -1, "Skate 3",
+                     "Expand opaque DXT1 to 16bpp RGB565 instead of 32bpp RGBA8 where the blocks "
+                     "have to be expanded on the CPU anyway. -1 asks the device, 0 off, 1 forces "
+                     "it on. Textures using DXT1's punch-out alpha stay RGBA8 either way.")
+    .range(-1, 1);
+
 namespace {
 bool g_bc_on_cpu = true;
 bool g_bc_resolved = false;
+bool g_dxt1_565 = false;
 }  // namespace
 
 bool DecodeBcOnCpu() { return g_bc_on_cpu; }
+
+bool DecodeDxt1To565() { return g_dxt1_565; }
 
 void ResolveBcSupport(nrhi::Device* device) {
   if (g_bc_resolved || device == nullptr) {
     return;
   }
   g_bc_resolved = true;
+  const auto resolve_565 = [device]() {
+    // Only worth anything where DXT1 is being expanded anyway: if the GPU
+    // samples BC1 natively, 4bpp already beats 16bpp.
+    const int32_t forced_565 = REXCVAR_GET(skate3_native_render_scene_dxt1_565);
+    const bool supported =
+        g_bc_on_cpu && device->SupportsSampledTextureFormat(nrhi::Format::kB5G6R5_UNORM);
+    g_dxt1_565 = forced_565 >= 0 ? (forced_565 != 0 && g_bc_on_cpu) : supported;
+    REXLOG_INFO("native-scene: opaque DXT1 expands to {}{}", g_dxt1_565 ? "RGB565" : "RGBA8",
+                forced_565 >= 0 ? " (forced by cvar)"
+                                : (supported ? " (device can sample B5G6R5)"
+                                             : " (device cannot sample B5G6R5, or BC is native)"));
+  };
   const int32_t forced = REXCVAR_GET(skate3_native_render_scene_bc_gpu);
   if (forced >= 0) {
     g_bc_on_cpu = forced == 0;
     REXLOG_INFO("native-scene: BC textures {} (forced by cvar)",
                 g_bc_on_cpu ? "expanded to RGBA8 on the CPU" : "sampled compressed on the GPU");
+    resolve_565();
     return;
   }
   // Every format the guest can present must work, not just BC1: the upload
@@ -222,6 +245,7 @@ void ResolveBcSupport(nrhi::Device* device) {
   REXLOG_INFO("native-scene: BC textures {} (device {} sample BC1-BC5)",
               g_bc_on_cpu ? "expanded to RGBA8 on the CPU" : "sampled compressed on the GPU",
               all ? "can" : "cannot");
+  resolve_565();
 }
 
 namespace {
@@ -1393,6 +1417,28 @@ void DecodeBc1Block(const uint8_t* b, uint8_t px[16][4], bool four_color_only = 
   }
 }
 
+// Does this DXT1 block carry real alpha? Only in the three-colour mode
+// (c0 <= c1, the else branch of DecodeBc1Block above) does index 3 mean
+// transparent - and only if some texel actually selects it. Encoders emit flat
+// blocks as c0 == c1 in that mode all the time without ever using index 3, so
+// testing the mode alone would keep most of an atlas at RGBA8 for nothing.
+// Expects the block already byte-swapped into little-endian order.
+inline bool Bc1BlockUsesPunchOut(const uint8_t* b) {
+  const uint16_t c0 = uint16_t(b[0] | (b[1] << 8));
+  const uint16_t c1 = uint16_t(b[2] | (b[3] << 8));
+  if (c0 > c1) {
+    return false;
+  }
+  uint32_t bits =
+      uint32_t(b[4]) | (uint32_t(b[5]) << 8) | (uint32_t(b[6]) << 16) | (uint32_t(b[7]) << 24);
+  for (int i = 0; i < 16; ++i, bits >>= 2) {
+    if ((bits & 3u) == 3u) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // The 8-byte interpolated-alpha block shared by BC3's alpha half, BC4, and
 // both halves of BC5: two endpoints then sixteen 3-bit indices.
 void DecodeBcAlphaBlock(const uint8_t* b, uint8_t out[16]) {
@@ -1447,9 +1493,12 @@ void DecodeBc3Block(const uint8_t* b, uint8_t px[16][4]) {
 // Metal pixelFormat 0, which is a hard assert inside the driver), so the
 // blocks are expanded here instead. One block row covers four texel rows;
 // rows past the mip's height are dropped rather than clamped.
+// pack_rgb565 writes each decoded texel as one 16-bit R5G6B5 rather than
+// dst_bpp raw channel bytes. It is a separate flag and not just dst_bpp == 2
+// because 2 already means BC5's R,G pair.
 void DecodeBcRowToMapping(const uint8_t* block_row, uint32_t cols, xenos::TextureFormat base_fmt,
                           uint32_t mip_w, uint32_t mip_h, uint32_t block_y, uint8_t* dst_base,
-                          uint32_t dst_pitch, uint32_t dst_bpp) {
+                          uint32_t dst_pitch, uint32_t dst_bpp, bool pack_rgb565 = false) {
   const uint32_t bytes_per_block =
       (base_fmt == xenos::TextureFormat::k_DXT1 || base_fmt == xenos::TextureFormat::k_DXT5A) ? 8u
                                                                                              : 16u;
@@ -1495,7 +1544,16 @@ void DecodeBcRowToMapping(const uint8_t* block_row, uint32_t cols, xenos::Textur
       if (x >= mip_w || y >= mip_h) {
         continue;
       }
-      std::memcpy(dst_base + size_t(y) * dst_pitch + size_t(x) * dst_bpp, px[t], dst_bpp);
+      uint8_t* dst = dst_base + size_t(y) * dst_pitch + size_t(x) * dst_bpp;
+      if (pack_rgb565) {
+        // Red in the top bits, matching kB5G6R5_UNORM (VK_FORMAT_R5G6B5_UNORM_PACK16
+        // and DXGI_FORMAT_B5G6R5_UNORM share this layout).
+        const uint16_t packed = uint16_t(((px[t][0] >> 3) << 11) | ((px[t][1] >> 2) << 5) |
+                                         (px[t][2] >> 3));
+        std::memcpy(dst, &packed, sizeof(packed));
+        continue;
+      }
+      std::memcpy(dst, px[t], dst_bpp);
     }
   }
 }
@@ -1957,10 +2015,74 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   // footprint is texel-based rather than block-based: full texel rows, and a
   // pitch measured in decoded bytes per texel.
   const bool decode_bc = DecodeBcOnCpu() && IsBcGuestFormat(info.format);
+
+  // Opaque DXT1 expands to 16bpp instead of 32bpp. The format cannot come from
+  // GetHostTextureFormat because it depends on the block CONTENT, and the
+  // content only exists once the chain above has been copied - which is why
+  // this sits here, in the window before anything reads `host`.
+  //
+  // EVERY copied mip is scanned, not just mip 0. ps_shadow_caster_clip samples
+  // the cutout with SampleBias(+2), so a texture whose mip 0 happens to be all
+  // four-colour but whose lower mips punch out would lose its shadow
+  // silhouette. Truncated copies stay RGBA8: their tail blocks were zeroed, a
+  // zero block reads as opaque, and the re-decode that follows would then
+  // disagree about the format.
+  if (decode_bc && DecodeDxt1To565() && !copy_truncated &&
+      rex::graphics::GetBaseFormat(info.format) == xenos::TextureFormat::k_DXT1) {
+    // Same run-copy addressing as the upload loop below (see the proof there),
+    // so only the blocks that are really part of each mip get looked at -
+    // padded macro-row and pool-neighbour blocks would otherwise read as
+    // punch-out and demote the whole texture for nothing.
+    const uint32_t run_blocks = std::clamp(16u >> bytes_per_block_log2, 1u, 8u);
+    bool punch_out = false;
+    for (uint32_t m = 0; m < mip_count && !punch_out; ++m) {
+      const uint32_t mw = std::max(width >> m, 1u);
+      const uint32_t mh = std::max(height >> m, 1u);
+      const uint32_t cols = (mw + block_w - 1) / block_w;
+      const uint32_t rows = (mh + block_h - 1) / block_h;
+      const MipSrc& s = srcs[m];
+      const uint8_t* guest = tex_scratch.data() + s.scratch_off;
+      for (uint32_t by = 0; by < rows && !punch_out; ++by) {
+        for (uint32_t bx = 0; bx < cols && !punch_out;) {
+          uint32_t off, run;
+          if (!info.is_tiled) {
+            off = ((by + s.oy) * s.pitch_blocks + s.ox + bx) * bytes_per_block;
+            run = cols - bx;
+          } else {
+            const uint32_t x = bx + s.ox;
+            run = std::min(cols - bx, run_blocks - (x & (run_blocks - 1)));
+            off = uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+                int32_t(x), int32_t(by + s.oy), s.pitch_blocks, bytes_per_block_log2));
+          }
+          for (uint32_t i = 0; i < run; ++i) {
+            const uint32_t boff = off + i * bytes_per_block;
+            if (boff + bytes_per_block > s.size) {
+              continue;  // range guard, same as the upload loop
+            }
+            uint8_t block[8];
+            std::memcpy(block, guest + boff, sizeof(block));
+            SwapGuestEndian(block, sizeof(block), info.endianness);
+            if (Bc1BlockUsesPunchOut(block)) {
+              punch_out = true;
+              break;
+            }
+          }
+          bx += run;
+        }
+      }
+    }
+    if (!punch_out) {
+      host = HostTextureFormat{nrhi::Format::kB5G6R5_UNORM, nrhi::Format::kB5G6R5_UNORM,
+                               xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+    }
+  }
+
   const uint32_t decoded_bpp = !decode_bc                                              ? 0u
                                : host.resource_format == nrhi::Format::kR8_UNORM       ? 1u
                                : host.resource_format == nrhi::Format::kR8G8_UNORM     ? 2u
+                               : host.resource_format == nrhi::Format::kB5G6R5_UNORM   ? 2u
                                                                                        : 4u;
+  const bool pack_rgb565 = host.resource_format == nrhi::Format::kB5G6R5_UNORM && decode_bc;
 
   // Per-mip upload footprints (D3D12 alignment rules).
   struct MipPlan {
@@ -2109,7 +2231,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
         // the mip's real extent so padded blocks do not write past it.
         DecodeBcRowToMapping(out_row, p.cols, rex::graphics::GetBaseFormat(info.format),
                              std::max(host_width >> m, 1u), std::max(host_height >> m, 1u), by,
-                             mapping + p.offset, p.pitch, decoded_bpp);
+                             mapping + p.offset, p.pitch, decoded_bpp, pack_rgb565);
       } else {
         std::memcpy(mapping + p.offset + size_t(by) * p.pitch, out_row, row_bytes);
       }

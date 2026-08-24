@@ -408,7 +408,21 @@ bool DecodeBcOnCpu();
 
 // Asks the device which BC formats it can sample and latches the answer.
 // Safe to call every frame; only the first call with a device does work.
+// Also latches DecodeDxt1To565.
 void ResolveBcSupport(nrhi::Device* device);
+
+// True where a DXT1 texture being expanded on the CPU should be expanded to
+// 16bpp RGB565 rather than 32bpp RGBA8. A DXT1 block's endpoints ARE RGB565,
+// so for a block in the four-colour mode this costs only the precision of the
+// two interpolated colours - and halves the largest texture class on a device
+// that has to store 4bpp source as an expansion.
+//
+// It cannot be decided from the format alone. A block whose c0 <= c1 is in the
+// three-colour punch-out mode, where index 3 means TRANSPARENT, and the game
+// leans on that alpha: scene.hlsl alpha-tests foliage and fence cards with it
+// and clips shadow casters against it. So the decision is per texture, taken
+// after the guest blocks have been copied - see Dxt1ChainUsesPunchOut.
+bool DecodeDxt1To565();
 
 // The uncompressed stand-in each BC format decodes to. Kept next to
 // GetHostTextureFormat so the two cannot drift apart.
