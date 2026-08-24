@@ -9,6 +9,7 @@
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
+#include <rex/ui/windowed_app_context_sdl.h>
 #include "skate3_touch_controls.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
@@ -694,6 +695,19 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // Native/emulated corner readout (top right; off by default, cvar
   // skate3_native_render_mode_indicator shows it live). Input-transparent,
   // so it never affects cursor or focus handling.
+  // Give back what can be rebuilt when the system says it is short. On a
+  // phone the usual cause is something else entirely - a call arriving - and
+  // an app that does not answer gets its graphics resources reclaimed out from
+  // under the driver instead. The stores refill from guest memory on demand,
+  // so the cost is a few seconds of redecoding rather than a lost session.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  if (auto* sdl_context = dynamic_cast<rex::ui::SDLWindowedAppContext*>(&app_context())) {
+    sdl_context->SetLowMemoryHandler([]() {
+      skate3::native_scene::FlushTextureCache();
+      skate3::native_scene::FlushMeshCache();
+    });
+  }
+#endif
   render_mode_indicator_ = std::make_unique<skate3::RenderModeIndicator>(drawer);
   // On-screen pad. Constructed everywhere and inert off-device; it draws only
   // while the touch driver reports no physical controller attached.
