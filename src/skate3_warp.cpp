@@ -1437,6 +1437,26 @@ void MaybeRequestWorld(PPCContext& ctx, uint8_t* base) {
   }
   REXLOG_INFO("skate3 warp request: '{}' resolved on attempt {} ({} s after gameplay)",
               REXCVAR_GET(skate3_warp_world), attempt + 1, (n - delay) / 60);
+  // A NODE WITHOUT A MENU ROW RESOLVES TO THE STOCK WORLD.
+  //
+  // The identity comes from the menu item whose +0x24 points at the node's pack
+  // entry, and only the node a Locations row is built for has one. Ask for a
+  // checkpoint, a cylinder or a multiplayer gate instead and the heap scan
+  // finds an item that carries the CURRENT world's pair - so the switch commits
+  // the world the game is already in, the load is skipped as a no-op, and every
+  // log line reads like success while the screen still shows Port Carverton.
+  // Measured on ForestSlope, McGazza and Joyride, deterministic across four
+  // runs each. Refuse it here: this is not a warp.
+  const uint32_t session_now = g_loader_session.load(std::memory_order_relaxed);
+  if (session_now != 0 && wanted == LoadGuestU64BE(base, session_now + 2192)) {
+    if (!g_request_logged.exchange(true)) {
+      REXLOG_WARN("skate3 warp request: '{}' resolved to the world already loaded "
+                  "({:016X}) - that node has no Locations row of its own, so ask for the "
+                  "pack's start node instead",
+                  REXCVAR_GET(skate3_warp_world), wanted);
+    }
+    return;
+  }
   if (g_requested.exchange(true)) {
     return;
   }
