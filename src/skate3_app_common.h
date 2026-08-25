@@ -66,6 +66,9 @@ class Skate3BaseApp : public rex::ReXApp {
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
   std::unique_ptr<skate3::TouchControlsOverlay> touch_controls_;
+  // Answered while the UI was still painting; consumed when staging runs.
+  std::string chosen_content_pack_;
+  bool chose_content_pack_ = false;
   // Full-screen "loading <map>" cover for launcher-driven map selection.
   std::unique_ptr<skate3::LoaderOverlay> loader_overlay_;
   std::unique_ptr<skate3::LevelSelectDialog> level_select_dialog_;

@@ -700,6 +700,42 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
       runtime_paths.game_data_root,
       window() ? window()->GetNativeWindowHandle() : nullptr);
 #endif
+  // Choose the content pack HERE, not where it is staged. Staging happens in
+  // OnPostSetup, by which point the UI has stopped painting - blocking there
+  // for a tap just leaves a black screen. This runs in the same window the
+  // install wizards above use, where the drawer is live, and only records the
+  // answer; OnPostSetup reads it later.
+  if (REXCVAR_GET(skate3_content_pack).empty()) {
+    std::vector<std::string> packs;
+    std::error_code pack_ec;
+    const auto documents = runtime_paths.user_data_root.parent_path();
+    for (const auto& entry : std::filesystem::directory_iterator(documents, pack_ec)) {
+      if (pack_ec || !entry.is_directory()) {
+        continue;
+      }
+      const std::string name = entry.path().filename().string();
+      if (name == "user" || name == "game") {
+        continue;
+      }
+      // A content pack is a folder carrying a .header; nothing else here has
+      // one, so this does not offer the player their own save folders.
+      std::error_code scan_ec;
+      for (const auto& file : std::filesystem::directory_iterator(entry.path(), scan_ec)) {
+        if (!scan_ec && file.is_regular_file() && file.path().extension() == ".header") {
+          packs.push_back(name);
+          break;
+        }
+      }
+    }
+    std::sort(packs.begin(), packs.end());
+    if (packs.size() > 1) {
+      const std::string chosen =
+          skate3::ChoosePackBlocking(app_context(), window(), imgui_drawer(), packs);
+      chosen_content_pack_ = chosen;
+      chose_content_pack_ = true;
+    }
+  }
+
   return runtime_paths;
 }
 
@@ -1392,18 +1428,14 @@ void Skate3BaseApp::StageContentPacks() {
   // More than one and no choice already made: ask, before anything is staged.
   // The guest has not started, so blocking here is free - and it has to happen
   // now, because the boot content scan reads what this stages.
-  if (candidates.size() > 1 && wanted.empty() && REXCVAR_GET(skate3_content_pack_menu)) {
-    std::vector<std::string> names;
-    names.reserve(candidates.size());
-    for (const auto& c : candidates) {
-      names.push_back(c.filename().string());
-    }
-    REXLOG_INFO("Skate 3 content packs available: {}", names.size());
-    wanted = skate3::ChoosePackBlocking(app_context(), window(), imgui_drawer(), names);
-    if (wanted.empty()) {
+  if (chose_content_pack_) {
+    // Answered before the guest started; empty means "stock game, stage
+    // nothing".
+    if (chosen_content_pack_.empty()) {
       REXLOG_INFO("Skate 3: no content pack staged this launch");
       return;
     }
+    wanted = chosen_content_pack_;
   }
 
   for (const auto& entry : candidates) {
