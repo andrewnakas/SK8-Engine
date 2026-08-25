@@ -40,6 +40,7 @@
 #include <rex/system/thread_state.h>
 
 REXCVAR_DECLARE(int32_t, skate3_hang_watchdog_seconds);
+REXCVAR_DECLARE(int32_t, skate3_stall_watchdog_seconds);
 
 namespace skate3::crash_report {
 
@@ -422,11 +423,18 @@ void WatchdogMain() {
     // this, because the frames never stopped - so it is checked separately,
     // and given a longer grace period since a legitimate load screen submits
     // nothing for a while too.
+    // Its own limit, and shorter than three times the frame-stall one it used
+    // to borrow. A player who hits a hang relaunches within a few seconds -
+    // long before 45 - so the dump that would explain it never got written.
+    int stall_limit = REXCVAR_GET(skate3_stall_watchdog_seconds);
+    if (stall_limit <= 0) {
+      stall_limit = limit * 3;
+    }
     const uint64_t work = g_guest_work.load(std::memory_order_relaxed);
     if (work != last_work) {
       last_work = work;
       idle_ticks = 0;
-    } else if (work != 0 && ++idle_ticks >= limit * 3 &&
+    } else if (work != 0 && ++idle_ticks >= stall_limit &&
                !g_hang_reported.exchange(true, std::memory_order_relaxed)) {
       Report r;
       r.Str("\n=== skate3: STALL - frames still presenting, guest submitting no draws ===\n");

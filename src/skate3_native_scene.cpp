@@ -59,6 +59,14 @@
 
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
+REXCVAR_DEFINE_INT32(skate3_stall_watchdog_seconds, 12, "Skate 3",
+                     "Seconds of the guest submitting no draws - while frames keep being "
+                     "presented - before every thread's stack is dumped. This is the shape a "
+                     "guest deadlock takes: the renderer happily presents an unchanging scene, "
+                     "so the frame-stall watchdog below never notices. 0 borrows three times "
+                     "that one's limit.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(skate3_hang_watchdog_seconds, 15, "Skate 3",
                      "Seconds without a guest frame before the hang watchdog dumps every "
                      "thread's stack to the log and to <log_file>.crash (0 = off). A freeze "
