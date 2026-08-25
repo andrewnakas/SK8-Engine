@@ -29,7 +29,28 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
   // navigation configured - but a player on a phone with a pad attached still
   // has to be able to answer this, and it is the one screen between them and
   // the game.
+  ~PackSelectDialog() {
+    for (SDL_Gamepad* pad : opened_) {
+      SDL_CloseGamepad(pad);
+    }
+  }
+
   void PollPad(size_t count) {
+    // Bring the gamepad subsystem up ourselves. It is normally started by the
+    // SDL input driver, which belongs to the runtime's input system - and that
+    // does not exist yet this early, so without this SDL_GetGamepads finds
+    // nothing and the pad appears dead. Refcounted, so the driver starting it
+    // again later is harmless.
+    if (!pad_subsystem_ready_) {
+      pad_subsystem_ready_ = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+      if (!pad_subsystem_ready_) {
+        return;
+      }
+      REXLOG_INFO("Skate 3 pack chooser: gamepad input ready");
+    }
+    // Pads are discovered through the event queue, which nothing is pumping
+    // this early either.
+    SDL_PumpEvents();
     int pad_count = 0;
     SDL_JoystickID* pads = SDL_GetGamepads(&pad_count);
     if (pads == nullptr) {
@@ -37,9 +58,19 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
     }
     bool up = false, down = false, accept = false;
     for (int i = 0; i < pad_count; ++i) {
+      // OPEN it. SDL_GetGamepadFromID only hands back a gamepad that is
+      // already open, so on its own it returns null for every attached pad and
+      // the controller looks dead. Handles are kept and closed with the
+      // dialog, rather than reopening each frame.
       SDL_Gamepad* pad = SDL_GetGamepadFromID(pads[i]);
       if (pad == nullptr) {
-        continue;
+        pad = SDL_OpenGamepad(pads[i]);
+        if (pad == nullptr) {
+          continue;
+        }
+        opened_.push_back(pad);
+        REXLOG_INFO("Skate 3 pack chooser: controller '{}' connected",
+                    SDL_GetGamepadName(pad) ? SDL_GetGamepadName(pad) : "?");
       }
       up |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP);
       down |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
@@ -132,6 +163,8 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
   size_t selected_ = 0;
   bool up_held_ = false, down_held_ = false, accept_held_ = false;
   bool accept_pressed_ = false;
+  bool pad_subsystem_ready_ = false;
+  std::vector<SDL_Gamepad*> opened_;
 };
 
 }  // namespace
