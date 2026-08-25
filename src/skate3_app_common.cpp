@@ -700,12 +700,13 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
       runtime_paths.game_data_root,
       window() ? window()->GetNativeWindowHandle() : nullptr);
 #endif
-  // Choose the content pack HERE, not where it is staged. Staging happens in
-  // OnPostSetup, by which point the UI has stopped painting - blocking there
-  // for a tap just leaves a black screen. This runs in the same window the
-  // install wizards above use, where the drawer is live, and only records the
-  // answer; OnPostSetup reads it later.
-  if (REXCVAR_GET(skate3_content_pack).empty()) {
+  // Ask which pack to load, before anything of the game starts. Asynchronous:
+  // this runs from OnFinalizePaths, before OnInitialize has returned, so the
+  // event loop is not pumping yet and a blocking wait would draw nothing -
+  // which is exactly the black screen it produced. Returning nullopt lets the
+  // loop start and the dialog render; startup resumes from the callback, the
+  // same shape the install wizards above use on Apple platforms.
+  if (REXCVAR_GET(skate3_content_pack).empty() && !chose_content_pack_) {
     std::vector<std::string> packs;
     std::error_code pack_ec;
     const auto documents = runtime_paths.user_data_root.parent_path();
@@ -718,7 +719,7 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
         continue;
       }
       // A content pack is a folder carrying a .header; nothing else here has
-      // one, so this does not offer the player their own save folders.
+      // one, so the player is not offered their own save folders.
       std::error_code scan_ec;
       for (const auto& file : std::filesystem::directory_iterator(entry.path(), scan_ec)) {
         if (!scan_ec && file.is_regular_file() && file.path().extension() == ".header") {
@@ -729,10 +730,13 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     }
     std::sort(packs.begin(), packs.end());
     if (packs.size() > 1) {
-      const std::string chosen =
-          skate3::ChoosePackBlocking(app_context(), window(), imgui_drawer(), packs);
-      chosen_content_pack_ = chosen;
-      chose_content_pack_ = true;
+      skate3::ShowPackSelect(imgui_drawer(), packs,
+                             [this, paths = runtime_paths, resume](std::string choice) mutable {
+                               chosen_content_pack_ = std::move(choice);
+                               chose_content_pack_ = true;
+                               resume(std::move(paths));
+                             });
+      return std::nullopt;
     }
   }
 

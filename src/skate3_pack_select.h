@@ -13,6 +13,7 @@
 
 #include <filesystem>
 #include <string>
+#include <functional>
 #include <vector>
 
 namespace rex::ui {
@@ -23,12 +24,16 @@ class WindowedAppContext;
 
 namespace skate3 {
 
-// Blocks until one is chosen, pumping the UI the way the title-update wizard
-// does. Returns the chosen folder name, or empty if the choice was skipped or
-// the app is quitting - in which case the caller stages the first by name.
-std::string ChoosePackBlocking(rex::ui::WindowedAppContext& app_context, rex::ui::Window* window,
-                               rex::ui::ImGuiDrawer* drawer,
-                               const std::vector<std::string>& packs);
+// Shows the list and returns immediately; `chosen` fires on the UI thread with
+// the folder name, or empty for "stock game".
+//
+// Asynchronous rather than blocking, because this runs from OnFinalizePaths -
+// before OnInitialize has returned, so the event loop is not pumping yet and a
+// blocking wait draws nothing at all. The caller returns std::nullopt and
+// resumes from the callback, which is the same shape the install wizards use
+// on Apple platforms.
+void ShowPackSelect(rex::ui::ImGuiDrawer* drawer, const std::vector<std::string>& packs,
+                    std::function<void(std::string)> chosen);
 
 }  // namespace skate3
 
