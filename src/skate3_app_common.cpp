@@ -741,7 +741,7 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     }
     std::sort(packs.begin(), packs.end());
     if (packs.size() > 1) {
-      skate3::ShowPackSelect(imgui_drawer(), packs,
+      skate3::ShowPackSelect(app_context(), imgui_drawer(), packs,
                              [this, paths = runtime_paths, resume](std::string choice) mutable {
                                chosen_content_pack_ = std::move(choice);
                                chose_content_pack_ = true;

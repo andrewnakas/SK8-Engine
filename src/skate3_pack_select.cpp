@@ -19,9 +19,12 @@ namespace {
 
 class PackSelectDialog final : public rex::ui::ImGuiDialog {
  public:
-  PackSelectDialog(rex::ui::ImGuiDrawer* drawer, std::vector<std::string> packs,
-                   std::function<void(std::string)> chosen)
-      : ImGuiDialog(drawer), packs_(std::move(packs)), chosen_(std::move(chosen)) {}
+  PackSelectDialog(rex::ui::WindowedAppContext& app_context, rex::ui::ImGuiDrawer* drawer,
+                   std::vector<std::string> packs, std::function<void(std::string)> chosen)
+      : ImGuiDialog(drawer),
+        app_context_(app_context),
+        packs_(std::move(packs)),
+        chosen_(std::move(chosen)) {}
 
  protected:
   // Controller navigation, read straight from SDL. The runtime's input system
@@ -151,12 +154,21 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
     auto chosen = std::move(chosen_);
     REXLOG_INFO("Skate 3: pack '{}' chosen", picked.empty() ? "(none)" : picked);
     Close();
+    // Resume startup on the NEXT UI tick, not from inside this draw. The
+    // callback restarts app initialisation - creating the runtime, launching
+    // the module - and running that while the drawer is still iterating its
+    // dialogs, having just deleted this one, is what made boot hang after a
+    // pick.
     if (chosen) {
-      chosen(std::move(picked));
+      app_context_.CallInUIThreadDeferred(
+          [chosen = std::move(chosen), picked = std::move(picked)]() mutable {
+            chosen(std::move(picked));
+          });
     }
   }
 
  private:
+  rex::ui::WindowedAppContext& app_context_;
   std::vector<std::string> packs_;
   std::function<void(std::string)> chosen_;
   bool done_ = false;
@@ -169,11 +181,12 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
 
 }  // namespace
 
-void ShowPackSelect(rex::ui::ImGuiDrawer* drawer, const std::vector<std::string>& packs,
+void ShowPackSelect(rex::ui::WindowedAppContext& app_context, rex::ui::ImGuiDrawer* drawer,
+                    const std::vector<std::string>& packs,
                     std::function<void(std::string)> chosen) {
   REXLOG_INFO("Skate 3: asking which of {} content packs to load", packs.size());
   // Owns itself; ImGuiDialog deletes on Close().
-  new PackSelectDialog(drawer, packs, std::move(chosen));
+  new PackSelectDialog(app_context, drawer, packs, std::move(chosen));
 }
 
 }  // namespace skate3

@@ -32,7 +32,8 @@ namespace skate3 {
 // blocking wait draws nothing at all. The caller returns std::nullopt and
 // resumes from the callback, which is the same shape the install wizards use
 // on Apple platforms.
-void ShowPackSelect(rex::ui::ImGuiDrawer* drawer, const std::vector<std::string>& packs,
+void ShowPackSelect(rex::ui::WindowedAppContext& app_context, rex::ui::ImGuiDrawer* drawer,
+                    const std::vector<std::string>& packs,
                     std::function<void(std::string)> chosen);
 
 }  // namespace skate3
