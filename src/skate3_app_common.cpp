@@ -12,6 +12,12 @@
 #include "skate3_pack_select.h"
 #include <rex/ui/windowed_app_context_sdl.h>
 
+REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, false, "Skate 3",
+                    "Ask which content pack to load when several are installed. Off: the first "
+                    "by name is staged. The chooser runs from OnPostSetup, where the UI is not "
+                    "yet painting - it blocks there and the screen stays black, so it needs a "
+                    "different insertion point before it can be on by default.");
+
 REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
                       "Which custom content pack in Documents to stage this launch, by folder "
                       "name. Empty stages the first by name. Only one is staged per launch: the "
@@ -1386,7 +1392,7 @@ void Skate3BaseApp::StageContentPacks() {
   // More than one and no choice already made: ask, before anything is staged.
   // The guest has not started, so blocking here is free - and it has to happen
   // now, because the boot content scan reads what this stages.
-  if (candidates.size() > 1 && wanted.empty()) {
+  if (candidates.size() > 1 && wanted.empty() && REXCVAR_GET(skate3_content_pack_menu)) {
     std::vector<std::string> names;
     names.reserve(candidates.size());
     for (const auto& c : candidates) {
