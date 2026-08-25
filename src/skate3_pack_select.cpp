@@ -5,6 +5,7 @@
 #include <memory>
 #include <thread>
 
+#include <SDL3/SDL.h>
 #include <imgui.h>
 
 #include <rex/logging.h>
@@ -23,10 +24,52 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
       : ImGuiDialog(drawer), packs_(std::move(packs)), chosen_(std::move(chosen)) {}
 
  protected:
+  // Controller navigation, read straight from SDL. The runtime's input system
+  // does not exist yet this early in startup, and ImGui here has no gamepad
+  // navigation configured - but a player on a phone with a pad attached still
+  // has to be able to answer this, and it is the one screen between them and
+  // the game.
+  void PollPad(size_t count) {
+    int pad_count = 0;
+    SDL_JoystickID* pads = SDL_GetGamepads(&pad_count);
+    if (pads == nullptr) {
+      return;
+    }
+    bool up = false, down = false, accept = false;
+    for (int i = 0; i < pad_count; ++i) {
+      SDL_Gamepad* pad = SDL_GetGamepadFromID(pads[i]);
+      if (pad == nullptr) {
+        continue;
+      }
+      up |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_UP);
+      down |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+      accept |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH);
+      // The stick too - a d-pad is not everyone's first reach.
+      const Sint16 ly = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
+      up |= ly < -16000;
+      down |= ly > 16000;
+    }
+    SDL_free(pads);
+
+    // Edge-triggered: held is one move, not one per frame.
+    if (up && !up_held_ && selected_ > 0) {
+      --selected_;
+    }
+    if (down && !down_held_ && selected_ + 1 < count) {
+      ++selected_;
+    }
+    accept_pressed_ = accept && !accept_held_;
+    up_held_ = up;
+    down_held_ = down;
+    accept_held_ = accept;
+  }
+
   void OnDraw(ImGuiIO& io) override {
     if (done_) {
       return;
     }
+    // One row per pack plus the skip row.
+    PollPad(packs_.size() + 1);
     const ImVec2 centre(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
     ImGui::SetNextWindowPos(centre, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.62f, 0.0f), ImGuiCond_Always);
@@ -42,15 +85,30 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
     const ImVec2 row(-1.0f, ImGui::GetTextLineHeight() * 2.4f);
     std::string picked;
     bool picked_any = false;
-    for (const std::string& pack : packs_) {
-      if (ImGui::Button(pack.c_str(), row)) {
-        picked = pack;
+    for (size_t i = 0; i < packs_.size(); ++i) {
+      const bool highlighted = selected_ == i;
+      if (highlighted) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+      }
+      if (ImGui::Button(packs_[i].c_str(), row) || (highlighted && accept_pressed_)) {
+        picked = packs_[i];
         picked_any = true;
+      }
+      if (highlighted) {
+        ImGui::PopStyleColor();
       }
     }
     ImGui::Separator();
-    if (ImGui::Button("Skip - load the stock game", ImVec2(-1.0f, row.y))) {
+    const bool skip_highlighted = selected_ == packs_.size();
+    if (skip_highlighted) {
+      ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
+    }
+    if (ImGui::Button("Skip - load the stock game", ImVec2(-1.0f, row.y)) ||
+        (skip_highlighted && accept_pressed_)) {
       picked_any = true;
+    }
+    if (skip_highlighted) {
+      ImGui::PopStyleColor();
     }
     ImGui::End();
     if (!picked_any) {
@@ -71,6 +129,9 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
   std::vector<std::string> packs_;
   std::function<void(std::string)> chosen_;
   bool done_ = false;
+  size_t selected_ = 0;
+  bool up_held_ = false, down_held_ = false, accept_held_ = false;
+  bool accept_pressed_ = false;
 };
 
 }  // namespace

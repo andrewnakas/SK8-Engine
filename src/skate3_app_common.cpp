@@ -731,7 +731,10 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
           continue;
         }
         if (IsContentPackFolder(child.path())) {
-          packs.push_back(name + "/" + child.path().filename().string());
+          // The LEAF name, which is what staging matches on - a wrapper-folder
+          // path would never compare equal to the candidate it refers to, and
+          // nothing would be staged at all.
+          packs.push_back(child.path().filename().string());
           break;
         }
       }
@@ -1519,13 +1522,32 @@ void Skate3BaseApp::StageContentPacks() {
       continue;
     }
 
+    // Clear every other pack we know about first. Staging is additive, and a
+    // pack left behind from an earlier launch stays installed - so choosing a
+    // different one simply added it beside the old, and the game went on
+    // loading whichever it found first. Only the packs this scan found are
+    // touched, so official content installed by other means is left alone.
+    for (const auto& other : candidates) {
+      const std::string other_name = other.filename().string();
+      if (other_name == package) {
+        continue;
+      }
+      std::error_code rm_ec;
+      const auto stale_dir = content_dir / other_name;
+      if (std::filesystem::exists(stale_dir, rm_ec)) {
+        std::filesystem::remove_all(stale_dir, rm_ec);
+        REXLOG_INFO("Skate 3: removed previously staged pack '{}'", other_name);
+      }
+      std::filesystem::remove(headers_dir / (other_name + ".header"), rm_ec);
+    }
+
     const auto target_dir = content_dir / package;
     const auto target_big = target_dir / big.filename();
     const auto target_header = headers_dir / (package + ".header");
     if (std::filesystem::exists(target_big, ec) &&
         std::filesystem::exists(target_header, ec)) {
       REXLOG_INFO("Skate 3 content pack '{}' already staged", package);
-      break;  // one per launch
+      break;  // one per launch; others were cleared above
     }
 
     std::filesystem::create_directories(target_dir, ec);
