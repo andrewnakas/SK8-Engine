@@ -9,7 +9,13 @@
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
+#include "skate3_pack_select.h"
 #include <rex/ui/windowed_app_context_sdl.h>
+
+REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
+                      "Which custom content pack in Documents to stage this launch, by folder "
+                      "name. Empty stages the first by name. Only one is staged per launch: the "
+                      "game's boot content scan does not cope with several at once.");
 #include "skate3_touch_controls.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
@@ -1358,19 +1364,53 @@ void Skate3BaseApp::StageContentPacks() {
   const auto content_dir = title_root / "00000002";
   const auto headers_dir = title_root / "Headers" / "00000002";
 
+  // ONE pack per launch. Staging every pack found overloads the game's boot
+  // content scan - the desktop loader hit the same wall with the shipped Danny
+  // Way and Maloof content and settled on staging exactly one - and it is also
+  // what makes "which map am I loading" answerable. Which one is
+  // skate3_content_pack; empty means the first by name.
+  std::string wanted = REXCVAR_GET(skate3_content_pack);
+  std::vector<std::filesystem::path> candidates;
   std::error_code ec;
   for (const auto& entry : std::filesystem::directory_iterator(documents, ec)) {
     if (ec || !entry.is_directory()) {
       continue;
     }
-    const std::string package = entry.path().filename().string();
-    if (package == "user" || package == "game") {
+    const std::string name = entry.path().filename().string();
+    if (name == "user" || name == "game") {
+      continue;
+    }
+    candidates.push_back(entry.path());
+  }
+  std::sort(candidates.begin(), candidates.end());
+  // More than one and no choice already made: ask, before anything is staged.
+  // The guest has not started, so blocking here is free - and it has to happen
+  // now, because the boot content scan reads what this stages.
+  if (candidates.size() > 1 && wanted.empty()) {
+    std::vector<std::string> names;
+    names.reserve(candidates.size());
+    for (const auto& c : candidates) {
+      names.push_back(c.filename().string());
+    }
+    REXLOG_INFO("Skate 3 content packs available: {}", names.size());
+    wanted = skate3::ChoosePackBlocking(app_context(), window(), imgui_drawer(), names);
+    if (wanted.empty()) {
+      REXLOG_INFO("Skate 3: no content pack staged this launch");
+      return;
+    }
+  }
+
+  for (const auto& entry : candidates) {
+    const std::string package = entry.filename().string();
+    // A named pack wins; otherwise the first by name, so the choice is at
+    // least stable between launches rather than filesystem order.
+    if (!wanted.empty() && package != wanted) {
       continue;
     }
 
     std::filesystem::path big, header;
     std::error_code scan_ec;
-    for (const auto& file : std::filesystem::directory_iterator(entry.path(), scan_ec)) {
+    for (const auto& file : std::filesystem::directory_iterator(entry, scan_ec)) {
       if (scan_ec || !file.is_regular_file()) {
         continue;
       }
@@ -1393,7 +1433,7 @@ void Skate3BaseApp::StageContentPacks() {
     if (std::filesystem::exists(target_big, ec) &&
         std::filesystem::exists(target_header, ec)) {
       REXLOG_INFO("Skate 3 content pack '{}' already staged", package);
-      continue;
+      break;  // one per launch
     }
 
     std::filesystem::create_directories(target_dir, ec);
@@ -1413,6 +1453,7 @@ void Skate3BaseApp::StageContentPacks() {
     }
     REXLOG_INFO("Staged Skate 3 content pack '{}' ({} + {})", package,
                 target_big.string(), target_header.string());
+    break;  // one per launch
   }
 }
 
