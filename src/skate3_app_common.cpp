@@ -718,12 +718,20 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
       if (name == "user" || name == "game") {
         continue;
       }
-      // A content pack is a folder carrying a .header; nothing else here has
-      // one, so the player is not offered their own save folders.
-      std::error_code scan_ec;
-      for (const auto& file : std::filesystem::directory_iterator(entry.path(), scan_ec)) {
-        if (!scan_ec && file.is_regular_file() && file.path().extension() == ".header") {
-          packs.push_back(name);
+      if (IsContentPackFolder(entry.path())) {
+        packs.push_back(name);
+        continue;
+      }
+      // Packs are often shipped inside a wrapper folder holding the package
+      // beside a readme, and dragging that whole folder in is the obvious
+      // thing to do - so look one level down as well.
+      std::error_code nest_ec;
+      for (const auto& child : std::filesystem::directory_iterator(entry.path(), nest_ec)) {
+        if (nest_ec || !child.is_directory()) {
+          continue;
+        }
+        if (IsContentPackFolder(child.path())) {
+          packs.push_back(name + "/" + child.path().filename().string());
           break;
         }
       }
@@ -1381,6 +1389,38 @@ void Skate3BaseApp::InstallBigDeviceAliases() {
   big_device_aliases_installed_ = true;
 }
 
+bool Skate3BaseApp::IsContentPackFolder(const std::filesystem::path& dir) {
+  // Both halves, and a header of a plausible size. The descriptor is a fixed
+  // 328-byte record whose trailing fields are anchored to the end of the file,
+  // so a truncated or emptied one is not something to offer the player - it
+  // would stage and then be dropped by the content manager without a word.
+  bool has_big = false;
+  std::error_code ec;
+  for (const auto& file : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec || !file.is_regular_file()) {
+      continue;
+    }
+    const auto ext = file.path().extension();
+    if (ext == ".big") {
+      has_big = true;
+    } else if (ext == ".header") {
+      std::error_code size_ec;
+      if (std::filesystem::file_size(file.path(), size_ec) < 256 || size_ec) {
+        return false;
+      }
+    }
+  }
+  if (!has_big) {
+    return false;
+  }
+  for (const auto& file : std::filesystem::directory_iterator(dir, ec)) {
+    if (!ec && file.is_regular_file() && file.path().extension() == ".header") {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Skate3BaseApp::StageContentPacks() {
   // Custom map packs ship as already-extracted marketplace content - a .big
   // beside its .header - rather than an STFS package the DLC installer could
@@ -1426,7 +1466,17 @@ void Skate3BaseApp::StageContentPacks() {
     if (name == "user" || name == "game") {
       continue;
     }
-    candidates.push_back(entry.path());
+    if (IsContentPackFolder(entry.path())) {
+      candidates.push_back(entry.path());
+      continue;
+    }
+    std::error_code nest_ec;
+    for (const auto& child : std::filesystem::directory_iterator(entry.path(), nest_ec)) {
+      if (!nest_ec && child.is_directory() && IsContentPackFolder(child.path())) {
+        candidates.push_back(child.path());
+        break;
+      }
+    }
   }
   std::sort(candidates.begin(), candidates.end());
   // More than one and no choice already made: ask, before anything is staged.

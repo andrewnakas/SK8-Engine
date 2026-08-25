@@ -41,6 +41,9 @@ class Skate3BaseApp : public rex::ReXApp {
   void InstallBigDeviceAliases();
   // Moves already-extracted content packs dropped into Documents under the
   // content tree the game reads.
+  // True if the folder holds a usable content package: a .big and a .header
+  // of a plausible size.
+  static bool IsContentPackFolder(const std::filesystem::path& dir);
   void StageContentPacks();
   void InstallDlcPackages();
   void ToggleSimpleSettings();
