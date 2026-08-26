@@ -94,6 +94,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_perf_interval);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_grid_standalone);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_display_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_grab_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_native);
@@ -10926,6 +10927,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       ApplySsaoPass(context, cmd, scene, viewport, scissor)) {
     post_ran = true;
     ssao_ran = true;
+  }
+  // The occlusion cull needs the depth grid, which ApplySsaoPass produces only
+  // as a side effect. With SSAO off (the iOS default) run the grid on its own -
+  // linearize + reduce, no GTAO march, no blurs, no composite - so the cull
+  // works without paying for an ambient-occlusion term nothing asked for.
+  if (!ssao_ran && use_depth && !loading_native &&
+      (REXCVAR_GET(skate3_native_render_scene_occlusion_cull) ||
+       REXCVAR_GET(skate3_native_render_scene_perf_items)) &&
+      REXCVAR_GET(skate3_native_render_scene_occlusion_grid_standalone)) {
+    ApplyOcclusionGridPass(context, cmd, scene, viewport, scissor);
   }
 
   // ---- Screen-space reflections (ssr.hlsl) ----

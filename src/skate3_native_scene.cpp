@@ -1207,6 +1207,15 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_perf_interval, 600, "Skate 3",
     .range(60, 6000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_slow_frame_max_ms, 2000,
+                     "Skate 3",
+                     "Upper bound (ms) on the guest-frame dt the slow-frame "
+                     "attribution line still reports. The original 100ms cap "
+                     "silently excluded exactly the multi-hundred-ms "
+                     "streaming spikes the breakdown exists to explain.")
+    .range(10, 60000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull, true, "Skate 3",
                     "Skip drawing static world items whose bounds are "
                     "provably hidden behind already-rendered geometry (depth-"
@@ -1215,6 +1224,16 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull, true, "Skate 3",
                     "keeps casting shadows. Dense areas with extended world "
                     "streaming spend roughly half their per-item CPU on such "
                     "items.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_grid_standalone, true,
+                    "Skate 3",
+                    "Build the occlusion cull's depth grid in a pass of its "
+                    "own when SSAO is off. The tile-MAX reduce that feeds the "
+                    "cull historically lived inside the SSAO pass, so "
+                    "disabling SSAO - which every iOS build does - silently "
+                    "disabled the cull with it. False restores that coupling: "
+                    "the grid is then produced only when SSAO runs.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_build, true,
@@ -8598,12 +8617,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // Attribute dips: the previous frame stretched the interval - log its
     // phase breakdown. "rest" = the game's own frame work + hook overhead
     // outside the build (dt minus our measured blocks).
-    if (dt_ms >= 4.5 && dt_ms < 100.0 &&
+    if (dt_ms >= 4.5 &&
+        dt_ms < double(REXCVAR_GET(skate3_native_render_scene_slow_frame_max_ms)) &&
         g_slow_frame_log_budget.load(std::memory_order_relaxed) > 0 &&
         g_slow_frame_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
       const double ours_ms =
           double(s_prev_build_ns + s_prev_cap_ns) * 1e-6;
-      REXLOG_DEBUG(
+      // INFO, not DEBUG: iOS never raises log_level, so at DEBUG this line -
+      // the only per-frame attribution of a dip - has never once reached a
+      // device log. g_slow_frame_log_budget already bounds it to 3 per perf
+      // window, so the volume is a few lines a minute, not a flood.
+      REXLOG_INFO(
           "native-scene: slow guest frame dt={:.2f}ms prev[cap={:.2f} build={:.2f} "
           "(2d={:.2f} spl={:.2f} pal={:.2f} ptail={:.2f} walk={:.2f}) rest={:.2f}]ms",
           dt_ms, double(s_prev_cap_ns) * 1e-6, double(s_prev_build_ns) * 1e-6,

@@ -1126,6 +1126,13 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context);
 bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
                    nrhi::Cmd* cmd, const FrameScene& scene,
                    const nrhi::Viewport& viewport, const nrhi::Rect& scissor);
+// Produces ONLY the occlusion-cull depth grid (linearize + tile-MAX reduce),
+// for when SSAO is off - as it always is on iOS. See the comment on the
+// definition for why the grid used to be trapped inside ApplySsaoPass.
+bool ApplyOcclusionGridPass(const NativeGuestOutputRenderContext& context,
+                            nrhi::Cmd* cmd, const FrameScene& scene,
+                            const nrhi::Viewport& viewport,
+                            const nrhi::Rect& scissor);
 bool ApplySsrPass(const NativeGuestOutputRenderContext& context,
                   nrhi::Cmd* cmd, const FrameScene& scene,
                   const nrhi::Viewport& viewport, const nrhi::Rect& scissor,
