@@ -1,5 +1,8 @@
 [submodule "third_party/rexglue-sdk"]
 	path = third_party/rexglue-sdk
-	url = https://github.com/mchughalex/rexglue-skate3.git
-	branch = skate3-sdk-clean
+	# The fork, because this branch pins an SDK commit that only exists there
+	# (the video preset row and the log changes). Point this back at
+	# mchughalex/rexglue-skate3 when those land upstream.
+	url = https://github.com/andrewnakas/rexglue-skate3.git
+	branch = perf/video-presets-and-quiet-logs
 
