@@ -88,6 +88,8 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_ssr_thickness);
 
 #include "skate3_native_shaders.h"
 
+REXCVAR_DECLARE(bool, skate3_native_render_scene_verbose);
+
 namespace skate3::native_scene {
 
 // ---- Screen-space ambient occlusion (ssao.hlsl: GTAO) --------------------
@@ -1408,7 +1410,7 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
   // Throttled diagnostics: the terms degrade to zero silently when the
   // shadow state or the fog capture is missing; log what decides them.
   static uint32_t s_vol_log = 0;
-  if (s_vol_log < 4 || (s_vol_log % 36000) == 0) {
+  if (REXCVAR_GET(skate3_native_render_scene_verbose) && (s_vol_log < 4 || (s_vol_log % 36000) == 0)) {
     REXLOG_INFO(
         "native-scene: vol2 shafts={} gates[cvar={} shvalid={} atlas={} "
         "insrv={}] inv={} ws={} nsm={} tex={} tint=({:.3f},{:.3f},{:.3f}) "

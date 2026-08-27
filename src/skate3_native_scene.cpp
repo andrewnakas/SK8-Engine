@@ -975,6 +975,25 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_ropa_delay, 0, "Skate 3",
                      "phase model was backwards. Kept for experiments.")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_verbose, false, "Skate 3",
+                    "Log the native renderer's per-mesh bookkeeping - cloth/ropa capture, "
+                    "close-clone mispairs, gap fills, palette relaxed-accepts, fog family "
+                    "gating, caster-bank swaps. All of it is normal traffic for the mesh "
+                    "capture path, and it runs at a couple of lines a second during play, "
+                    "which buries anything worth reading. Startup lines - graphics device, "
+                    "video preset, renderer takeover - are NOT gated by this.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_tex_log, false, "Skate 3",
+                    "Log the texture cache's own bookkeeping - every re-decode and every "
+                    "near-black payload served as white. Both are NORMAL: textures the game "
+                    "rewrites in place (event ads, lightmap pages, the CAS editor's "
+                    "progressive composites) re-decode by design, and a payload still "
+                    "streaming reads back black until it lands. They are diagnostics for "
+                    "chasing texture flicker, not faults, so they stay off unless asked "
+                    "for.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(skate3_native_render_scene_trace_mesh, "", "Skate 3",
                       "Hex guest mesh address to trace end-to-end through the "
                       "texture pipeline ('tex-trace:' log lines): per-frame "
@@ -1695,7 +1714,7 @@ uint32_t RefinePaletteBase(uint8_t* base, uint32_t bank, uint32_t palette_base,
     if (sc >= 0 && front_all && spread <= max_spread && spread >= min_spread) {
       static std::atomic<uint64_t> s_main_relaxed{0};
       const uint64_t n = s_main_relaxed.fetch_add(1, std::memory_order_relaxed);
-      if (n < 8 || (n & 1023u) == 0) {
+      if (REXCVAR_GET(skate3_native_render_scene_verbose) && (n < 8 || (n & 1023u) == 0)) {
         REXLOG_INFO(
             "native-scene: main-pass palette relaxed-accept mesh={:08X} "
             "base={} score={} spread={:.2f} bind={:.2f} (n={})",
@@ -4150,7 +4169,7 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
     // live native-mode banks actually hold at OUR capture moments.
     static std::atomic<uint32_t> ropa_log_count{0};
     const uint32_t ln = ropa_log_count.fetch_add(1, std::memory_order_relaxed);
-    if (ln < 8 || (ln & 1023u) == 0) {
+    if (REXCVAR_GET(skate3_native_render_scene_verbose) && (ln < 8 || (ln & 1023u) == 0)) {
       const uint32_t m = main_pass ? 191u : 188u;
       REXLOG_INFO(
           "native-scene: ropa mesh={:08X} vb={:08X} base={} score={} "
@@ -4909,7 +4928,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
                 s_fog_win.compare_exchange_strong(win, now_s)) {
               s_fog_rejects.store(0, std::memory_order_relaxed);
             }
-            if (s_fog_rejects.fetch_add(1, std::memory_order_relaxed) < 8) {
+            if (REXCVAR_GET(skate3_native_render_scene_verbose) && s_fog_rejects.fetch_add(1, std::memory_order_relaxed) < 8) {
               REXLOG_INFO(
                   "native-scene: fog capture REJECTED by family gate "
                   "(prevented flash): vs_obj={:08X} ps_obj={:08X} "
@@ -7413,7 +7432,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             static std::atomic<uint64_t> s_rigid_mispair{0};
             const uint64_t n =
                 s_rigid_mispair.fetch_add(1, std::memory_order_relaxed);
-            if (n < 24 || (n & 255u) == 0) {
+            if (REXCVAR_GET(skate3_native_render_scene_verbose) && (n < 24 || (n & 255u) == 0)) {
               REXLOG_INFO(
                   "native-scene: rigid close-clone mispair reset mesh={:08X} "
                   "k={} d={:.2f}m (n={})",
@@ -9284,7 +9303,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         g_lw_gap_filled.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<uint32_t> s_fill_logged{0};
         const uint32_t ln = s_fill_logged.fetch_add(1, std::memory_order_relaxed);
-        if (ln < 16 || (ln & 255u) == 0) {
+        if (REXCVAR_GET(skate3_native_render_scene_verbose) && (ln < 16 || (ln & 255u) == 0)) {
           REXLOG_INFO(
               "native-scene: LW gap fill ctx={:08X} mesh={:08X} fam={} "
               "age={} alpha={:.2f} (n={})",
@@ -9449,7 +9468,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           t.frame = s_pub_frame;
           static std::atomic<uint64_t> s_bank_swaps{0};
           const uint64_t n = s_bank_swaps.fetch_add(1, std::memory_order_relaxed);
-          if (n < 8 || (n & 255u) == 0) {
+          if (REXCVAR_GET(skate3_native_render_scene_verbose) && (n < 8 || (n & 255u) == 0)) {
             REXLOG_INFO(
                 "native-scene: caster-bank publish swapped for last main-view "
                 "capture mesh={:08X} fam={} (n={})",
@@ -9486,7 +9505,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           scene.items.push_back(t.item);
           static std::atomic<uint64_t> s_gap_filled{0};
           const uint64_t n = s_gap_filled.fetch_add(1, std::memory_order_relaxed);
-          if (n < 8 || (n & 1023u) == 0) {
+          if (REXCVAR_GET(skate3_native_render_scene_verbose) && (n < 8 || (n & 1023u) == 0)) {
             REXLOG_INFO(
                 "native-scene: dyn gap fill mesh={:08X} age={} ropa={} fam={} (n={})",
                 mesh, gap, t.item.ropa ? 1 : 0, t.item.char_family, n + 1);

@@ -1,11 +1,13 @@
 #include "skate3_app_common.h"
 
 #include "skate3_demo_path.h"
+#include "skate3_dlc_picker.h"
 #include "skate3_dlc_trace.h"
 #include "skate3_fov.h"
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
+#include "skate3_performance_profile.h"
 #include "skate3_native_scene.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
@@ -409,16 +411,25 @@ void ApplyFirstRunVideoDefaults(const std::filesystem::path& settings_path,
     return;
   }
 
+  // Was a bare resolution_scale = 2 for every machine. That is a desktop
+  // discrete GPU's default: it renders the world at twice the window and, with
+  // the effect defaults on top, an integrated GPU at 1280x800 gets 7 fps
+  // measured. The preset picks the whole bundle from the hardware instead, and
+  // still only ever sets FIRST-RUN defaults.
   const auto scale = std::to_string(kDefaultResolutionScale);
   rex::cvar::SetFlagByName("resolution_scale", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_x", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_y", scale);
+  skate3::perf::ApplyRequestedProfile(/*first_run=*/true);
 }
 
 void LoadAndNormalizeSimpleSettings(const std::filesystem::path& settings_path,
                                     const std::filesystem::path& developer_config_path) {
   if (std::filesystem::exists(settings_path)) {
     rex::cvar::LoadConfig(settings_path);
+    // An explicitly named preset beats the saved settings; "auto" does not,
+    // so a player's own choices survive every launch after the first.
+    skate3::perf::ApplyRequestedProfile(/*first_run=*/false);
   } else {
     ApplyFirstRunVideoDefaults(settings_path, developer_config_path);
   }
@@ -447,33 +458,6 @@ const char* FirstExistingFontPath(std::initializer_list<const char*> paths) {
   return nullptr;
 }
 
-std::string Hex8(uint32_t value) {
-  std::ostringstream stream;
-  stream << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
-  return stream.str();
-}
-
-std::filesystem::path InstalledMarketplaceContentPath(const std::filesystem::path& content_root,
-                                                      uint32_t title_id,
-                                                      const std::filesystem::path& package_path) {
-  return content_root / "0000000000000000" / Hex8(title_id) / "00000002" /
-         package_path.filename();
-}
-
-std::filesystem::path InstalledMarketplaceHeaderPath(const std::filesystem::path& content_root,
-                                                     uint32_t title_id,
-                                                     const std::filesystem::path& package_path) {
-  return content_root / "0000000000000000" / Hex8(title_id) / "Headers" / "00000002" /
-         (package_path.filename().string() + ".header");
-}
-
-bool IsInstalledMarketplaceContent(const std::filesystem::path& content_root, uint32_t title_id,
-                                   const std::filesystem::path& package_path) {
-  return std::filesystem::is_directory(
-             InstalledMarketplaceContentPath(content_root, title_id, package_path)) &&
-         std::filesystem::is_regular_file(
-             InstalledMarketplaceHeaderPath(content_root, title_id, package_path));
-}
 
 std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
     const std::filesystem::path& executable_root, const std::filesystem::path& game_data_root,
@@ -525,6 +509,7 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   ConfigureSkate3UserPaths(paths, user_settings_path_, profiles_path_);
   config_path_ = paths.config_path;
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
+  skate3::perf::InstallLiveProfileSwitch();
   Skate3InitializeFieldOfViewOverride();
   ApplyUltrawideVideoDefaults();
   DisableActiveDebugDiagnostics();
@@ -829,7 +814,6 @@ void Skate3BaseApp::OnPostSetup() {
       REXLOG_INFO("Skate 3 saves: using portable folder {}", portable_saves.string());
     }
   }
-  InstallDlcPackages();
   InstallRecipeOverlay();
 
   // Register retail multi-entry-function alternate entries.
@@ -867,6 +851,16 @@ void Skate3BaseApp::OnPostSetup() {
       }
     }
   }
+}
+
+void Skate3BaseApp::OnPreLaunchModule() {
+  // Deliberately here rather than in OnPostSetup, where the DLC install used
+  // to live. The add-on picker is a dialog the player drives, so it needs the
+  // app's event loop to be running; OnPostSetup runs inside OnInitialize,
+  // before that loop starts, while LaunchModule defers this step onto the UI
+  // thread once it is. The guest still has not started either way, so the
+  // choice is made before anything can enumerate content.
+  InstallDlcPackages();
 }
 
 void Skate3BaseApp::OnShutdown() {
@@ -1299,18 +1293,22 @@ void Skate3BaseApp::InstallBigDeviceAliases() {
       "big:", "\\Device\\Harddisk0\\Partition1");
   runtime()->file_system()->RegisterSymbolicLink(
       "dlcbig:", "\\Device\\Harddisk0\\Partition1");
+  // After it notices content it has not seen before, the game restarts itself
+  // by name and asks the disc for the RETAIL executable, sk83_na_f.xex. That
+  // file does not exist in a recomp install - the entry point is default.xex -
+  // so the open fails and the title exits immediately after the content scan,
+  // which reads as "the game quits as soon as I add a map". Alias the retail
+  // name onto the real entry point; the VFS resolves symlinks by prefix, so
+  // this redirects exactly that one file and nothing else.
+  runtime()->file_system()->RegisterSymbolicLink(
+      "\\Device\\Harddisk0\\Partition1\\sk83_na_f.xex",
+      "\\Device\\Harddisk0\\Partition1\\default.xex");
   big_device_aliases_installed_ = true;
 }
 
 void Skate3BaseApp::InstallDlcPackages() {
   if (!REXCVAR_GET(skate3_auto_install_dlc) || !runtime() || !runtime()->kernel_state() ||
       !runtime()->kernel_state()->content_manager()) {
-    return;
-  }
-
-  const uint32_t title_id = runtime()->kernel_state()->title_id();
-  if (title_id == 0) {
-    REXLOG_WARN("Skipping Skate 3 DLC install; title ID is not available");
     return;
   }
 
@@ -1325,84 +1323,18 @@ void Skate3BaseApp::InstallDlcPackages() {
   const auto source_dirs =
       DiscoverDlcSourceDirectories(rex::filesystem::GetAppRootFolder(),
                                    runtime()->game_data_root(), runtime()->user_data_root());
-  std::unordered_set<std::string> seen_packages;
-  size_t installed_count = 0;
-  size_t skipped_count = 0;
 
-  for (const auto& source_dir : source_dirs) {
-    if (!std::filesystem::is_directory(source_dir)) {
-      continue;
-    }
-
-    std::error_code iter_ec;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(source_dir, iter_ec)) {
-      if (iter_ec) {
-        REXLOG_WARN("Could not scan Skate 3 DLC folder {}: {}", source_dir.string(),
-                    iter_ec.message());
-        break;
-      }
-      if (!entry.is_regular_file()) {
-        continue;
-      }
-
-      const auto package_path = entry.path();
-      std::error_code canonical_ec;
-      auto package_key = std::filesystem::weakly_canonical(package_path, canonical_ec).string();
-      if (canonical_ec) {
-        package_key = std::filesystem::absolute(package_path).string();
-      }
-      if (!seen_packages.insert(package_key).second) {
-        continue;
-      }
-
-      const auto header = rex::filesystem::StfsContainerDevice::ReadPackageHeader(package_path);
-      if (!header) {
-        REXLOG_WARN("Skipping DLC candidate with invalid STFS header: {}", package_path.string());
-        ++skipped_count;
-        continue;
-      }
-
-      const auto content_type =
-          static_cast<rex::system::XContentType>(header->metadata.content_type);
-      if (content_type != rex::system::XContentType::kMarketplaceContent) {
-        REXLOG_WARN("Skipping non-DLC content package {} with type {:08X}",
-                    package_path.filename().string(), static_cast<uint32_t>(content_type));
-        ++skipped_count;
-        continue;
-      }
-
-      const uint32_t package_title_id = header->metadata.execution_info.title_id;
-      if (package_title_id != 0 && package_title_id != title_id) {
-        REXLOG_WARN("Skipping DLC package {} for title {:08X}; running title is {:08X}",
-                    package_path.filename().string(), package_title_id, title_id);
-        ++skipped_count;
-        continue;
-      }
-
-      if (IsInstalledMarketplaceContent(runtime()->user_data_root(), title_id, package_path)) {
-        REXLOG_INFO("DLC package already installed: {}", package_path.filename().string());
-        ++skipped_count;
-        continue;
-      }
-
-      REXLOG_INFO("Installing Skate 3 DLC package: {}", package_path.string());
-      const auto result = runtime()->kernel_state()->content_manager()->InstallContent(package_path);
-      if (result == 0) {
-        ++installed_count;
-        REXLOG_INFO("Installed Skate 3 DLC package: {}", package_path.filename().string());
-      } else {
-        ++skipped_count;
-        REXLOG_WARN("Failed to install Skate 3 DLC package {}: {:08X}",
-                    package_path.filename().string(), static_cast<uint32_t>(result));
-      }
-    }
-  }
-
-  if (installed_count || skipped_count) {
-    REXLOG_INFO("Skate 3 DLC scan complete: {} installed, {} skipped", installed_count,
-                skipped_count);
-  } else {
-    REXLOG_INFO("No Skate 3 DLC packages found. Drop legally obtained DLC package files in {}",
-                user_dlc_root.string());
+  // ONE add-on per session, chosen here rather than installed all at once.
+  //
+  // The old behaviour installed every package it could find and let the game
+  // sort it out. That does not hold up: past a handful of installed packages
+  // the boot content scan crashes, and short of that every pack's locations
+  // pile into one menu. Selecting a single add-on before the guest launches is
+  // what the external launcher always did by staging a throwaway user root;
+  // skate3_dlc_picker does the same thing from inside the game, so a plain
+  // "drop your maps in dlc/" install works on its own.
+  if (!skate3::dlc::RunStartupSelection(app_context(), window(), imgui_drawer(), runtime(),
+                                        source_dirs)) {
+    app_context().QuitFromUIThread();
   }
 }

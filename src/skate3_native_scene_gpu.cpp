@@ -164,6 +164,8 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_tex_store_mb);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_budget_ms);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_min_items);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_mesh);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_log);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_verbose);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_2d);
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
@@ -1128,7 +1130,11 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
           item.mesh, min_bi, max_bi, palette_bones);
     }
   }
-  if (garbage != 0) {
+  // Capped: one malformed mesh streams in repeatedly and would otherwise
+  // print this every time it is decoded. The first few are the diagnostic;
+  // the rest are noise.
+  static std::atomic<uint32_t> s_bbox_logs{0};
+  if (garbage != 0 && s_bbox_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
     REXLOG_WARN(
         "native-scene: mesh {:08X} decoded {} of {} verts outside bbox "
         "({:.1f},{:.1f},{:.1f})..({:.1f},{:.1f},{:.1f}) fmt {} stride {} vb {:08X}",
@@ -1936,7 +1942,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
       if (total_blocks >= 32 && (guard_zeroed * 4 >= total_blocks ||
                                  zero_samples >= 12)) {
         static std::atomic<uint32_t> s_mip_diag{0};
-        if (s_mip_diag.fetch_add(1, std::memory_order_relaxed) < 24) {
+        if (REXCVAR_GET(skate3_native_render_scene_verbose) && s_mip_diag.fetch_add(1, std::memory_order_relaxed) < 24) {
           REXLOG_INFO(
               "native-scene: MIP DIAG {}x{} mip {}/{} zero_samples={}/32 "
               "guard_zeroed={}/{} ox={} oy={} pitch_b={} size={} min={} "
@@ -8639,7 +8645,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           // on one key = streaming oscillation, visible as texture flicker
           // on the affected meshes.
           static std::atomic<uint32_t> s_redecode_logs{0};
-          if (s_redecode_logs.fetch_add(1) < 256) {
+          if (REXCVAR_GET(skate3_native_render_scene_tex_log) &&
+              s_redecode_logs.fetch_add(1) < 256) {
             REXLOG_INFO(
                 "native-scene: texture re-decode key={:016X} reason={}{}{} "
                 "words=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
@@ -8690,7 +8697,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                       frame_number, slot, tex_ptr);
         }
         static std::atomic<uint32_t> s_nb_logs{0};
-        if (s_nb_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+        if (REXCVAR_GET(skate3_native_render_scene_tex_log) &&
+            s_nb_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
           REXLOG_INFO(
               "native-scene: near-black decode obj={:08X} slot={} served as "
               "white fallback (mid-compose/stream content)",

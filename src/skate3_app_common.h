@@ -33,6 +33,7 @@ class Skate3BaseApp : public rex::ReXApp {
   void OnConfigureFonts(ImFontAtlas* atlas) override;
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   void OnPostSetup() override;
+  void OnPreLaunchModule() override;
   void OnShutdown() override;
 
  private:
