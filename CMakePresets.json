@@ -104,6 +104,23 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "macos-fast",
+      "displayName": "macOS Release, optimised for Apple Silicon",
+      "inherits": "macos-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "--no-default-config",
+        "CMAKE_CXX_FLAGS": "--no-default-config",
+        "CMAKE_OBJC_FLAGS": "--no-default-config",
+        "CMAKE_OBJCXX_FLAGS": "--no-default-config",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
+        "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
+        "REXGLUE_RUNTIME_STATIC": "ON",
+        "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
+      }
     }
   ],
   "buildPresets": [
@@ -134,6 +151,11 @@
     {
       "name": "macos-release",
       "configurePreset": "macos-release"
+    },
+    {
+      "name": "macos-fast",
+      "configurePreset": "macos-fast",
+      "jobs": 3
     }
   ]
 }

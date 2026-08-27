@@ -243,6 +243,25 @@ if(WIN32)
     set(REXGLUE_RUNTIME_RC_COPYRIGHT "(c) Skate3Recomp contributors")
 endif()
 
+# Hidden visibility is only safe once rexruntime is STATIC: with the shared
+# build, skate3 resolves the runtime's symbols through the dylib's export
+# table, and hiding them breaks the link outright. Once everything lands in one
+# executable there is nothing left to export - the ~48k guest stubs and the
+# runtime's whole surface stop occupying the dynamic symbol table, the link
+# gets faster, and the optimizer may treat every definition as internal.
+#
+# Must be set BEFORE the SDK's targets are created below, since CMake reads
+# these at add_library() time. Separately switchable from the static option so
+# it can be dropped without editing anything.
+if(REXGLUE_RUNTIME_STATIC)
+    option(SKATE3_HIDDEN_VISIBILITY "Build with -fvisibility=hidden" ON)
+    if(SKATE3_HIDDEN_VISIBILITY)
+        set(CMAKE_C_VISIBILITY_PRESET hidden)
+        set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+        set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+    endif()
+endif()
+
 include(cmake/RexGlue.cmake)
 include(cmake/CodegenTargets.cmake)
 
@@ -275,8 +294,18 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_user_settings.cpp
     src/skate3_warp.cpp
     src/skate3_win_icon.cpp
-    third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )
+# The SDK's xboxkrnl_crypt.cpp does `#include "crypto/sha256.cpp"` - it pulls
+# the SOURCE in textually - so sha256's definitions already exist inside
+# rexruntime. Compiling it here as well was harmless while the runtime was a
+# dylib (two-level namespace let the executable's copy shadow it), but in a
+# single static link the two collide: 10 duplicate symbols. The only consumer
+# here, src/skate3_title_update_installer.cpp, includes just the header, so the
+# definitions can come from the archive.
+if(NOT REXGLUE_RUNTIME_STATIC)
+    list(APPEND SKATE3_COMMON_SOURCES
+         third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp)
+endif()
 if(SKATE3_IOS)
     # UIDocumentPickerViewController, so the disc can be chosen from Files.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_ios.mm)
@@ -380,6 +409,25 @@ else()
 endif()
 
 target_link_libraries(skate3 PRIVATE rex::runtime)
+
+# A static archive only yields the members that resolve an undefined symbol.
+# That is wrong for this library: REX_EXPORT expands to a
+# `static PPCFuncRegistrar` (include/rex/hook.h:72-74), so a kernel TU
+# registers its guest exports from a static initializer and is otherwise
+# referenced by nobody. Verified: xboxkrnl_crypt.cpp.o carries a
+# __mod_init_func section and no external references. Left to the default
+# rules the linker would silently drop such members and the guest would call
+# unregistered imports at runtime - a failure that shows up as
+# InvalidFunctionTrap long after the build "succeeded".
+#
+# -force_load restores the dylib's all-objects-present semantics for this one
+# archive. The normal link above stays: after force_load nothing from it is
+# still undefined, so it contributes no duplicates.
+if(REXGLUE_RUNTIME_STATIC)
+    target_link_options(skate3 PRIVATE
+        "LINKER:-force_load,$<TARGET_FILE:rexruntime>")
+endif()
+
 rexglue_configure_target(skate3)
 
 if(APPLE)
@@ -420,6 +468,63 @@ if(APPLE)
     else()
         target_link_options(skate3 PRIVATE -Wl,-stack_size,0x4000000)
         target_link_libraries(skate3 PRIVATE "-framework Cocoa")
+
+        # macOS has always produced a bare executable - MACOSX_BUNDLE was iOS
+        # only. Turning this ON produces a double-clickable Skate3.app.
+        #
+        # Default OFF on purpose: a bundle moves the binary to
+        # Skate3.app/Contents/MacOS/skate3, which silently breaks any script
+        # that runs out/build/<dir>/skate3. Flip it once the measurement
+        # scripts are pointed at the new path.
+        #
+        # Game data and config still live BESIDE the .app, not inside it:
+        # GetAppRootFolder() (src/core/filesystem_posix.cpp) strips
+        # <name>.app/Contents/MacOS, so the app root stays the build directory
+        # and the existing `game` symlink and `logs` directory keep working.
+        # That is what we want - the disc image is 6 GB and has no business
+        # inside an application bundle.
+        #
+        # The MoltenVK + ICD JSON staging in rexglue_helpers.cmake copies into
+        # $<TARGET_FILE_DIR:skate3>, which becomes Contents/MacOS under a
+        # bundle, so the loader still finds them with no change.
+        option(SKATE3_MACOS_BUNDLE "Build macOS output as Skate3.app" OFF)
+        if(SKATE3_MACOS_BUNDLE)
+            set_target_properties(skate3 PROPERTIES
+                MACOSX_BUNDLE TRUE
+                OUTPUT_NAME "Skate 3"
+                MACOSX_BUNDLE_INFO_PLIST
+                    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/Info.plist.in"
+                MACOSX_BUNDLE_BUNDLE_NAME "Skate 3"
+                MACOSX_BUNDLE_GUI_IDENTIFIER "com.nakas.skate3"
+                MACOSX_BUNDLE_EXECUTABLE_NAME "Skate 3"
+                MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+                MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+            )
+            # The SDK's staging put the Vulkan files next to the executable,
+            # which codesign rejects for a bundle. Move them into the layout it
+            # expects, then sign. Added after rexglue_configure_target() above,
+            # so this POST_BUILD runs after the staging one.
+            #
+            # Nested code is signed before the bundle that contains it -
+            # codesign seals what it finds, so the order matters. --deep is
+            # deliberately avoided: it is deprecated and re-signs nested code
+            # that may already have a valid signature.
+            add_custom_command(TARGET skate3 POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    "-DBUNDLE_CONTENTS=$<TARGET_BUNDLE_CONTENT_DIR:skate3>"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/StageBundle.cmake"
+                COMMAND /usr/bin/codesign --force --sign - --timestamp=none
+                        "$<TARGET_BUNDLE_CONTENT_DIR:skate3>/Frameworks/libMoltenVK.dylib"
+                COMMAND /usr/bin/codesign --force --sign - --timestamp=none
+                        "$<TARGET_BUNDLE_DIR:skate3>"
+                COMMENT "Staging and ad-hoc signing Skate 3.app"
+                VERBATIM
+            )
+            # So the executable can find the relocated dylibs.
+            set_target_properties(skate3 PROPERTIES
+                INSTALL_RPATH "@executable_path/../Frameworks"
+                BUILD_WITH_INSTALL_RPATH TRUE)
+        endif()
     endif()
 endif()
 
@@ -427,15 +532,20 @@ if(WIN32)
     target_link_libraries(skate3 PRIVATE comdlg32 winhttp d3dcompiler gdiplus)
 endif()
 
-add_custom_target(skate3_stage_runtime_library
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:skate3>"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:rexruntime>"
-        "$<TARGET_FILE_DIR:skate3>"
-    DEPENDS rexruntime
-    VERBATIM
-)
-add_dependencies(skate3 skate3_stage_runtime_library)
+# With a static runtime there is no dylib to put beside the executable - the
+# archive is already inside it - so the staging step is skipped rather than
+# copying a .a next to the binary.
+if(NOT REXGLUE_RUNTIME_STATIC)
+    add_custom_target(skate3_stage_runtime_library
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:skate3>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:rexruntime>"
+            "$<TARGET_FILE_DIR:skate3>"
+        DEPENDS rexruntime
+        VERBATIM
+    )
+    add_dependencies(skate3 skate3_stage_runtime_library)
+endif()
 
 # App icons. Loose PNGs beside the executable - see the note in Info.plist.in
 # about why there is no asset catalog here.
