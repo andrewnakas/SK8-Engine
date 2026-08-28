@@ -1,5 +1,7 @@
 #include "skate3_title_update_installer.h"
 
+#include "skate3_iso_installer.h"  // FileTransferSteps
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -847,7 +849,7 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
     return true;
   };
 
-  new rex::ui::AcquireWizardDialog(
+  auto* dialog = new rex::ui::AcquireWizardDialog(
       drawer, std::move(options), std::move(fetch), []() { return PickTitleUpdateFile(); },
       std::move(install),
       [runtime_paths = std::move(runtime_paths), complete = std::move(complete)]() mutable {
@@ -855,6 +857,9 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
           complete(std::move(runtime_paths));
         }
       });
+  // Only relevant to the "select a file" route - downloading needs none of it.
+  dialog->SetInstructions(FileTransferStepsTitle(),
+                          FileTransferSteps("the title update package", "Select file..."));
 }
 
 bool RunTitleUpdateInstallWizardBlocking(rex::ui::WindowedAppContext& app_context,

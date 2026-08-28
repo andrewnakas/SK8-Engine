@@ -414,6 +414,43 @@ class XboxIsoReader {
 
 }  // namespace
 
+const char* FileTransferStepsTitle() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  return "GETTING THE FILE ONTO THIS DEVICE";
+#else
+  return "GETTING THE FILE ONTO THIS COMPUTER";
+#endif
+}
+
+std::vector<std::string> FileTransferSteps(const char* what, const char* action) {
+  const std::string file = what;
+  const std::string button = action;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // Documents is exposed over Finder file sharing (UIFileSharingEnabled plus
+  // LSSupportsOpeningDocumentsInPlace in Info.plist), which is the only
+  // practical way to move several gigabytes onto a phone. The picker can also
+  // reach iCloud Drive and attached USB storage, so that stays an option.
+  return {
+      "Connect this device to your computer with a cable, and tap Trust if you are asked.",
+      "On a Mac, open Finder and click this device in the sidebar, then open the Files tab. "
+      "On Windows, open iTunes and go to the device's File Sharing tab.",
+      "Drag " + file + " onto the Skate 3 entry there and wait for the copy to finish - a "
+      "full disc image takes several minutes.",
+      "Come back here, choose " + button + ", and pick the file under \"On My iPhone\" or "
+      "\"On My iPad\" -> Skate 3.",
+      "Already have it on iCloud Drive or a USB drive plugged into this device? Skip the "
+      "steps above and choose " + button + " straight away.",
+  };
+#else
+  return {
+      "Copy " + file + " somewhere this computer can reach - a local folder, an external "
+      "drive or a network share all work.",
+      "Choose " + button + " and browse to it. The file is read where it sits and is never "
+      "moved or modified.",
+  };
+#endif
+}
+
 bool IsGameInstalled(const std::filesystem::path& game_root) {
   return std::filesystem::is_regular_file(game_root / std::string(kDefaultXex));
 }
@@ -444,15 +481,19 @@ void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig r
     return true;
   };
 
-  new rex::ui::InstallWizardDialog(
+  auto* dialog = new rex::ui::InstallWizardDialog(
       drawer, "Setup", "Game Files",
-      "Skate 3 game files were not found. Select your Xbox 360 ISO to install them.",
+      "Skate 3 game files were not found. Install them from your own Xbox 360 disc image "
+      "(a .iso file). The disc is around 6 GB and is copied once, so this takes a few "
+      "minutes.",
       game_root.string(), std::move(pick_source), std::move(install),
       [runtime_paths = std::move(runtime_paths), complete = std::move(complete)]() mutable {
         if (complete) {
           complete(std::move(runtime_paths));
         }
       });
+  dialog->SetInstructions(FileTransferStepsTitle(),
+                          FileTransferSteps("your Skate 3 ISO", "Select ISO"));
 }
 
 bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context,

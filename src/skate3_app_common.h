@@ -47,6 +47,12 @@ class Skate3BaseApp : public rex::ReXApp {
   void StageContentPacks();
   void InstallDlcPackages();
   void ToggleSimpleSettings();
+  // Opens the settings straight on the Performance page (the perf_chord
+  // shortcut, Start + Select by default); closes again if that page is
+  // already the one on screen.
+  void TogglePerformanceMenu();
+  // Builds simple_settings_dialog_ if it does not exist yet. Does not show it.
+  void EnsureSimpleSettingsDialog();
   void ToggleNativeDebug();
   void ApplySettingsCursorMode();
   void ApplyGameplayCursorMode();

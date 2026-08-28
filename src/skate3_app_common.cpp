@@ -910,6 +910,10 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   rex::ui::RegisterBind("bind_skate3_menu_alt", "F1", "Skate 3 settings alternate", [this] {
     ToggleSimpleSettings();
   });
+  // Keyboard counterpart to the Start + Select chord. Sits next to the FPS
+  // counter's F2 because it answers the same question in more detail.
+  rex::ui::RegisterBind("bind_skate3_perf_menu", "Shift+F2", "Skate 3 performance menu",
+                        [this] { TogglePerformanceMenu(); });
   // Remembered handle: the F11 paired A/B parity capture (native + emulated
   // screenshots + gsnap, sequenced from the guest frame loop in
   // skate3_native_render.cpp) needs the window without an app pointer.
@@ -979,6 +983,10 @@ void Skate3BaseApp::OnPostSetup() {
     });
     input_system->SetMenuChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() { ToggleSimpleSettings(); });
+    });
+    // Start + Select opens the performance menu (cvar perf_chord).
+    input_system->SetPerfChordCallback([this]() {
+      app_context().CallInUIThreadDeferred([this]() { TogglePerformanceMenu(); });
     });
     // The middle Xbox button opens the level picker (cvar picker_chord). It
     // only reaches the input system when guide_button is on, so a launcher that
@@ -1063,14 +1071,28 @@ void Skate3BaseApp::OnShutdown() {
 }
 
 void Skate3BaseApp::ToggleSimpleSettings() {
+  if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
+    simple_settings_dialog_->Hide();
+    return;
+  }
+  EnsureSimpleSettingsDialog();
+  ApplySettingsCursorMode();
+  skate3::native_scene::SetSettingsMenuBlur(true);
+  simple_settings_dialog_->Show();
+}
+
+void Skate3BaseApp::TogglePerformanceMenu() {
+  EnsureSimpleSettingsDialog();
+  // Set up as if opening: TogglePerformance() closes instead when the
+  // Performance page is already the one on screen, and the Hide() it runs
+  // fires close_settings, which puts the blur and cursor back.
+  ApplySettingsCursorMode();
+  skate3::native_scene::SetSettingsMenuBlur(true);
+  simple_settings_dialog_->TogglePerformance();
+}
+
+void Skate3BaseApp::EnsureSimpleSettingsDialog() {
   if (simple_settings_dialog_) {
-    if (simple_settings_dialog_->visible()) {
-      simple_settings_dialog_->Hide();
-    } else {
-      ApplySettingsCursorMode();
-      skate3::native_scene::SetSettingsMenuBlur(true);
-      simple_settings_dialog_->Show();
-    }
     return;
   }
 
@@ -1114,6 +1136,12 @@ void Skate3BaseApp::ToggleSimpleSettings() {
   auto close_settings = [this]() {
     skate3::native_scene::SetSettingsMenuBlur(false);
     ApplyGameplayCursorMode();
+    // Release the Performance page's claim on frame-stat collection. The
+    // app's own policy (FPS/debug overlays) is a separate input and is left
+    // exactly as it was.
+    if (auto* presenter = imgui_drawer() ? imgui_drawer()->presenter() : nullptr) {
+      presenter->SetGuestFrameStatsHold(false);
+    }
   };
   auto close_game = [this]() {
 #if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
@@ -1156,14 +1184,37 @@ void Skate3BaseApp::ToggleSimpleSettings() {
     }
     return pad;
   };
+  // Live frame timings for the Performance page. Collecting them costs GPU
+  // timestamp queries, so the page holds collection on only while it is the
+  // page on screen - the hold is released in close_settings above.
+  auto poll_perf_stats = [this]() {
+    rex::ui::SimpleSettingsPerfStats out;
+    auto* presenter = imgui_drawer() ? imgui_drawer()->presenter() : nullptr;
+    if (!presenter) {
+      return out;
+    }
+    presenter->SetGuestFrameStatsHold(true);
+    const rex::ui::Presenter::GuestFrameStats stats = presenter->GetGuestFrameStats();
+    // The first polls after the hold is taken land before any frame has been
+    // timed; report nothing rather than a confident zero.
+    if (stats.frame_count == 0 || stats.fps <= 0.0) {
+      return out;
+    }
+    out.valid = true;
+    out.fps = stats.fps;
+    out.frame_time_ms = stats.frame_time_ms;
+    out.wait_ms = stats.wait_ms;
+    out.gpu_ms = stats.gpu_ms;
+    out.gpu_draw_ms = stats.gpu_draw_ms;
+    out.gpu_resolve_ms = stats.gpu_resolve_ms;
+    out.gpu_dump_ms = stats.gpu_dump_ms;
+    return out;
+  };
   simple_settings_dialog_ =
       std::make_unique<rex::ui::SimpleSettingsDialog>(
           imgui_drawer(), user_settings_path_, std::move(load_profiles), std::move(save_profile),
           std::move(close_settings), std::move(close_game), std::move(restart_game),
-          std::move(poll_gamepad));
-  ApplySettingsCursorMode();
-  skate3::native_scene::SetSettingsMenuBlur(true);
-  simple_settings_dialog_->Show();
+          std::move(poll_gamepad), std::move(poll_perf_stats));
 }
 
 void Skate3BaseApp::ToggleNativeDebug() {
