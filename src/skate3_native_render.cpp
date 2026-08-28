@@ -332,6 +332,26 @@ void PaceGuestFrame() {
       cap = auto_cap;
     }
   }
+  // What the pacer is actually doing, logged whenever it changes - so a
+  // report carries its own pacing configuration, and so flipping Framerate
+  // Cap in the settings menu leaves both configurations in the same log with
+  // the [pace] lines around them. Reading this against the display rate is
+  // what distinguishes "the emulation is slow" from "the cap does not match
+  // what the display will present" - see display_presentable_refresh_cap_hz.
+  {
+    static double s_logged_cap = -1.0;
+    if (cap != s_logged_cap) {
+      s_logged_cap = cap;
+      const float refresh_hz = rex::ui::Window::CachedDisplayRefreshHz();
+      if (cap >= 1.0) {
+        REXLOG_INFO("[pace] guest frame cap is now {:.0f} fps (auto={}, display presents at {:.0f} Hz)",
+                    cap, REXCVAR_GET(skate3_guest_fps_cap_auto) ? "on" : "off", refresh_hz);
+      } else {
+        REXLOG_INFO("[pace] guest frame cap is now OFF (auto={}, display presents at {:.0f} Hz)",
+                    REXCVAR_GET(skate3_guest_fps_cap_auto) ? "on" : "off", refresh_hz);
+      }
+    }
+  }
   static std::chrono::steady_clock::time_point s_next{};
   if (cap < 1.0) {
     s_next = {};
