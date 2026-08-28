@@ -32,6 +32,7 @@ REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
 #include "skate3_warp.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
@@ -501,8 +502,26 @@ std::filesystem::path ResolveRuntimeGameDataRoot(const rex::PathConfig& paths) {
     return std::filesystem::path(home) / "Documents" / "game";
   }
 #endif
+  // A configured root is a BUILD machine's path, and a distributed build is
+  // running somewhere else: /Users/<whoever>/skate3/game cannot even be
+  // created on another Mac, so honouring it blindly makes a released app fail
+  // to install the game with a permission error naming a stranger's home
+  // directory. Accept it when it exists, or when its parent does and we could
+  // create it there; otherwise fall through to somewhere this machine
+  // actually has.
   if (!paths.game_data_root.empty() && !IsInsideApplicationBundle(paths.game_data_root)) {
-    return paths.game_data_root;
+    std::error_code ec;
+    const bool exists = std::filesystem::is_directory(paths.game_data_root, ec) && !ec;
+    const auto parent = paths.game_data_root.parent_path();
+    // Parent exists = we could create it there. Deliberately not a real
+    // writability probe: this runs on every start, and the install path
+    // reports a permission failure clearly enough on its own.
+    const bool creatable = !parent.empty() && std::filesystem::is_directory(parent, ec) && !ec;
+    if (exists || creatable) {
+      return paths.game_data_root;
+    }
+    REXLOG_INFO("Configured game root {} is not present on this machine; using a local path",
+                paths.game_data_root.string());
   }
 
   // The working directory is only a sensible guess where the app is launched
@@ -521,7 +540,15 @@ std::filesystem::path ResolveRuntimeGameDataRoot(const rex::PathConfig& paths) {
   // - so prefer the user data root, which is always somewhere writable,
   // and only fall back to the config directory when there is nothing better.
   if (!paths.user_data_root.empty() && !IsInsideApplicationBundle(paths.user_data_root)) {
-    return paths.user_data_root.parent_path() / "game";
+    // Under the user data root, beside dlc/ and saves/, so everything this
+    // app owns lives in one folder. Earlier builds put it one level up,
+    // outside that folder entirely - keep using that when a game is actually
+    // installed there, so an existing install is not orphaned by the move.
+    const auto legacy = paths.user_data_root.parent_path() / "game";
+    if (skate3::IsGameInstalled(legacy)) {
+      return legacy;
+    }
+    return paths.user_data_root / "game";
   }
 
   const auto config_game = paths.config_path.parent_path() / "game";
@@ -604,6 +631,21 @@ std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
     add_dir(configured_root);
   }
   add_dir(executable_root / std::string(kDlcDirectoryName));
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
+  // Inside a .app the executable sits in Contents/MacOS, so "beside the
+  // executable" is three levels below where a person actually sees the app.
+  // Look beside the BUNDLE too, so dropping a dlc/ folder next to Skate 3.app
+  // works the way it does next to the Linux binary.
+  if (executable_root.has_parent_path()) {
+    const auto contents = executable_root.parent_path();          // Contents
+    if (contents.filename() == "Contents" && contents.has_parent_path()) {
+      const auto bundle = contents.parent_path();                 // Skate 3.app
+      if (bundle.has_parent_path()) {
+        add_dir(bundle.parent_path() / std::string(kDlcDirectoryName));
+      }
+    }
+  }
+#endif
   add_dir(game_data_root / std::string(kDlcDirectoryName));
   add_dir(user_data_root / std::string(kDlcDirectoryName));
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -1757,6 +1799,21 @@ void Skate3BaseApp::InstallDlcPackages() {
       }
 
       const auto package_path = entry.path();
+      // The folder ships its own README, and people leave notes next to their
+      // packs. A content package has no extension (LIVE/CON) or is a .big, so
+      // skipping plain text costs nothing and stops the scan warning about
+      // files it was never meant to read.
+      {
+        auto ext = package_path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".txt" || ext == ".md" || ext == ".nfo" || ext == ".ds_store") {
+          continue;
+        }
+        if (package_path.filename() == ".DS_Store") {
+          continue;
+        }
+      }
       std::error_code canonical_ec;
       auto package_key = std::filesystem::weakly_canonical(package_path, canonical_ec).string();
       if (canonical_ec) {
