@@ -442,17 +442,102 @@ void LoadAndNormalizeSimpleSettings(const std::filesystem::path& settings_path,
   rex::ui::EnsureSimpleSettingsConfig(settings_path);
 }
 
+// True if the path sits inside the application bundle. On iOS that is
+// read-only and code signed, so installing there fails with "Operation not
+// permitted"; on macOS it would corrupt the signature. Either way it is never
+// a legitimate place to write game data.
+bool IsInsideApplicationBundle(const std::filesystem::path& path) {
+#if defined(__APPLE__)
+  for (const auto& part : path) {
+    const auto name = part.string();
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".app") == 0) {
+      return true;
+    }
+  }
+#else
+  (void)path;
+#endif
+  return false;
+}
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// Inside the iOS data container ONLY Documents/, Library/ and tmp/ are
+// writable - the container root itself is not. A desktop XDG-style path like
+// <container>/.local/share/game therefore fails with EPERM just as surely as
+// the read-only app bundle does, which is exactly what the installer hit:
+//
+//   Unable to create the game directory at
+//   .../Data/Application/<uuid>/.local/share/game: Operation not permitted
+//
+// So on iOS the answer is not "any path outside the bundle", it is "a path
+// under one of the three writable roots".
+bool IsWritableIosLocation(const std::filesystem::path& path) {
+  const char* home = std::getenv("HOME");
+  if (!home || !*home) {
+    return false;
+  }
+  const std::filesystem::path home_path(home);
+  for (const char* writable : {"Documents", "Library", "tmp"}) {
+    const auto root = (home_path / writable).string();
+    const auto candidate = path.string();
+    if (candidate.compare(0, root.size(), root) == 0 &&
+        (candidate.size() == root.size() || candidate[root.size()] == '/')) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
 std::filesystem::path ResolveRuntimeGameDataRoot(const rex::PathConfig& paths) {
-  if (!paths.game_data_root.empty()) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // Honour a configured root only where it is somewhere we can actually write.
+  if (!paths.game_data_root.empty() && IsWritableIosLocation(paths.game_data_root)) {
+    return paths.game_data_root;
+  }
+  // Documents is both writable and the directory the user reaches over Finder
+  // to drop an ISO into, so it is where the game belongs.
+  if (const char* home = std::getenv("HOME"); home && *home) {
+    return std::filesystem::path(home) / "Documents" / "game";
+  }
+#endif
+  if (!paths.game_data_root.empty() && !IsInsideApplicationBundle(paths.game_data_root)) {
     return paths.game_data_root;
   }
 
+  // The working directory is only a sensible guess where the app is launched
+  // from a shell. On iOS it IS the bundle, so this branch has to be able to
+  // reject its own answer rather than hand back an unwritable path.
   const auto working_directory_game = std::filesystem::current_path() / "game";
-  if (skate3::IsGameInstalled(working_directory_game)) {
+  if (!IsInsideApplicationBundle(working_directory_game) &&
+      skate3::IsGameInstalled(working_directory_game)) {
     return working_directory_game;
   }
 
-  return paths.config_path.parent_path() / "game";
+  // Last resort. Both remaining candidates can land inside the bundle - which
+  // is exactly how the installer came to report
+  //   "Unable to create the game directory at .../skate3.app/game:
+  //    Operation not permitted"
+  // - so prefer the user data root, which is always somewhere writable,
+  // and only fall back to the config directory when there is nothing better.
+  if (!paths.user_data_root.empty() && !IsInsideApplicationBundle(paths.user_data_root)) {
+    return paths.user_data_root.parent_path() / "game";
+  }
+
+  const auto config_game = paths.config_path.parent_path() / "game";
+  if (!IsInsideApplicationBundle(config_game)) {
+    return config_game;
+  }
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // Nothing usable was configured and every candidate is inside the bundle.
+  // $HOME is the sandbox root on iOS, so Documents is both writable and the
+  // directory the user can reach over Finder to drop an ISO in.
+  if (const char* home = std::getenv("HOME"); home && *home) {
+    return std::filesystem::path(home) / "Documents" / "game";
+  }
+#endif
+  return config_game;
 }
 
 const char* FirstExistingFontPath(std::initializer_list<const char*> paths) {
@@ -628,6 +713,10 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   }
   auto runtime_paths = defaults;
   runtime_paths.game_data_root = ResolveRuntimeGameDataRoot(runtime_paths);
+  REXLOG_INFO("game data root: {} (configured: {}, user data: {})",
+              runtime_paths.game_data_root.string(),
+              defaults.game_data_root.empty() ? "<empty>" : defaults.game_data_root.string(),
+              defaults.user_data_root.empty() ? "<empty>" : defaults.user_data_root.string());
   runtime_paths.config_path.clear();
   if (!skate3::IsGameInstalled(runtime_paths.game_data_root)) {
     REXLOG_INFO("Game files not found at {}; launching rexglue ISO installer",
