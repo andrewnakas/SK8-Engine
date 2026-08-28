@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
@@ -217,7 +218,8 @@ class XboxIsoReader {
     }
 
     entries_.clear();
-    if (!ParseDirectory("", game_offset, game_offset + uint64_t(root_sector) * kSectorSize, error)) {
+    if (!ParseDirectory("", game_offset, game_offset + uint64_t(root_sector) * kSectorSize,
+                        root_size, error)) {
       return false;
     }
 
@@ -249,7 +251,11 @@ class XboxIsoReader {
     std::error_code ec;
     std::filesystem::create_directories(target_root, ec);
     if (ec) {
-      error = "Unable to create the game directory.";
+      // Say WHICH path and WHY. "Unable to create the game directory" on its
+      // own is unactionable for anyone reporting it, and the cause is almost
+      // always visible right here - a read-only or missing parent, or no space.
+      error = "Unable to create the game directory at " + target_root.string() + ": " +
+              ec.message();
       return false;
     }
 
@@ -263,13 +269,15 @@ class XboxIsoReader {
       const auto target = target_root / std::filesystem::path(entry.path);
       std::filesystem::create_directories(target.parent_path(), ec);
       if (ec) {
-        error = "Unable to create an install subdirectory.";
+        error = "Unable to create the install subdirectory " + target.parent_path().string() +
+                ": " + ec.message();
         return false;
       }
 
       std::ofstream out(target, std::ios::binary | std::ios::trunc);
       if (!out) {
-        error = "Unable to create " + entry.path + ".";
+        error = "Unable to create " + entry.path + " at " + target.string() + " (" +
+                std::strerror(errno) + ").";
         return false;
       }
 
@@ -306,15 +314,16 @@ class XboxIsoReader {
   }
 
   bool ParseDirectory(const std::string& prefix, uint64_t game_offset, uint64_t directory_offset,
-                      std::string& error) {
+                      uint64_t directory_size, std::string& error) {
     struct PendingNode {
       uint64_t directory_offset = 0;
       uint32_t node_offset = 0;
+      uint64_t directory_size = 0;
       std::string prefix;
     };
 
     std::vector<PendingNode> pending;
-    pending.push_back({directory_offset, 0, prefix});
+    pending.push_back({directory_offset, 0, directory_size, prefix});
     std::array<uint8_t, 14> header{};
     size_t visited = 0;
 
@@ -324,6 +333,15 @@ class XboxIsoReader {
       if (++visited > 500000) {
         error = "The ISO directory tree is unexpectedly large.";
         return false;
+      }
+
+      // A node offset must land inside this directory's own data. Without this
+      // a bad or unusual subtree pointer walks off into whatever follows on the
+      // disc and the garbage there surfaces as a bogus "invalid directory
+      // entry" rather than as the out-of-range read it actually is.
+      if (node.directory_size &&
+          uint64_t(node.node_offset) + header.size() > node.directory_size) {
+        continue;
       }
 
       const uint64_t entry_offset = node.directory_offset + node.node_offset;
@@ -338,7 +356,18 @@ class XboxIsoReader {
       const uint32_t length = ReadLe32(header.data() + 8);
       const uint8_t attributes = header[12];
       const uint8_t name_length = header[13];
-      if (name_length == 0 || name_length > 240) {
+
+      // Padding, not corruption. XDVDFS pads the tail of a directory's last
+      // sector, and mastering tools differ on what they pad WITH - 0xFF from
+      // some, 0x00 from others - so both a 0xFF and a 0 name length simply mean
+      // "there is no entry here". Treating either as fatal is what produced
+      // "The ISO contains an invalid directory entry name" on perfectly good
+      // discs: the walk reached padding and gave up on the whole ISO instead of
+      // on that one branch.
+      if (name_length == 0 || name_length == 0xFF) {
+        continue;
+      }
+      if (name_length > 240) {
         error = "The ISO contains an invalid directory entry name.";
         return false;
       }
@@ -349,18 +378,25 @@ class XboxIsoReader {
         return false;
       }
 
-      if (left) {
-        pending.push_back({node.directory_offset, static_cast<uint32_t>(left) * 4u, node.prefix});
+      // 0xFFFF is the "no child" sentinel. Only 0 was being treated as absent,
+      // so a subtree terminated the other way was followed into the padding
+      // above - the direct cause of the reported failures. 0 stays a
+      // terminator too: offset 0 is the node the walk started from.
+      if (left && left != 0xFFFF) {
+        pending.push_back({node.directory_offset, static_cast<uint32_t>(left) * 4u,
+                           node.directory_size, node.prefix});
       }
-      if (right) {
-        pending.push_back({node.directory_offset, static_cast<uint32_t>(right) * 4u, node.prefix});
+      if (right && right != 0xFFFF) {
+        pending.push_back({node.directory_offset, static_cast<uint32_t>(right) * 4u,
+                           node.directory_size, node.prefix});
       }
 
       const bool is_directory = (attributes & 0x10) != 0;
       const std::string full_path = node.prefix + name;
       if (is_directory) {
         if (length != 0) {
-          pending.push_back({game_offset + uint64_t(sector) * kSectorSize, 0, full_path + "/"});
+          pending.push_back(
+              {game_offset + uint64_t(sector) * kSectorSize, 0, length, full_path + "/"});
         }
       } else {
         entries_.push_back({full_path, game_offset + uint64_t(sector) * kSectorSize, length});
