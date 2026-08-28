@@ -811,9 +811,18 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
       "This build of Skate 3 requires Title Update 3, a free update originally published on "
       "Xbox Live. It is not part of the game disc.";
   options.target_directory = game_root.string();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // iOS cannot spawn a subprocess, so DownloadToFile is a stub that only ever
+  // reports failure. Offering the button anyway would be a button that cannot
+  // work - the file has to come in over file sharing, which is what the steps
+  // below explain.
+  options.initial_status =
+      "Copy the title update onto this device, then select it here.";
+#else
   options.initial_status =
       "Download it automatically, or select a title update package you already have.";
   options.fetch_button_label = "Download (1.7 MB)";
+#endif
   options.pick_button_label = "Select file...";
   options.fetch_connecting_status =
       "Connecting to the download server... (this can take a moment)";
@@ -857,9 +866,16 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
           complete(std::move(runtime_paths));
         }
       });
-  // Only relevant to the "select a file" route - downloading needs none of it.
-  dialog->SetInstructions(FileTransferStepsTitle(),
-                          FileTransferSteps("the title update package", "Select file..."));
+  // Only relevant to the "select a file" route - downloading needs none of it,
+  // and on iOS that route is the only one there is.
+  {
+    auto steps = FileTransferSteps("the title update package", "Select file...");
+    steps.insert(steps.begin(),
+                 "Download the title update on a computer from "
+                 "xboxunity.net/Resources/Lib/TitleUpdate.php?tuid=21774 - it is about "
+                 "1.7 MB, and the file is named TU_12K2276_000000C000000.00000000000O3.");
+    dialog->SetInstructions(FileTransferStepsTitle(), std::move(steps));
+  }
 }
 
 bool RunTitleUpdateInstallWizardBlocking(rex::ui::WindowedAppContext& app_context,
