@@ -4764,9 +4764,15 @@ void OnSetStreamSource(uint32_t stream, uint32_t vb_obj, uint32_t offset, uint32
 void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t r6,
                 uint32_t r7) {
   g_draw_seq.fetch_add(1, std::memory_order_relaxed);
+  g_draws_all.fetch_add(1, std::memory_order_relaxed);
   const uint32_t flags2d = Phase2dFlags();
   if (flags2d != 0) {
     g_draws_2d.fetch_add(1, std::memory_order_relaxed);
+    for (uint32_t bit = 0; bit < 6; ++bit) {
+      if (flags2d & (1u << bit)) {
+        g_draws_2d_by_bit[bit].fetch_add(1, std::memory_order_relaxed);
+      }
+    }
   }
   // Last-draw provenance for the submit-exit capture (see g_last_draw_ibvb):
   // only an indexed 3D draw leaves a bank the palette/world capture may
@@ -5547,8 +5553,12 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   if (flags2d != 0 && SceneEnabled() && REXCVAR_GET(skate3_native_render_scene_2d)) {
     if (func == 2) {
       const uint32_t device = g_device.load(std::memory_order_relaxed);
-      if (device != 0 && r7 >= 0x10000 && r5 != 0 && r5 <= 65536 && r6 >= 8 &&
-          r6 <= 256 && (r6 & 3) == 0) {
+      const bool recordable = device != 0 && r7 >= 0x10000 && r5 != 0 && r5 <= 65536 &&
+                              r6 >= 8 && r6 <= 256 && (r6 & 3) == 0;
+      if (!recordable) {
+        g_2d_gate_reject.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (recordable) {
         Draw2d d;
         d.prim = r4;
         d.count = r5;
@@ -8030,6 +8040,7 @@ void Publish2dDraws(uint8_t* base) {
     std::lock_guard<std::mutex> lock(g_2d_mutex);
     frame_2d.swap(g_frame_2d);
   }
+  g_2d_capin.store(uint32_t(frame_2d.size()), std::memory_order_relaxed);
   static thread_local std::vector<uint8_t> scratch_2d;
   std::vector<Draw2d> published;
   published.reserve(frame_2d.size());
@@ -8063,6 +8074,7 @@ void Publish2dDraws(uint8_t* base) {
     const uint32_t bytes = d.count * d.stride;
     scratch_2d.resize(bytes);
     if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
+      g_2d_copyfail.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     // Guest dwords are big-endian.

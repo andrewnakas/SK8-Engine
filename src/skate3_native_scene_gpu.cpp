@@ -7596,7 +7596,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     REXLOG_INFO(
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
-        "2d[other={} dropped={} askip={} astale={} pending={} badfmt={} stride={} notex={} textures={}] cached_meshes={} mesh_mb={} textures={} tex_mb={} "
+        "2d[other={} dropped={} askip={} astale={} pending={} badfmt={} stride={} notex={} textures={}] "
+        "draws_all={} capin={} gate_rej={} copyfail={} 2dbits[fe={} aptmovie={} aptunit={} rtt={} font={} simple={}] cached_meshes={} mesh_mb={} textures={} tex_mb={} "
         "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} relax={} caster={} incoh={} stretch={} blend={} blendmiss={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
@@ -7614,6 +7615,10 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_2d_async_skip.load(), g_2d_async_stale.load(), g_scene_2d_size.load(),
         g_draws_2d_badfmt.load(),
         g_draws_2d_badfmt_stride.load(), g_draws_2d_notex.load(), g_r.tex_store.size(),
+        g_draws_all.load(), g_2d_capin.load(), g_2d_gate_reject.load(),
+        g_2d_copyfail.load(), g_draws_2d_by_bit[0].load(), g_draws_2d_by_bit[1].load(),
+        g_draws_2d_by_bit[2].load(), g_draws_2d_by_bit[3].load(),
+        g_draws_2d_by_bit[4].load(), g_draws_2d_by_bit[5].load(),
         g_r.meshes.size(), g_mesh_store_bytes >> 20, g_r.tex_store.size(),
         g_tex_store_bytes >> 20,
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
