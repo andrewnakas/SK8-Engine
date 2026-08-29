@@ -428,6 +428,10 @@ void DumpAllThreads() {
   tail.Flush();
 }
 
+// How long the guest may take to produce its first frame before the watchdog
+// calls it a hang. Boot to gameplay measures ~25s on an iPhone 13 mini.
+constexpr int kPreFirstFrameGraceSeconds = 75;
+
 void WatchdogMain() {
   uint64_t last_seen = 0;
   int stalled_ticks = 0;
@@ -468,6 +472,17 @@ void WatchdogMain() {
     }
 
     const uint64_t now = g_heartbeat.load(std::memory_order_relaxed);
+    // Before the guest has ever presented a frame the heartbeat is legitimately
+    // zero for the whole of boot - ISO scan, module load, the intro - which on
+    // this game is comfortably longer than the normal watchdog period. Arming
+    // the watchdog early (so a guest that never starts still gets a dump) made
+    // that fire on EVERY healthy launch, and because the report latches, the
+    // real hang later in the same run was then never dumped at all. Give the
+    // pre-first-frame phase its own, much longer grace.
+    if (now == 0 && stalled_ticks < kPreFirstFrameGraceSeconds) {
+      ++stalled_ticks;
+      continue;
+    }
     if (now != last_seen) {
       last_seen = now;
       stalled_ticks = 0;
