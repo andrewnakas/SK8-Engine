@@ -1849,9 +1849,16 @@ void Skate3BaseApp::InstallDlcPackages() {
         continue;
       }
 
+      // The next three skips are INFO, not WARN. Every one of them means "a
+      // file in this folder is not DLC for this game", which is the normal
+      // state of a folder containing anything else - and the scan hits every
+      // save and content package on the device, so at warn they were around
+      // fifty lines a boot burying whatever real warning followed. The summary
+      // below reports the count; a skip that is genuinely a failure (install
+      // returned an error) is still a warning.
       const auto header = rex::filesystem::StfsContainerDevice::ReadPackageHeader(package_path);
       if (!header) {
-        REXLOG_WARN("Skipping DLC candidate with invalid STFS header: {}", package_path.string());
+        REXLOG_INFO("Skipping DLC candidate with invalid STFS header: {}", package_path.string());
         ++skipped_count;
         continue;
       }
@@ -1859,7 +1866,7 @@ void Skate3BaseApp::InstallDlcPackages() {
       const auto content_type =
           static_cast<rex::system::XContentType>(header->metadata.content_type);
       if (content_type != rex::system::XContentType::kMarketplaceContent) {
-        REXLOG_WARN("Skipping non-DLC content package {} with type {:08X}",
+        REXLOG_INFO("Skipping non-DLC content package {} with type {:08X}",
                     package_path.filename().string(), static_cast<uint32_t>(content_type));
         ++skipped_count;
         continue;
@@ -1867,7 +1874,7 @@ void Skate3BaseApp::InstallDlcPackages() {
 
       const uint32_t package_title_id = header->metadata.execution_info.title_id;
       if (package_title_id != 0 && package_title_id != title_id) {
-        REXLOG_WARN("Skipping DLC package {} for title {:08X}; running title is {:08X}",
+        REXLOG_INFO("Skipping DLC package {} for title {:08X}; running title is {:08X}",
                     package_path.filename().string(), package_title_id, title_id);
         ++skipped_count;
         continue;
