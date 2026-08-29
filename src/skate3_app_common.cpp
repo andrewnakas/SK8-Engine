@@ -11,6 +11,7 @@
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
 #include "skate3_pack_select.h"
+#include "skate3_performance_profile.h"
 #include <rex/ui/windowed_app_context_sdl.h>
 
 REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, false, "Skate 3",
@@ -1019,6 +1020,9 @@ void Skate3BaseApp::OnPostSetup() {
   // parsed, so an ios_args.txt that asks for diagnostics gets them from frame
   // one rather than from whenever the settings screen is first opened.
   skate3::InstallDiagnosticsSwitch();
+  // After the cvars and settings.toml are in, so naming a preset at launch
+  // beats both - and before the renderer reads any of them.
+  skate3::ApplyRequestedPerformanceProfile();
   skate3::shader_disasm::RunIfRequested();
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();

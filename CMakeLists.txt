@@ -285,6 +285,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_native_debug_dialog.cpp
     src/skate3_touch_controls.cpp
     src/skate3_pack_select.cpp
+    src/skate3_performance_profile.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
     src/skate3_native_scene_gpu.cpp
