@@ -37,6 +37,7 @@ REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
+REXCVAR_DECLARE(bool, skate3_diagnostics);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
 REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
                     "Diagnostic: watch the guest D3D command-ring write pointer at every "
@@ -397,6 +398,23 @@ void ReportPacing() {
   static Clock::time_point s_prev{};
   static Clock::time_point s_window_start{};
   static std::vector<double> s_intervals_ms;
+
+  // This used to run unconditionally, which was defensible while the line it
+  // produces was always printed. It is not defensible now that the shipped log
+  // level is warn and [pace] writes at info: without this gate every player
+  // would time every frame, grow a 1800-entry vector, and sort a copy of it
+  // every thirty seconds, to format a string that is then dropped.
+  if (!REXCVAR_GET(skate3_diagnostics)) {
+    if (s_prev.time_since_epoch().count() != 0) {
+      // Drop the window rather than keep it: the next sample after the switch
+      // is flipped back on would otherwise be an interval spanning however long
+      // diagnostics were off, and land in p95 as a hitch that never happened.
+      s_prev = {};
+      s_intervals_ms.clear();
+      s_intervals_ms.shrink_to_fit();
+    }
+    return;
+  }
 
   const auto now = Clock::now();
   if (s_prev.time_since_epoch().count() == 0) {
