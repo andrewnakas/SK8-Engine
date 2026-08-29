@@ -28,6 +28,7 @@ namespace skate3::crash_report {
 
 #if defined(_WIN32)
 inline void EnsureInstalled(uint8_t* /*guest_base*/) {}
+inline void StartWatchdogEarly() {}
 inline void Heartbeat() {}
 inline void NoteGuestWork(uint64_t /*submitted*/) {}
 #else
@@ -35,6 +36,16 @@ inline void NoteGuestWork(uint64_t /*submitted*/) {}
 // host address as a guest address (the only form that means anything when
 // reading recompiled code).
 void EnsureInstalled(uint8_t* guest_base);
+
+/// Start ONLY the hang watchdog, before the guest has run.
+///
+/// EnsureInstalled hangs off the guest's first D3D Swap so that its fault
+/// handler lands last on the chain - which means a boot that never reaches a
+/// Swap gets no watchdog and no thread dump at all. That is exactly the shape
+/// of the "guest resumed but never executed" freeze, so the watchdog is
+/// started separately here. Deliberately does NOT touch the exception or
+/// SIGABRT handlers; EnsureInstalled still owns those and remains idempotent.
+void StartWatchdogEarly();
 
 // Called at the guest frame boundary. When it stops advancing for
 // skate3_hang_watchdog_seconds, every thread's stack is dumped - a freeze

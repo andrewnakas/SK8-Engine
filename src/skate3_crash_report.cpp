@@ -581,6 +581,23 @@ bool CrashReportHandler(rex::arch::Exception* ex, void* /*data*/) {
 
 }  // namespace
 
+void StartWatchdogEarly() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (g_crash_fd < 0) {
+      const std::string& log_file = REXCVAR_GET(log_file);
+      const std::string path =
+          log_file.empty() ? std::string("skate3_crash.txt") : log_file + ".crash";
+      g_crash_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    }
+    snprintf(g_stamp, sizeof(g_stamp), "v=%s platform=%s", SKATE3_VERSION_STRING,
+             SKATE3_BUILD_PLATFORM);
+    g_epoch0.store(uint64_t(time(nullptr)), std::memory_order_relaxed);
+    StartWatchdog();
+    REXLOG_INFO("skate3 crash reporter: hang watchdog armed before the guest starts");
+  });
+}
+
 void EnsureInstalled(uint8_t* guest_base) {
   static std::once_flag once;
   std::call_once(once, [guest_base] {

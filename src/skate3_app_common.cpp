@@ -24,6 +24,7 @@ REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
                       "game's boot content scan does not cope with several at once.");
 #include "skate3_touch_controls.h"
 #include "skate3_native_scene.h"
+#include "skate3_crash_report.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
 #include "skate3_win_icon.h"
@@ -1008,6 +1009,11 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 }
 
 void Skate3BaseApp::OnPostSetup() {
+  // Arm the hang watchdog before the guest runs. The full reporter installs
+  // from the guest's first D3D Swap, so a boot that never reaches one - the
+  // freeze where the main thread is resumed and then simply never executes -
+  // produced no thread dump at all, which is why that failure had no evidence.
+  skate3::crash_report::StartWatchdogEarly();
   skate3::shader_disasm::RunIfRequested();
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
