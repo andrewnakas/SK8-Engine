@@ -79,6 +79,27 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 
+	<!-- Opt into high frame rates on ProMotion iPhones. NOT because the game
+	     should run above 60 - the guest stays capped at 60 - but to work around
+	     a long-standing iOS bug where, on a ProMotion device, ANY touch halves
+	     the frame rate: 120 -> 60, 60 -> 30. Reported since iOS 15 and still
+	     open (Apple Developer Forums thread 695097); this is a touchscreen game,
+	     so the halving is effectively permanent.
+
+	     Without this key iOS holds the layer to a 60 fps ceiling, the halving
+	     takes it to 30, and that is exactly what an iPhone 15 Pro Max measured:
+	     p50 33.3 ms, an exact 2x the vblank, with the GPU idle at 4.6 ms and the
+	     command processor never waiting on a fence. A 60 Hz iPhone 13 mini has
+	     no ProMotion and is unaffected, which is why it holds a locked 60 while
+	     far faster hardware does not - the split is the display, not the chip.
+
+	     The documented workaround is to allow a rate above the target so the
+	     halving lands ON the target: permit 120, ask the guest for 60, get 60.
+	     The guest cap is unchanged (skate3_guest_fps_cap=60 with auto off), so
+	     this does not add render work or heat. -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+
 	<!-- A storyboard-less launch screen; without any UILaunchScreen key iOS
 	     letterboxes the app at a legacy resolution. -->
 	<key>UILaunchScreen</key>
