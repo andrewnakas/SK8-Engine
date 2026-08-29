@@ -1329,6 +1329,16 @@ void Skate3BaseApp::RestartGame() {
     }
     argv.push_back(nullptr);
 
+#if REX_PLATFORM_IOS
+    // iOS forbids a sandboxed app from spawning anything, so posix_spawn here
+    // fails with EPERM, logs, and returns - which is why "Apply & Restart" did
+    // nothing at all on a phone. The settings are already written to disk by
+    // ApplyAndRestart's SaveVideo() before this runs, so quitting IS applying
+    // them; the player just relaunches by hand. Falls through to the quit
+    // below rather than trying and failing first.
+    REXLOG_INFO("Restart requested: settings saved, quitting for a manual relaunch (iOS "
+                "cannot restart itself)");
+#else
     const std::string executable = rex::path_to_utf8(executable_path);
     pid_t child_pid = 0;
     const int spawn_result =
@@ -1338,6 +1348,7 @@ void Skate3BaseApp::RestartGame() {
                   std::strerror(spawn_result));
       return;
     }
+#endif
 #else
     REXLOG_WARN("Restart requested, but automatic restart is not implemented on this platform");
     return;
