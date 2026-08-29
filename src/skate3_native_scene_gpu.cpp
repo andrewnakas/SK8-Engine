@@ -206,6 +206,21 @@ namespace {
 bool g_bc_on_cpu = true;
 bool g_bc_resolved = false;
 bool g_dxt1_565 = false;
+
+// The two silent rejections in emit_draw. A black menu screen reads as
+// draws_2d=14398 drawn_2d=0 with only 189 accounted for by dropped/askip,
+// because a quad refused for its vertex format or for an unresolved texture
+// returned without recording anything. These say which of the two it is.
+std::atomic<uint64_t> g_draws_2d_badfmt{0};
+std::atomic<uint64_t> g_draws_2d_notex{0};
+// How many quads the guest actually handed us for the frame just drawn.
+// draws_2d is cumulative and was seen FROZEN at 16533 across a whole black
+// screen, which says the guest stopped submitting rather than that we
+// rejected anything - but the two are indistinguishable without this.
+std::atomic<uint32_t> g_scene_2d_size{0};
+// Distinct strides seen when a quad is refused for its format: the guest's
+// actual stride, so the 28-byte assumption can be checked rather than argued.
+std::atomic<uint32_t> g_draws_2d_badfmt_stride{0};
 }  // namespace
 
 bool DecodeBcOnCpu() { return g_bc_on_cpu; }
@@ -7581,7 +7596,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     REXLOG_INFO(
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
-        "2d[other={} dropped={} askip={} astale={} textures={}] cached_meshes={} mesh_mb={} textures={} tex_mb={} "
+        "2d[other={} dropped={} askip={} astale={} pending={} badfmt={} stride={} notex={} textures={}] cached_meshes={} mesh_mb={} textures={} tex_mb={} "
         "vs_uploads={} palettes={} palette_base_plus1={} ropa[rigid={} stale={} rescued={} relax={} caster={} incoh={} stretch={} blend={} blendmiss={}] dyn_gap={} skinned={} skinned_skipped={} foreign_bank={} "
         "rigid[pending={} dropped={} worldprops={}] "
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
@@ -7596,7 +7611,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         frames, scene.items.size(), drawn, g_draws_2d.load(), drawn_2d,
         drawn_spline, g_draws_spline.load(),
         g_draws_2d_other.load(), g_draws_2d_dropped.load(),
-        g_2d_async_skip.load(), g_2d_async_stale.load(), g_r.tex_store.size(),
+        g_2d_async_skip.load(), g_2d_async_stale.load(), g_scene_2d_size.load(),
+        g_draws_2d_badfmt.load(),
+        g_draws_2d_badfmt_stride.load(), g_draws_2d_notex.load(), g_r.tex_store.size(),
         g_r.meshes.size(), g_mesh_store_bytes >> 20, g_r.tex_store.size(),
         g_tex_store_bytes >> 20,
         g_vs_uploads.load(), g_palette_snapshots.load(), g_palette_base_plus1.load(),
@@ -11696,6 +11713,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       std::lock_guard<std::mutex> lock(g_2d_mutex);
       scene_2d = g_scene_2d;
     }
+    g_scene_2d_size.store(uint32_t(scene_2d.size()), std::memory_order_relaxed);
     if (!scene_2d.empty()) {
       cmd->SetPipeline(g_r.pso_2d);
       // One shared draw routine for both the RTT passes and the screen pass.
@@ -11707,6 +11725,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                  nrhi::TextureView* const* yuv = nullptr) {
         const uint32_t bytes = uint32_t(d.verts.size());
         if (bytes == 0 || d.stride != 28) {
+          g_draws_2d_badfmt.fetch_add(1, std::memory_order_relaxed);
+          g_draws_2d_badfmt_stride.store(d.stride, std::memory_order_relaxed);
           return;
         }
         if (ui_offset + bytes > RendererState::kUiRegionSize) {
@@ -11722,6 +11742,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           if (t == nullptr) {
             // Big-art decode in flight on the workers (large-art async
             // routing); skip the quad; it lands 1-3 frames later.
+            g_draws_2d_notex.fetch_add(1, std::memory_order_relaxed);
             return;
           }
           srv_view = t->srv;
