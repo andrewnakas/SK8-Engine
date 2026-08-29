@@ -5,6 +5,7 @@
 #endif
 
 #include "skate3_demo_path.h"
+#include "skate3_diagnostics.h"
 #include "skate3_fov.h"
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
@@ -1014,6 +1015,10 @@ void Skate3BaseApp::OnPostSetup() {
   // freeze where the main thread is resumed and then simply never executes -
   // produced no thread dump at all, which is why that failure had no evidence.
   skate3::crash_report::StartWatchdogEarly();
+  // Before anything that might want to be measured, and after the cvars are
+  // parsed, so an ios_args.txt that asks for diagnostics gets them from frame
+  // one rather than from whenever the settings screen is first opened.
+  skate3::InstallDiagnosticsSwitch();
   skate3::shader_disasm::RunIfRequested();
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
