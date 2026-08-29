@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 2.4.7 LANGUAGES CXX)
+project(skate3 VERSION 2.5.0 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -29,6 +29,25 @@ skate3_resolve_version(SKATE3_FULL_VERSION
     FLOOR_VERSION ${PROJECT_VERSION}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 string(REGEX REPLACE "-.*$" "" SKATE3_NUMERIC_VERSION "${SKATE3_FULL_VERSION}")
+
+# An app bundle cannot carry the full version string: CFBundleShortVersionString
+# is the marketing version and Apple requires a clean x.y.z, so it gets
+# PROJECT_VERSION while the log, the window title and the crash report all get
+# SKATE3_FULL_VERSION from git describe. Off a release tag those two disagree -
+# a binary that reports 2.5.0.4-dev.gABCDEF inside a bundle whose Info.plist,
+# and therefore make-ipa.sh and the AltStore manifest, says a clean 2.5.0.
+#
+# That disagreement is fine for a development build and is a packaging bug in a
+# release, and the only difference between the two is whether anyone noticed.
+# So notice. CFBundleVersion carries SKATE3_NUMERIC_VERSION (which keeps the
+# commit count) so the bundle itself also shows it.
+if(NOT SKATE3_FULL_VERSION VERSION_EQUAL PROJECT_VERSION)
+    message(WARNING
+        "Version mismatch: the binary will report '${SKATE3_FULL_VERSION}' but any app "
+        "bundle's CFBundleShortVersionString will say '${PROJECT_VERSION}'. This build is "
+        "not on a release tag. For a release: tag first, then re-run CMake - git describe "
+        "is read at configure time, so configuring before tagging bakes in the suffix.")
+endif()
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.
 string(REPLACE "." ";" SKATE3_RC_VERSION_PARTS "${SKATE3_NUMERIC_VERSION}")
@@ -457,7 +476,7 @@ if(APPLE)
             MACOSX_BUNDLE_GUI_IDENTIFIER "${SKATE3_IOS_BUNDLE_ID}"
             MACOSX_BUNDLE_EXECUTABLE_NAME "skate3"
             MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-            MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+            MACOSX_BUNDLE_BUNDLE_VERSION "${SKATE3_NUMERIC_VERSION}"
             XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${SKATE3_IOS_BUNDLE_ID}"
             XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ios/skate3.entitlements"
@@ -500,7 +519,7 @@ if(APPLE)
                 MACOSX_BUNDLE_GUI_IDENTIFIER "com.nakas.skate3"
                 MACOSX_BUNDLE_EXECUTABLE_NAME "Skate 3"
                 MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-                MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+                MACOSX_BUNDLE_BUNDLE_VERSION "${SKATE3_NUMERIC_VERSION}"
             )
             # The SDK's staging put the Vulkan files next to the executable,
             # which codesign rejects for a bundle. Move them into the layout it
