@@ -27,10 +27,14 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include <skate3_version.h>
 
 #include <rex/cvar.h>
 #include <rex/exception_handler.h>
@@ -235,6 +239,24 @@ std::atomic<uint64_t> g_heartbeat{0};
 std::atomic<uint64_t> g_guest_work{0};
 std::atomic<bool> g_hang_reported{false};
 
+// Report attribution. The crash file is append-only and survives across
+// sessions and builds, so without these every block in it is anonymous.
+// Pre-formatted at install time and ticked from the watchdog thread; the
+// signal handlers only Str()/Dec() them.
+char g_stamp[160] = "";
+std::atomic<uint64_t> g_uptime_seconds{0};
+std::atomic<uint64_t> g_epoch0{0};
+
+void WriteReportStamp(Report& r) {
+  r.Str("  ");
+  r.Str(g_stamp);
+  r.Str(" uptime_s=");
+  r.Dec(g_uptime_seconds.load(std::memory_order_relaxed));
+  r.Str(" epoch0=");
+  r.Dec(g_epoch0.load(std::memory_order_relaxed));
+  r.Str("\n");
+}
+
 #if defined(__linux__)
 void ThreadDumpHandler(int, siginfo_t*, void*) {
   Report r;
@@ -267,6 +289,7 @@ void ThreadDumpHandler(int, siginfo_t*, void*) {
 void DumpAllThreads() {
   Report r;
   r.Str("\n=== skate3: HANG detected - no guest frame for the watchdog period ===\n");
+  WriteReportStamp(r);
 #if defined(__linux__)
   r.Str("  every thread's stack follows; the one holding the lock everyone else\n");
   r.Str("  is waiting on is the interesting one.\n");
@@ -413,6 +436,7 @@ void WatchdogMain() {
   for (;;) {
     struct timespec ts = {1, 0};
     nanosleep(&ts, nullptr);
+    g_uptime_seconds.fetch_add(1, std::memory_order_relaxed);
     const int limit = REXCVAR_GET(skate3_hang_watchdog_seconds);
     if (limit <= 0) {
       continue;
@@ -438,6 +462,7 @@ void WatchdogMain() {
                !g_hang_reported.exchange(true, std::memory_order_relaxed)) {
       Report r;
       r.Str("\n=== skate3: STALL - frames still presenting, guest submitting no draws ===\n");
+      WriteReportStamp(r);
       r.Flush();
       DumpAllThreads();
     }
@@ -487,6 +512,7 @@ void AbortHandler(int sig, siginfo_t* info, void* uctx) {
   if (reporting.compare_exchange_strong(expected, 1)) {
     Report r;
     r.Str("\n=== skate3: guest abort (REX_FATAL / assert) ===\n");
+    WriteReportStamp(r);
     WriteGuestState(r);
   }
   // Chain, then let abort() finish the job: returning from here re-raises with
@@ -514,6 +540,7 @@ bool CrashReportHandler(rex::arch::Exception* ex, void* /*data*/) {
 
   Report r;
   r.Str("\n=== skate3: unhandled guest fault ===\n");
+  WriteReportStamp(r);
 
   const bool illegal = ex->code() == rex::arch::Exception::Code::kIllegalInstruction;
   r.Str(illegal ? "  kind          illegal instruction\n" : "  kind          access violation\n");
@@ -566,6 +593,12 @@ void EnsureInstalled(uint8_t* guest_base) {
     if (g_crash_fd < 0) {
       REXLOG_WARN("skate3 crash reporter: could not open '{}'; stderr only", path);
     }
+    // Attribution for every block appended to the .crash file. Formatted here,
+    // on a normal thread, so the handlers only ever copy bytes.
+    snprintf(g_stamp, sizeof(g_stamp), "v=%s platform=%s", SKATE3_VERSION_STRING,
+             SKATE3_BUILD_PLATFORM);
+    g_epoch0.store(uint64_t(time(nullptr)), std::memory_order_relaxed);
+
     rex::arch::ExceptionHandler::Install(CrashReportHandler, nullptr);
     StartWatchdog();
 
