@@ -98,6 +98,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_grid_standalone);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_display_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_grab_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_native);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_prewarm);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_readback);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_refl_bias_auto);
@@ -3780,12 +3781,26 @@ bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context) {
 // the first photo-editor frame (a one-time ~100 ms compile the frozen-scene
 // editor absorbs invisibly). Output-sized targets are (re)built per frame by
 // the render block on size change.
-bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
+// budget_ms bounds how long one call may spend compiling. It always builds at
+// least one entry, so progress is guaranteed however small the budget; 0 means
+// "exactly one entry per call". Returns true only when the WHOLE family - the
+// nine PSOs plus the intermediates, the grade LUT, the CB ring and the fixed
+// views - is live, so a partially built pfx_pso[] is never reachable: the two
+// call sites either pump it or gate the entire chain on it.
+bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context,
+                           uint32_t budget_ms) {
   if (g_r.pfx_ready) {
     return true;
   }
   if (g_r.pfx_failed) {
     return false;
+  }
+  const auto build_start = std::chrono::steady_clock::now();
+  if (g_r.pfx_built == 0) {
+    // Latched at the START of a build, not at the end: the family is now
+    // compiled over several frames, so a mid-build change has to be
+    // detectable too - see the retire in EnsurePipeline.
+    g_r.pfx_rtv_format = context.guest_output->format();
   }
   nrhi::Device* device = context.device;
   const auto fail = [&](const char* what) {
@@ -3838,7 +3853,7 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
   };
   const nrhi::ShaderMacro msaa_defines[] = {{"PFX_MSAA", "1"},
                                             {nullptr, nullptr}};
-  for (int i = 0; i < 9; ++i) {
+  for (int i = int(g_r.pfx_built); i < 9; ++i) {
     const bool msaa_pass = (i == 0 && g_r.msaa > 1);
     const nrhi::ShaderMacro* defs = msaa_pass ? msaa_defines : nullptr;
     const char* variant = msaa_pass ? "PFX_MSAA=1" : "";
@@ -3862,11 +3877,27 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context) {
     pso.depth_clip = true;
     pso.rtv_format = entries[i].rtv;
     pso.sample_count = 1;
+    // Every pass here is a fullscreen triangle: the chain sets kTriangleList
+    // once and draws nothing else. Without this the backend also builds a
+    // strip twin nothing binds, doubling the compile cost of the one family
+    // that is guaranteed to be cold when a player first opens the editor.
+    pso.triangle_list_only = true;
     g_r.pfx_pso[i] = device->CreateGraphicsPipeline(pso);
     device->DestroyDeferred(vs);
     device->DestroyDeferred(ps);
     if (g_r.pfx_pso[i] == nullptr) {
       return fail(entries[i].ps);
+    }
+    g_r.pfx_built = uint32_t(i) + 1;
+    // Out of budget: come back next call. The caller renders the scene
+    // without the photo effects until the whole family lands, which is the
+    // state the photo_native cvar already documents as expected on the
+    // editor's first frames. Nine bounded stalls beat one unbounded one.
+    const int64_t spent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - build_start)
+                                 .count();
+    if (g_r.pfx_built < 9 && spent_ms >= int64_t(budget_ms)) {
+      return false;
     }
   }
   // Fixed-size intermediates + the identity grade LUT + the CB ring.
@@ -4586,10 +4617,16 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
       (hdr_want && g_r.hdr_scene_format != hdr_fmt_want) ||
       g_r.msaa != msaa_want ||
       g_r.showcase_shaders != g_r.showcase_shaders_want) {
-    if (g_r.msaa != msaa_want && g_r.pfx_ready) {
-      // The photo-postfx depth-pack pass is compiled against the depth
-      // buffer's sample count (PFX_MSAA variant); retire the chain's PSOs
-      // so the next photo-editor frame rebuilds them.
+    // The photo-postfx depth-pack pass is compiled against the depth buffer's
+    // sample count (PFX_MSAA variant), and the fisheye/debug passes against
+    // the guest output format - retire the chain's PSOs on either change so
+    // the family rebuilds. The format half is unreachable today (the guest
+    // output format is a constant), but the family is now built behind a
+    // loading screen and used much later, so the assumption it rests on is
+    // checked rather than assumed.
+    if ((g_r.pfx_ready || g_r.pfx_built != 0) &&
+        (g_r.msaa != msaa_want ||
+         g_r.pfx_rtv_format != context.guest_output->format())) {
       for (nrhi::Pipeline*& p : g_r.pfx_pso) {
         if (p != nullptr) {
           device->DestroyDeferred(p);
@@ -4597,6 +4634,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
         }
       }
       g_r.pfx_ready = false;
+      g_r.pfx_built = 0;
+      g_r.pfx_rtv_format = nrhi::Format::kUnknown;
     }
     g_r.hdr_active = hdr_want;
     g_r.hdr_scene_format = hdr_fmt_want;
@@ -5738,8 +5777,42 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
     // Build the pipelines / render targets behind the loading screen so
     // the one-time PSO compilation (~200 ms) never lands on a gameplay
     // frame.
-    if (!g_r.failed && g_r.pso == nullptr) {
+    const bool built_main_family_this_frame = !g_r.failed && g_r.pso == nullptr;
+    if (built_main_family_this_frame) {
       EnsurePipeline(context);
+    }
+    // The photo-editor chain belongs here for the same reason, and was the
+    // ONE family left out of it: EnsurePipeline builds every other one
+    // (scene, resolve, blur, outline, 2d, spline, shadow), and photo_fx was
+    // built lazily on the first frame the editor was open instead. That is
+    // nine pipelines at once on the thread that presents, and on MoltenVK a
+    // build is SPIR-V -> MSL -> Metal at 362-686 ms EACH - a 3-6 second stall
+    // where the comment on EnsurePhotoFxPipeline promised ~100 ms. It read as
+    // "picture missions crash the first time and work after relaunching",
+    // because the disk pipeline cache the crashed run wrote made the second
+    // launch a file read.
+    //
+    // Called BESIDE EnsurePipeline rather than inside it deliberately: that
+    // function returns false if any family fails and the caller treats that
+    // as the renderer being unusable, whereas a photo-fx failure must only
+    // cost the photo effects. EnsurePhotoFxPipeline already latches
+    // g_r.pfx_failed and its use site is a plain `&& EnsurePhotoFxPipeline()`
+    // guard that falls back to the scene without the chain, so ignoring the
+    // result here is the containment, not a missing check.
+    // One entry per loading frame: the spinner keeps moving, and the load is
+    // lengthened by the honest compile time and nothing more. Guarded on
+    // pfx_ready rather than on a first-load flag, so a family retired by an
+    // MSAA change is re-warmed at the next load.
+    // ...but never on the frame EnsurePipeline just built the main family.
+    // That frame already carries ~50 pipeline builds (measured at 691 ms on an
+    // M-series Mac, cold); adding the photo chain's first and largest entry to
+    // it made it the single worst frame of the whole load for no reason. The
+    // next loading frame is free.
+    if (!built_main_family_this_frame && !g_r.failed && g_r.pso != nullptr &&
+        !g_r.pfx_ready && !g_r.pfx_failed &&
+        REXCVAR_GET(skate3_native_render_scene_photo_native) &&
+        REXCVAR_GET(skate3_native_render_scene_photo_prewarm)) {
+      EnsurePhotoFxPipeline(context, /*budget_ms=*/0);
     }
     if (loading_native) {
       // RenderScene renders this frame (black + 2D loading UI) and runs
@@ -11025,7 +11098,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // DOF downsample -> tap9dofMotionBlur -> tap9dof -> uber -> fisheye.
   if (scene.photo_fx.valid &&
       REXCVAR_GET(skate3_native_render_scene_photo_native) &&
-      EnsurePhotoFxPipeline(context)) {
+      EnsurePhotoFxPipeline(context, /*budget_ms=*/0)) {
     const auto pfx_to_srv = [&](nrhi::Texture* r) {
       cmd->Barrier(r, nrhi::ResourceState::kRenderTarget,
                    nrhi::ResourceState::kPixelShaderResource);

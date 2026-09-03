@@ -2,6 +2,8 @@
 
 #include "skate3_crash_report.h"
 
+#include "skate3_native_scene.h"
+
 #if !defined(_WIN32)
 
 #include <dirent.h>
@@ -247,6 +249,30 @@ char g_stamp[160] = "";
 std::atomic<uint64_t> g_uptime_seconds{0};
 std::atomic<uint64_t> g_epoch0{0};
 
+// Which front-end screen was on top when this report was written. The value is
+// a relaxed atomic the scene code already publishes every frame, so reading it
+// from a signal handler is safe, and it is the one piece of context that turns
+// a stranger's crash report from an address into a place. Every crash in the
+// v2.5.0 field reports named a screen ("selecting a photo", "adding a second
+// skater") and the dump could not confirm any of them.
+const char* FrontEndScreenName(uint32_t id) {
+  // Ids surveyed from captures; see PortraitRttWindowActive and
+  // YieldForCasEditor in skate3_native_scene.cpp, which classify the same set.
+  switch (id) {
+    case skate3::native_scene::kFrontEndStackEmpty: return "none/gameplay";
+    case 0:  return "FE root";
+    case 1:  return "photo editor";
+    case 11: return "photo editor";
+    case 15: return "create-a-skater editor";
+    case 17: return "pause challenge map";
+    case 24: return "FMV";
+    case 56: return "pause root";
+    case 59: return "skate-reel browser";
+    case 63: return "team screen";
+    default: return "unclassified";
+  }
+}
+
 void WriteReportStamp(Report& r) {
   r.Str("  ");
   r.Str(g_stamp);
@@ -254,6 +280,15 @@ void WriteReportStamp(Report& r) {
   r.Dec(g_uptime_seconds.load(std::memory_order_relaxed));
   r.Str(" epoch0=");
   r.Dec(g_epoch0.load(std::memory_order_relaxed));
+  r.Str("\n");
+  const uint32_t fe = skate3::native_scene::FrontEndTopScreen();
+  r.Str("  fe screen     ");
+  r.Str(FrontEndScreenName(fe));
+  if (fe != skate3::native_scene::kFrontEndStackEmpty) {
+    r.Str(" (id ");
+    r.Dec(fe);
+    r.Str(")");
+  }
   r.Str("\n");
 }
 

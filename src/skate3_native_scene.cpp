@@ -518,6 +518,22 @@ REXCVAR_DEFINE_BOOL(
     "safety hatch if the display screen misrenders natively.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_photo_prewarm, true, "Skate 3",
+    "Build the photo-editor postfx pipelines behind the loading screen, one "
+    "per frame, instead of all nine on the first frame the editor is open. "
+    "They are the only PSO family in the renderer that is not already "
+    "prewarmed, and the only one whose pixel shaders are shared with nothing "
+    "else - so on MoltenVK, where a build is a SPIR-V -> MSL -> Metal "
+    "compile, opening the editor on a cold cache stalled the thread the guest "
+    "renders on for seconds. It reached players as 'picture missions crash "
+    "the first time and work after relaunching', the relaunch being the disk "
+    "pipeline cache serving what the crashed run had already compiled. Costs "
+    "a few seconds spread across the first cold load and nothing on later "
+    "launches. Turn OFF to measure the cold path - the editor still works, it "
+    "just builds the chain a frame at a time while rendering without the "
+    "effects.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_photo_native, true, "Skate 3",
     "Render the photo-mission photo editor NATIVELY, applying the game's "
     "own postfx chain (depth of field / saturation / brightness / contrast "

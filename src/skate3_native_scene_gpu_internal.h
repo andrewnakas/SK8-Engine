@@ -658,6 +658,16 @@ struct RendererState {
   uint32_t pfx_width = 0, pfx_height = 0;
   bool pfx_ready = false;
   bool pfx_failed = false;
+  // How many of the nine photo-fx PSOs are built. The family is compiled a
+  // little at a time rather than all in one call: on MoltenVK each entry is a
+  // SPIR-V -> MSL -> Metal compile of a pixel shader shared with nothing else
+  // in the renderer, so building all nine at once is a multi-second stall on
+  // whichever thread asked. Reset wherever pfx_ready is cleared.
+  uint32_t pfx_built = 0;
+  // The guest-output format entries 6 and 8 (ps_fisheye, ps_pfx_debug) were
+  // compiled against. Constant in practice today, but the family is now built
+  // long before it is used, so the assumption is latched rather than trusted.
+  nrhi::Format pfx_rtv_format = nrhi::Format::kUnknown;
   // Screen-space ambient occlusion (ssao.hlsl: GTAO over the resolved
   // scene; see ApplySsaoPass). Own binding layout: root constants b0 + two
   // single-texture tables t0/t1 + point/linear clamp samplers. Full-res
@@ -1103,7 +1113,8 @@ bool Ensure2dPso(const NativeGuestOutputRenderContext& context);
 bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context);
 bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context);
 bool EnsureHeapsAndRings(const NativeGuestOutputRenderContext& context);
-bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context);
+bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context,
+                           uint32_t budget_ms);
 bool EnsureShadowResources(const NativeGuestOutputRenderContext& context);
 bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context);
 bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context);
