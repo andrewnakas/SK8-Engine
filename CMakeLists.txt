@@ -333,6 +333,10 @@ if(SKATE3_IOS)
 elseif(APPLE)
     # NSOpenPanel.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_macos.mm)
+elseif(ANDROID)
+    # The system document picker and the relaunch, both through static methods
+    # on the activity class the app registered with SDL.
+    list(APPEND SKATE3_COMMON_SOURCES src/skate3_android_bridge.cpp)
 endif()
 
 set(SKATE3_SOURCES
@@ -445,8 +449,17 @@ target_link_libraries(skate3 PRIVATE rex::runtime)
 # archive. The normal link above stays: after force_load nothing from it is
 # still undefined, so it contributes no duplicates.
 if(REXGLUE_RUNTIME_STATIC)
-    target_link_options(skate3 PRIVATE
-        "LINKER:-force_load,$<TARGET_FILE:rexruntime>")
+    if(ANDROID)
+        # lld's spelling of the same rule. --whole-archive applies to the
+        # archives that follow it, so the runtime is named explicitly between
+        # the two flags; the ordinary rex::runtime link above then contributes
+        # nothing further, every member already being present.
+        target_link_options(skate3 PRIVATE
+            "LINKER:--whole-archive,$<TARGET_FILE:rexruntime>,--no-whole-archive")
+    else()
+        target_link_options(skate3 PRIVATE
+            "LINKER:-force_load,$<TARGET_FILE:rexruntime>")
+    endif()
 endif()
 
 rexglue_configure_target(skate3)

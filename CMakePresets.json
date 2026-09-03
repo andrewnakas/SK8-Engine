@@ -121,6 +121,35 @@
         "REXGLUE_RUNTIME_STATIC": "ON",
         "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
       }
+    },
+    {
+      "name": "android-base",
+      "hidden": true,
+      "inherits": "base",
+      "toolchainFile": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-28",
+        "ANDROID_STL": "c++_static",
+        "CMAKE_BUILD_TYPE": "Release",
+        "REXGLUE_RUNTIME_STATIC": "ON",
+        "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
+        "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
+        "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
+      }
+    },
+    {
+      "name": "android-arm64-release",
+      "displayName": "Android arm64-v8a Release, tuned for Snapdragon 8 Gen 1 (no SVE)",
+      "inherits": "android-base",
+      "cacheVariables": {
+        "REXGLUE_ANDROID_ARM_MCPU": "cortex-a710+nosve+nosve2"
+      }
+    },
+    {
+      "name": "android-arm64-generic",
+      "displayName": "Android arm64-v8a Release, generic ARMv8.2 (any 2018+ phone)",
+      "inherits": "android-base"
     }
   ],
   "buildPresets": [
@@ -155,6 +184,22 @@
     {
       "name": "macos-fast",
       "configurePreset": "macos-fast",
+      "jobs": 3
+    },
+    {
+      "name": "android-arm64-release",
+      "configurePreset": "android-arm64-release",
+      "targets": [
+        "skate3"
+      ],
+      "jobs": 3
+    },
+    {
+      "name": "android-arm64-generic",
+      "configurePreset": "android-arm64-generic",
+      "targets": [
+        "skate3"
+      ],
       "jobs": 3
     }
   ]

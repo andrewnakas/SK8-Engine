@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/overlay/install_wizard_overlay.h>
 #include <rex/ui/windowed_app_context.h>
@@ -33,13 +34,35 @@
 #include <rex/ui/window_win.h>
 #elif defined(__APPLE__)
 #elif defined(__ANDROID__)
-// No native file dialog on Android: the game data is addressed by path under
-// the app's external files directory, so the ISO install wizard is inert.
+// The system document picker, through the activity; see skate3_android_bridge.
+#include "skate3_android_bridge.h"
 #else
 #include <gtk/gtk.h>
 #endif
 
+// The disc image to install without asking. Android's setup screen picks the
+// file through the system document picker and passes the descriptor it gets
+// back as /proc/self/fd/<n>, because a content:// URI is not a path and the
+// reader below is an ifstream. SKATE3_INSTALL_ISO in the environment does the
+// same thing from a shell and still works; this exists because an app process
+// has no shell to set it from.
+REXCVAR_DEFINE_STRING(skate3_install_iso, "", "Skate 3",
+                      "Path to a Skate 3 Xbox 360 disc image to install at startup without "
+                      "showing the installer, or empty to ask.");
+
 namespace skate3 {
+
+namespace {
+// The cvar first, then the environment variable that predates it.
+std::string AutomatedIsoSource() {
+  const std::string& from_cvar = REXCVAR_GET(skate3_install_iso);
+  if (!from_cvar.empty()) {
+    return from_cvar;
+  }
+  const char* from_env = std::getenv("SKATE3_INSTALL_ISO");
+  return from_env ? from_env : std::string();
+}
+}  // namespace
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 std::filesystem::path PickIsoFileIOS();
@@ -120,9 +143,10 @@ std::filesystem::path PickIsoFile() {
 }
 #elif defined(__ANDROID__)
 std::filesystem::path PickIsoFile() {
-  // Nothing to pick from: an empty path makes the caller report that no ISO
-  // was selected, which is the correct outcome for a pre-installed data dir.
-  return {};
+  // ACTION_OPEN_DOCUMENT in the activity; the result is a /proc/self/fd path
+  // for the chosen document, which std::ifstream reads like any file. Empty
+  // when the player cancelled, which the caller reports as "no ISO selected".
+  return skate3::android::PickDocument("Select Skate 3 Xbox 360 ISO");
 }
 #else
 std::filesystem::path PickIsoFile() {
@@ -526,12 +550,11 @@ bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context
     return true;
   };
 
-  if (const char* automated_iso = std::getenv("SKATE3_INSTALL_ISO");
-      automated_iso != nullptr && *automated_iso != '\0') {
+  if (const std::string automated_iso = AutomatedIsoSource(); !automated_iso.empty()) {
     std::atomic<uint64_t> copied_bytes{0};
     std::atomic<uint64_t> total_bytes{0};
     std::string error;
-    REXLOG_INFO("Installing Skate 3 game files from SKATE3_INSTALL_ISO={}", automated_iso);
+    REXLOG_INFO("Installing Skate 3 game files from {}", automated_iso);
     if (!install(std::filesystem::path(automated_iso), copied_bytes, total_bytes, error)) {
       REXLOG_ERROR("Automated ISO installation failed: {}", error);
       return false;

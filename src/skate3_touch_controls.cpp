@@ -11,7 +11,7 @@
 #include <TargetConditionals.h>
 #endif
 
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
 #define SKATE3_HAS_TOUCH_CONTROLS 1
 #include <rex/input/touch_input_driver.h>
 #else

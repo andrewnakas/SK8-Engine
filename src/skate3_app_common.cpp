@@ -1,5 +1,9 @@
 #include "skate3_app_common.h"
 
+#if defined(__ANDROID__)
+#include "skate3_android_bridge.h"
+#endif
+
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -111,6 +115,11 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_showcase);
 // and while it captures input the guest input system is gated off.
 REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam_capture_input);
+
+// Defined by the two installers; read here to decide whether the interactive
+// wizard is needed at all.
+REXCVAR_DECLARE(std::string, skate3_install_iso);
+REXCVAR_DECLARE(std::string, skate3_install_tu);
 
 REXCVAR_DEFINE_STRING(skate3_dlc_root, "", "Skate 3",
                       "Directory containing Skate 3 DLC package files");
@@ -651,7 +660,7 @@ std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
 #endif
   add_dir(game_data_root / std::string(kDlcDirectoryName));
   add_dir(user_data_root / std::string(kDlcDirectoryName));
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
   // On a phone the only place a pack can be put is the top of the app's
   // Documents folder - Finder and the Files app will not drop a folder into a
   // subdirectory of it. The scan below is recursive, so naming the root is
@@ -766,9 +775,16 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   if (!skate3::IsGameInstalled(runtime_paths.game_data_root)) {
     REXLOG_INFO("Game files not found at {}; launching rexglue ISO installer",
                 runtime_paths.game_data_root.string());
-#if defined(__APPLE__)
-    if (const char* automated_iso = std::getenv("SKATE3_INSTALL_ISO");
-        automated_iso == nullptr || *automated_iso == '\0') {
+#if defined(__APPLE__) || defined(__ANDROID__)
+    // The blocking pump below never pumps SDL events on these platforms, so
+    // the interactive wizard has to run through the asynchronous path; only
+    // an automated install (SKATE3_INSTALL_ISO from the shell or the activity)
+    // may block.
+    if (REXCVAR_GET(skate3_install_iso).empty() &&
+        [] {
+          const char* v = std::getenv("SKATE3_INSTALL_ISO");
+          return v == nullptr || *v == '\0';
+        }()) {
 #if SKATE3_HAS_TITLE_UPDATE
       // Chain the title update wizard after the ISO install completes.
       auto resume_after_title_update =
@@ -807,9 +823,12 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   if (!skate3::IsTitleUpdateInstalled(runtime_paths.game_data_root)) {
     REXLOG_INFO("Skate 3 Title Update 3 not staged at {}; launching title update installer",
                 runtime_paths.game_data_root.string());
-#if defined(__APPLE__)
-    if (const char* automated_tu = std::getenv("SKATE3_INSTALL_TU");
-        automated_tu == nullptr || *automated_tu == '\0') {
+#if defined(__APPLE__) || defined(__ANDROID__)
+    if (REXCVAR_GET(skate3_install_tu).empty() &&
+        [] {
+          const char* v = std::getenv("SKATE3_INSTALL_TU");
+          return v == nullptr || *v == '\0';
+        }()) {
       skate3::ShowTitleUpdateInstallWizard(imgui_drawer(), std::move(runtime_paths),
                                            std::move(resume));
       return std::nullopt;
@@ -897,7 +916,7 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // an app that does not answer gets its graphics resources reclaimed out from
   // under the driver instead. The stores refill from guest memory on demand,
   // so the cost is a few seconds of redecoding rather than a lost session.
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
   if (auto* sdl_context = dynamic_cast<rex::ui::SDLWindowedAppContext*>(&app_context())) {
     sdl_context->SetLowMemoryHandler([]() {
       skate3::native_scene::FlushTextureCache();
@@ -1353,6 +1372,15 @@ void Skate3BaseApp::RestartGame() {
     // below rather than trying and failing first.
     REXLOG_INFO("Restart requested: settings saved, quitting for a manual relaunch (iOS "
                 "cannot restart itself)");
+#elif REX_PLATFORM_ANDROID
+    // An app process cannot exec itself either, but the activity can relaunch
+    // the app: it starts a fresh task from a helper process and lets this one
+    // exit. Settings are already on disk, so quitting below completes it.
+    if (skate3::android::RequestRestart()) {
+      REXLOG_INFO("Restart requested: relaunch scheduled through the activity");
+    } else {
+      REXLOG_WARN("Restart requested, but the activity declined; quitting for a manual relaunch");
+    }
 #else
     const std::string executable = rex::path_to_utf8(executable_path);
     pid_t child_pid = 0;

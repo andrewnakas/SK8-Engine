@@ -42,12 +42,18 @@
 #include <sys/wait.h>
 #elif defined(__ANDROID__)
 #include <sys/wait.h>
-// No native file dialog on Android; see PickTitleUpdateFile below.
+// The system document picker, through the activity; see skate3_android_bridge.
+#include "skate3_android_bridge.h"
 #else
 #include <sys/wait.h>
 
 #include <gtk/gtk.h>
 #endif
+
+// See skate3_install_iso: the same route for the title update package.
+REXCVAR_DEFINE_STRING(skate3_install_tu, "", "Skate 3",
+                      "Path to the Skate 3 Title Update 3 package to stage at startup without "
+                      "showing the installer, \"download\" to fetch it, or empty to ask.");
 
 REXCVAR_DEFINE_STRING(skate3_title_update_url,
                       "https://xboxunity.net/Resources/Lib/TitleUpdate.php?tuid=21774",
@@ -641,9 +647,8 @@ std::filesystem::path PickTitleUpdateFile() {
 }
 #elif defined(__ANDROID__)
 std::filesystem::path PickTitleUpdateFile() {
-  // An empty path reads as "nothing selected". The Android build expects the
-  // title update to already be staged alongside the rest of the game data.
-  return {};
+  // ACTION_OPEN_DOCUMENT in the activity, as for the disc image.
+  return skate3::android::PickDocument("Select the Skate 3 Title Update (TU_12K2276...)");
 }
 #else
 std::filesystem::path PickTitleUpdateFile() {
@@ -878,16 +883,27 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
   }
 }
 
+namespace {
+// The cvar first, then the environment variable that predates it.
+std::string AutomatedTitleUpdateSource() {
+  const std::string& from_cvar = REXCVAR_GET(skate3_install_tu);
+  if (!from_cvar.empty()) {
+    return from_cvar;
+  }
+  const char* from_env = std::getenv("SKATE3_INSTALL_TU");
+  return from_env ? from_env : std::string();
+}
+}  // namespace
+
 bool RunTitleUpdateInstallWizardBlocking(rex::ui::WindowedAppContext& app_context,
                                          rex::ui::Window* window,
                                          rex::ui::ImGuiDrawer* drawer,
                                          rex::PathConfig runtime_paths,
                                          rex::PathConfig& installed_paths) {
-  if (const char* automated_tu = std::getenv("SKATE3_INSTALL_TU");
-      automated_tu != nullptr && *automated_tu != '\0') {
+  if (const std::string automated_tu = AutomatedTitleUpdateSource(); !automated_tu.empty()) {
     std::string error;
     bool ok = false;
-    REXLOG_INFO("Installing Skate 3 title update from SKATE3_INSTALL_TU={}", automated_tu);
+    REXLOG_INFO("Installing Skate 3 title update from {}", automated_tu);
     if (std::string_view(automated_tu) == "download") {
       std::atomic<uint64_t> copied_bytes{0};
       std::atomic<uint64_t> total_bytes{0};
