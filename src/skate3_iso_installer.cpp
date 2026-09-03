@@ -436,6 +436,99 @@ class XboxIsoReader {
   std::vector<IsoEntry> entries_;
 };
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// Directories an already-placed disc image can be found in, best first.
+//
+// The document picker is not always available. Apps installed by TrollStore or
+// a jailbreak are not registered with LaunchServices the way a normally
+// installed app is, and players report that
+// UIDocumentPickerViewController either never returns a usable URL or is not
+// presentable at all - the only route that worked for them was LiveContainer,
+// whose "file picker fix" substitutes its own. A player who has already copied
+// the ISO onto the device is then stuck with no way to point the game at it,
+// which is exactly what was reported: "I placed it in the right folders, but
+// the IPA did not detect it" - because nothing ever looked.
+//
+// So look. Documents is the folder the wizard already tells people to drag the
+// file into and the one Finder file sharing exposes, and it costs a directory
+// listing to check.
+std::vector<std::filesystem::path> IsoSearchDirectories() {
+  std::vector<std::filesystem::path> dirs;
+  const char* home = std::getenv("HOME");
+  if (home != nullptr && *home != '\0') {
+    const std::filesystem::path documents = std::filesystem::path(home) / "Documents";
+    dirs.push_back(documents);
+    // Where "Open in Skate 3" from another app delivers a copy.
+    dirs.push_back(documents / "Inbox");
+    // Someone who read "put it in the game folder" literally.
+    dirs.push_back(documents / "game");
+    dirs.push_back(std::filesystem::path(home) / "Downloads");
+  }
+  // Outside the sandbox, and unreadable unless the app is running with the
+  // wider access a TrollStore or jailbreak install has - which is precisely
+  // the case where the picker is the least dependable. The iterator below is
+  // error-code based, so an unreadable path costs nothing and is skipped.
+  dirs.emplace_back("/var/mobile/Documents");
+  dirs.emplace_back("/var/mobile/Downloads");
+  dirs.emplace_back("/var/mobile/Media/Downloads");
+  dirs.emplace_back("/var/mobile/Media/Documents");
+  return dirs;
+}
+
+bool HasIsoExtension(const std::filesystem::path& path) {
+  std::string ext = path.extension().string();
+  std::transform(ext.begin(), ext.end(), ext.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return ext == ".iso";
+}
+
+// An .iso already sitting on the device that really is an Xbox 360 disc, or an
+// empty path. Every candidate is opened and validated before it is offered, so
+// an unrelated .iso in Downloads cannot send the installer down a path that
+// fails minutes later, and the largest is tried first because the real disc is
+// around 6-7 GB.
+std::filesystem::path FindPlacedIso() {
+  std::vector<std::pair<uint64_t, std::filesystem::path>> candidates;
+  std::error_code ec;
+  for (const std::filesystem::path& dir : IsoSearchDirectories()) {
+    if (!std::filesystem::is_directory(dir, ec)) {
+      continue;
+    }
+    for (std::filesystem::directory_iterator it(dir, ec), end; it != end; it.increment(ec)) {
+      if (ec) {
+        break;
+      }
+      if (!it->is_regular_file(ec) || !HasIsoExtension(it->path())) {
+        continue;
+      }
+      const uint64_t size = std::filesystem::file_size(it->path(), ec);
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      candidates.emplace_back(size, it->path());
+    }
+    ec.clear();
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (const auto& [size, path] : candidates) {
+    XboxIsoReader reader;
+    std::string error;
+    if (reader.Open(path, error)) {
+      REXLOG_INFO("iso-installer: using the disc image already on the device at {} ({} MB)",
+                  path.string(), size >> 20);
+      return path;
+    }
+    REXLOG_INFO("iso-installer: ignoring {} - it is not a readable Xbox 360 disc ({})",
+                path.string(), error);
+  }
+  return {};
+}
+#else
+std::filesystem::path FindPlacedIso() { return {}; }
+#endif
+
 }  // namespace
 
 const char* FileTransferStepsTitle() {
@@ -455,15 +548,17 @@ std::vector<std::string> FileTransferSteps(const char* what, const char* action)
   // practical way to move several gigabytes onto a phone. The picker can also
   // reach iCloud Drive and attached USB storage, so that stays an option.
   return {
-      "Connect this device to your computer with a cable, and tap Trust if you are asked.",
-      "On a Mac, open Finder and click this device in the sidebar, then open the Files tab. "
-      "On Windows, open iTunes and go to the device's File Sharing tab.",
-      "Drag " + file + " onto the Skate 3 entry there and wait for the copy to finish - a "
-      "full disc image takes several minutes.",
-      "Come back here, choose " + button + ", and pick the file under \"On My iPhone\" or "
-      "\"On My iPad\" -> Skate 3.",
-      "Already have it on iCloud Drive or a USB drive plugged into this device? Skip the "
-      "steps above and choose " + button + " straight away.",
+      "Put " + file + " in the Skate 3 folder on this device. Open the Files app, go to "
+      "\"On My iPhone\" or \"On My iPad\", and drop it into the Skate 3 folder there.",
+      "Over a cable instead: on a Mac open Finder, click this device in the sidebar and "
+      "open the Files tab; on Windows use iTunes and its File Sharing tab. Drag " + file +
+          " onto the Skate 3 entry and wait - a full disc image takes several minutes.",
+      "Then choose " + button + ". A disc image sitting in that folder is found and used "
+      "automatically, with no file picker involved. This is the route to use if the game "
+      "was installed with TrollStore or on a jailbreak, where the system file picker is "
+      "not always available.",
+      "If nothing is found there, " + button + " opens the file picker instead, which can "
+      "also reach iCloud Drive and USB storage plugged into this device.",
   };
 #else
   return {
@@ -479,6 +574,48 @@ bool IsGameInstalled(const std::filesystem::path& game_root) {
   return std::filesystem::is_regular_file(game_root / std::string(kDefaultXex));
 }
 
+std::filesystem::path ResolveNestedGameRoot(const std::filesystem::path& game_root) {
+  if (game_root.empty() || IsGameInstalled(game_root)) {
+    return game_root;
+  }
+  // Extracting a disc image on a computer almost always yields a FOLDER, and
+  // copying that folder across gives default.xex a level of nesting the game
+  // does not look under - "I placed it in the right folders, but the app did
+  // not detect it". The folder is usually named after the disc, so its name
+  // cannot be guessed; finding it is a single directory listing.
+  //
+  // Deliberately one level only, and only when exactly one child qualifies:
+  // deeper or ambiguous layouts are a guess, and silently adopting the wrong
+  // root is worse than saying the files are missing.
+  std::error_code ec;
+  std::filesystem::path found;
+  size_t matches = 0;
+  for (std::filesystem::directory_iterator it(game_root, ec), end; it != end; it.increment(ec)) {
+    if (ec) {
+      break;
+    }
+    if (!it->is_directory(ec)) {
+      continue;
+    }
+    if (IsGameInstalled(it->path())) {
+      found = it->path();
+      if (++matches > 1) {
+        REXLOG_WARN(
+            "game root: {} holds more than one folder with a default.xex; leaving it alone "
+            "rather than guessing which disc to run",
+            game_root.string());
+        return game_root;
+      }
+    }
+  }
+  if (matches == 1) {
+    REXLOG_INFO("game root: default.xex is one level down, in {} - using that",
+                found.string());
+    return found;
+  }
+  return game_root;
+}
+
 void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig runtime_paths,
                                  std::function<void(rex::PathConfig)> complete) {
   // Copied up front: the constructor call below move-captures runtime_paths,
@@ -486,7 +623,19 @@ void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig r
   // it in the same expression can observe the moved-from value.
   const auto game_root = runtime_paths.game_data_root;
 
-  auto pick_source = []() { return PickIsoFile(); };
+  // Prefer a disc image the player has already put on the device over asking
+  // the system for one. On iOS the picker is the step that fails for
+  // TrollStore and jailbreak installs (see FindPlacedIso), and it is also
+  // simply the slower path for someone who has just finished dragging a 6 GB
+  // file into the Skate 3 folder over a cable. Everywhere else the scan finds
+  // nothing and this is exactly the old behaviour.
+  auto pick_source = []() {
+    std::filesystem::path placed = FindPlacedIso();
+    if (!placed.empty()) {
+      return placed;
+    }
+    return PickIsoFile();
+  };
   auto install = [game_root](const std::filesystem::path& source,
                              std::atomic<uint64_t>& copied_bytes,
                              std::atomic<uint64_t>& total_bytes, std::string& error) {

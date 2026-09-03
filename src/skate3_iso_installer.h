@@ -19,6 +19,12 @@ const char* FileTransferStepsTitle();
 std::vector<std::string> FileTransferSteps(const char* what, const char* action);
 
 bool IsGameInstalled(const std::filesystem::path& game_root);
+
+// game_root itself, or the single folder inside it that holds default.xex when
+// game_root does not. Copying an extracted disc across as a folder is the
+// usual way people end up one level too deep; this finds that case and nothing
+// more ambiguous. Returns game_root unchanged when there is no clear answer.
+std::filesystem::path ResolveNestedGameRoot(const std::filesystem::path& game_root);
 void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig runtime_paths,
                                  std::function<void(rex::PathConfig)> complete);
 bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context,

@@ -767,6 +767,11 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   }
   auto runtime_paths = defaults;
   runtime_paths.game_data_root = ResolveRuntimeGameDataRoot(runtime_paths);
+  // Accept a disc that was copied across as a folder rather than as loose
+  // files - see ResolveNestedGameRoot. Applied after the root is chosen so
+  // every candidate above gets the same treatment, and a no-op when the files
+  // are where they are supposed to be.
+  runtime_paths.game_data_root = skate3::ResolveNestedGameRoot(runtime_paths.game_data_root);
   REXLOG_INFO("game data root: {} (configured: {}, user data: {})",
               runtime_paths.game_data_root.string(),
               defaults.game_data_root.empty() ? "<empty>" : defaults.game_data_root.string(),
