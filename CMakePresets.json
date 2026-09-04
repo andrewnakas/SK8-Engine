@@ -156,7 +156,8 @@
       "displayName": "Android arm64-v8a Release, scheduled for in-order cores (low-end phones and tablets)",
       "inherits": "android-base",
       "cacheVariables": {
-        "REXGLUE_ANDROID_ARM_MTUNE": "cortex-a53"
+        "REXGLUE_ANDROID_ARM_MTUNE": "cortex-a53",
+        "REXGLUE_ANDROID_ARM_NO_OUTLINE_ATOMICS": "ON"
       }
     }
   ],

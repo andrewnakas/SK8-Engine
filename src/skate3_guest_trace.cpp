@@ -60,6 +60,18 @@
 
 #include "skate3_guest_trace.h"
 
+#if defined(__linux__)
+// For the guest sampling profiler's Linux path: thread discovery through
+// /proc/self/task and pc capture from a signal handler.
+#include <dirent.h>
+#include <dlfcn.h>
+#include <fstream>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
+
 #include "generated/skate3_init.h"
 
 #include <algorithm>
@@ -546,7 +558,7 @@ void ControllerMain() {
 // logging, no lock that the suspended thread could be holding, because it is
 // suspended at an arbitrary instruction and may hold anything. And pcs are
 // resolved afterwards, off the suspended path, when nothing is stopped.
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
 
 REXCVAR_DEFINE_BOOL(skate3_guest_profile, false, "Skate 3",
                     "Sample the busiest guest threads and report the guest functions they spend "
@@ -571,8 +583,35 @@ struct SampleCounts {
   // code at all, which is worth seeing as its own bucket - it is the runtime,
   // the kernel imports, or libc underneath the guest.
   std::map<uint32_t, uint64_t> by_function;
+  // Host pcs, as an offset from the containing module's load address. The
+  // <host> bucket was the largest single entry on the guest main thread and
+  // the profiler could only say "not generated code", which named nothing.
+  // These are logged as module+offset and symbolised afterwards against the
+  // UNSTRIPPED library the build keeps for ndk-stack - the shipped one is
+  // stripped, so dladdr on the device would resolve almost nothing.
+  std::map<std::string, uint64_t> by_host;
   uint64_t total = 0;
 };
+
+std::string HostSite(uintptr_t pc) {
+#if defined(__linux__)
+  Dl_info info = {};
+  if (dladdr(reinterpret_cast<const void*>(pc), &info) != 0 && info.dli_fname != nullptr) {
+    const char* slash = std::strrchr(info.dli_fname, '/');
+    const char* mod = slash != nullptr ? slash + 1 : info.dli_fname;
+    if (info.dli_sname != nullptr) {
+      return fmt::format("{}!{}", mod, info.dli_sname);
+    }
+    return fmt::format("{}+0x{:x}", mod,
+                       uintptr_t(pc) - uintptr_t(info.dli_fbase));
+  }
+#endif
+  return "unknown";
+}
+
+#if defined(__APPLE__)
+using SampleTarget = mach_port_t;
+constexpr SampleTarget kNoTarget = MACH_PORT_NULL;
 
 mach_port_t FindThreadByName(const std::string& wanted) {
   thread_act_array_t threads = nullptr;
@@ -599,6 +638,103 @@ mach_port_t FindThreadByName(const std::string& wanted) {
   return found;
 }
 
+// Reads the pc of a running thread WITHOUT stopping it. Mach can suspend a
+// thread and read its register state from outside; Linux cannot, so the thread
+// is asked to report its own pc from a signal handler instead. The handler
+// runs on the target thread with the interrupted context, which is exactly
+// what a sampling profiler needs, and the target is only interrupted for the
+// few instructions it takes to store one word.
+bool SampleThreadPc(SampleTarget target, uintptr_t* out_pc) {
+  arm_thread_state64_t state = {};
+  mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+  if (thread_suspend(target) != KERN_SUCCESS) {
+    return false;
+  }
+  const bool ok = thread_get_state(target, ARM_THREAD_STATE64,
+                                   reinterpret_cast<thread_state_t>(&state),
+                                   &state_count) == KERN_SUCCESS;
+  thread_resume(target);
+  if (ok) {
+    *out_pc = uintptr_t(arm_thread_state64_get_pc(state));
+  }
+  return ok;
+}
+
+void ReleaseTarget(SampleTarget target) { mach_port_deallocate(mach_task_self(), target); }
+
+#else  // Linux / Android
+
+using SampleTarget = pid_t;
+constexpr SampleTarget kNoTarget = 0;
+
+// Set by the handler on the sampled thread, read by the sampler thread.
+std::atomic<uintptr_t> g_sample_pc{0};
+std::atomic<int> g_sample_ready{0};
+
+void SampleSignalHandler(int, siginfo_t*, void* uctx) {
+  const auto* uc = static_cast<const ucontext_t*>(uctx);
+  g_sample_pc.store(uintptr_t(uc->uc_mcontext.pc), std::memory_order_relaxed);
+  g_sample_ready.store(1, std::memory_order_release);
+}
+
+// /proc/self/task/<tid>/comm holds the thread name, truncated to 15 bytes -
+// the same truncation the thread-placement map has to allow for, so a prefix
+// match is the only thing that works for names like "render_thread".
+pid_t FindThreadByName(const std::string& wanted) {
+  DIR* d = opendir("/proc/self/task");
+  if (d == nullptr) {
+    return 0;
+  }
+  pid_t found = 0;
+  while (dirent* e = readdir(d)) {
+    if (e->d_name[0] < '0' || e->d_name[0] > '9') {
+      continue;
+    }
+    char path[128];
+    std::snprintf(path, sizeof(path), "/proc/self/task/%s/comm", e->d_name);
+    std::ifstream in(path);
+    std::string name;
+    if (!in || !std::getline(in, name)) {
+      continue;
+    }
+    if (name.compare(0, wanted.size(), wanted) == 0) {
+      found = pid_t(std::atoi(e->d_name));
+      break;
+    }
+  }
+  closedir(d);
+  return found;
+}
+
+bool SampleThreadPc(SampleTarget target, uintptr_t* out_pc) {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    struct sigaction sa = {};
+    sa.sa_sigaction = SampleSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, nullptr);
+  });
+  g_sample_ready.store(0, std::memory_order_relaxed);
+  if (syscall(SYS_tgkill, getpid(), target, SIGPROF) != 0) {
+    return false;  // thread is gone
+  }
+  // Bounded: a thread blocked in a syscall may not run the handler promptly,
+  // and a sampler that waits forever for it would stop sampling altogether.
+  for (int spin = 0; spin < 2000; ++spin) {
+    if (g_sample_ready.load(std::memory_order_acquire)) {
+      *out_pc = g_sample_pc.load(std::memory_order_relaxed);
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(10));
+  }
+  return false;
+}
+
+void ReleaseTarget(SampleTarget) {}
+
+#endif
+
 void SamplerMain() {
   const std::string wanted = REXCVAR_GET(skate3_guest_profile_thread);
   const auto interval = std::chrono::microseconds(REXCVAR_GET(skate3_guest_profile_interval_us));
@@ -606,7 +742,7 @@ void SamplerMain() {
 
   EnsureTables();
 
-  mach_port_t target = MACH_PORT_NULL;
+  SampleTarget target = kNoTarget;
   SampleCounts counts;
   auto next_report = std::chrono::steady_clock::now() + report_every;
   // Raw pcs, resolved after the target is running again.
@@ -614,38 +750,33 @@ void SamplerMain() {
   pending.reserve(4096);
 
   while (true) {
-    if (target == MACH_PORT_NULL) {
+    if (target == kNoTarget) {
       target = FindThreadByName(wanted);
-      if (target == MACH_PORT_NULL) {
+      if (target == kNoTarget) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         continue;
       }
       REXLOG_INFO("skate3 profile: sampling '{}' every {}us", wanted, interval.count());
     }
 
-    // The whole suspended window: suspend, read pc, resume. Nothing else.
-    arm_thread_state64_t state = {};
-    mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
-    bool got_state = false;
-    if (thread_suspend(target) == KERN_SUCCESS) {
-      got_state = thread_get_state(target, ARM_THREAD_STATE64,
-                                   reinterpret_cast<thread_state_t>(&state),
-                                   &state_count) == KERN_SUCCESS;
-      thread_resume(target);
-    } else {
+    uintptr_t pc = 0;
+    if (!SampleThreadPc(target, &pc)) {
       // The thread went away - find it again next time round.
-      mach_port_deallocate(mach_task_self(), target);
-      target = MACH_PORT_NULL;
+      ReleaseTarget(target);
+      target = kNoTarget;
       continue;
     }
-    if (got_state) {
-      pending.push_back(uintptr_t(arm_thread_state64_get_pc(state)));
-    }
+    pending.push_back(pc);
 
     // Resolve off the suspended path.
     if (pending.size() >= 256) {
       for (uintptr_t pc : pending) {
-        counts.by_function[GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr)]++;
+        const uint32_t guest =
+            GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr);
+        counts.by_function[guest]++;
+        if (guest == 0) {
+          counts.by_host[HostSite(pc)]++;
+        }
         counts.total++;
       }
       pending.clear();
@@ -654,7 +785,12 @@ void SamplerMain() {
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_report) {
       for (uintptr_t pc : pending) {
-        counts.by_function[GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr)]++;
+        const uint32_t guest =
+            GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr);
+        counts.by_function[guest]++;
+        if (guest == 0) {
+          counts.by_host[HostSite(pc)]++;
+        }
         counts.total++;
       }
       pending.clear();
@@ -684,7 +820,29 @@ void SamplerMain() {
           }
         }
         REXLOG_INFO("skate3 profile: {} samples of '{}' | {}", counts.total, wanted, line);
+        if (!counts.by_host.empty()) {
+          std::vector<std::pair<uint64_t, std::string>> hranked;
+          hranked.reserve(counts.by_host.size());
+          for (const auto& [site, hits] : counts.by_host) {
+            hranked.emplace_back(hits, site);
+          }
+          std::sort(hranked.begin(), hranked.end(),
+                    [](const auto& a, const auto& b) { return a.first > b.first; });
+          std::string hline;
+          for (size_t i = 0; i < hranked.size() && i < 10; ++i) {
+            const double percent = 100.0 * double(hranked[i].first) / double(counts.total);
+            if (percent < 0.3) {
+              break;
+            }
+            if (!hline.empty()) {
+              hline += ' ';
+            }
+            hline += fmt::format("{}={:.1f}%", hranked[i].second, percent);
+          }
+          REXLOG_INFO("skate3 profile host: {}", hline);
+        }
         counts.by_function.clear();
+        counts.by_host.clear();
         counts.total = 0;
       }
     }

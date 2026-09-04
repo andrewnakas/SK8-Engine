@@ -1279,6 +1279,31 @@ REXCVAR_DEFINE_INT32(
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(
+    skate3_guest_spin_yield, 0, "Skate 3",
+    "Pace the guest's spin-wait (sub_82B76080), which a sampling profile put at "
+    "35% of the render thread with its calling loop at another 13%. The console "
+    "paced that wait with cctpl/db16cyc/cctpm; none of the three survive "
+    "recompilation, so it spins flat out and starves the threads it is waiting "
+    "for. 0 = today's behaviour, 1 = ARM yield hints (approximates db16cyc), "
+    "2 = sched_yield (actually gives the core up).")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_lw_refresh, 1, "Skate 3",
+    "Run the ambient world - pedestrians and traffic - only every Nth frame. "
+    "1 is every frame, which is today's behaviour. This is the work that "
+    "separates a menu from gameplay on a slow device: the same tablet holds "
+    "56 fps in the menus and 6 in the world, and the GPU is idle for both "
+    "(wait 0.00 ms of a 155 ms frame), so the difference is the guest CPU "
+    "simulating the crowd. The skater, the board and the physics run through "
+    "different functions and stay at full rate. Above 1 the LivingWorld "
+    "gap-fill window widens to match, or an NPC that misses its update reads "
+    "as a blink.")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_guest, true,
                     "Skate 3",
                     "Also skip the GUEST engine's draw-list dispatch for "
@@ -9350,7 +9375,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         LwRetained& r = it->second;
         float alpha = 1.0f;
         uint32_t entity = 0;
-        if (now - r.frame > 2 ||
+        // The window has to cover the throttle: an NPC whose manager update
+        // was skipped has no fresh record through no fault of its own, and
+        // dropping it would show as the blink this gap fill exists to stop.
+        const uint64_t lw_gap =
+            2 + uint64_t(std::max(0, REXCVAR_GET(skate3_native_render_lw_refresh) - 1));
+        if (now - r.frame > lw_gap ||
             !skate3::native_lw::LookupLwCtx(it->first, &alpha, &entity)) {
           it = g_lw_last_items.erase(it);
           continue;

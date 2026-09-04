@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <sched.h>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +41,8 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DECLARE(bool, skate3_diagnostics);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
 REXCVAR_DECLARE(int32_t, skate3_native_render_guest_static_refresh);
+REXCVAR_DECLARE(int32_t, skate3_native_render_lw_refresh);
+REXCVAR_DECLARE(int32_t, skate3_guest_spin_yield);
 REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
                     "Diagnostic: watch the guest D3D command-ring write pointer at every "
                     "deferred render-state flush (D3D::SetPending_RenderStates). The pointer at "
@@ -1222,6 +1225,77 @@ extern "C" REX_FUNC(sub_82B79FC0) {
   if (enabled) {
     skate3::native_scene::OnDrawDone(base, 2, r4, r5, r6, ctx.r3.u32 != 0 ? ctx.r3.u32 : r7);
   }
+}
+
+// The guest's spin-wait body, and by a wide margin the most expensive guest
+// function on a slow device: a sampling profile of the render thread put
+// sub_82B76080 at 35% and its calling loop sub_82B755C0 at 13%, stable across
+// four windows of ~15,000 samples. Together, roughly half the render thread.
+//
+// It is a poll - read a timestamp, subtract, compare against 5000, return
+// "keep waiting" - and on the console it is paced. The Xbox 360 wrote the wait
+// as `cctpl` (drop this SMT thread's priority so its sibling gets the core),
+// thirty-two `db16cyc` (sixteen cycles of delay each), then `cctpm`. The
+// recompiler emits none of those three: they have no x86/ARM equivalent and
+// they carry no architectural state, so the loop that was throttled on the
+// console runs flat out here, burning a core and the memory bandwidth that the
+// threads it is waiting FOR need in order to finish.
+//
+// Giving the wait back its pacing is the point. Default 0 keeps today's
+// behaviour so this cannot regress a device that is already fast.
+extern "C" REX_FUNC(sub_82B76080) {
+  if (const int32_t mode = REXCVAR_GET(skate3_guest_spin_yield); mode > 0) {
+    if (mode == 1) {
+      // The console's own pacing, approximately: a pipeline hint rather than a
+      // trip through the scheduler. Cheapest, and it cannot lose the thread's
+      // timeslice while it holds anything.
+      for (int i = 0; i < 32; ++i) {
+        __builtin_arm_yield();
+      }
+    } else {
+      // Actually give the core up. The loop is waiting on another guest
+      // thread, so the fastest way out of the wait is to let that thread run.
+      sched_yield();
+    }
+  }
+  __imp__sub_82B76080(ctx, base);
+}
+
+// Sk8::cLivingWorldPresEntityManager::Update - the ambient world's whole sim
+// tick: pedestrians and traffic, every entity, every frame.
+//
+// Skipping it on non-refresh frames is the single largest lever on a device
+// that cannot keep up, because it is measurably what separates a menu from
+// gameplay. The Galaxy Tab A7 Lite holds 55-57 fps in the menus and collapses
+// to 6-7 in the world, on the same renderer and the same GPU - and the GPU is
+// idle in both (wait 0.00 ms of a 155 ms frame), so the entire difference is
+// the guest CPU simulating the crowd.
+//
+// The skater, the board and the physics do not come through here, so they keep
+// running at full rate; what stutters is the pedestrians' own animation. Both
+// the vtable thunk at 0x827BC9A0 and any direct dispatch land on this
+// function, so hooking it here catches the subsystem in one place.
+extern "C" REX_FUNC(sub_827BC9A8) {
+  // Instrumented: three controlled runs (throttle off, every 2nd, every 4th)
+  // all measured p50 116.5 ms, so either this never fires or the crowd is not
+  // the cost here. Counting says which.
+  static std::atomic<uint64_t> calls{0};
+  static std::atomic<uint64_t> skips{0};
+  const uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  bool skipped = false;
+  if (const int32_t period = REXCVAR_GET(skate3_native_render_lw_refresh);
+      period > 1 && skate3::native_render::Enabled() &&
+      (skate3::native_render::g_frame_index % uint64_t(period)) != 0) {
+    skips.fetch_add(1, std::memory_order_relaxed);
+    skipped = true;
+  }
+  if ((n % 2000) == 0) {
+    REXLOG_WARN("lw-throttle: {} calls, {} skipped", n, skips.load());
+  }
+  if (skipped) {
+    return;
+  }
+  __imp__sub_827BC9A8(ctx, base);
 }
 
 // LivingWorld batch pack writer (unnamed; called per entity per sim tick
