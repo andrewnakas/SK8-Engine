@@ -63,6 +63,7 @@
 #if defined(__linux__)
 // For the guest sampling profiler's Linux path: thread discovery through
 // /proc/self/task and pc capture from a signal handler.
+#include <numeric>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fstream>
@@ -573,6 +574,10 @@ REXCVAR_DEFINE_INT32(skate3_guest_profile_report_s, 30, "Skate 3",
                      "Seconds between profile reports.")
     .range(5, 600);
 
+REXCVAR_DEFINE_STRING(skate3_guest_profile_order_file, "", "Skate 3",
+                      "Write the ranked hot guest functions here as an lld "
+                      "--symbol-ordering-file (empty = off).");
+
 REXCVAR_DEFINE_STRING(skate3_guest_profile_thread, "render_thread", "Skate 3",
                       "Name (prefix) of the thread to sample.");
 
@@ -820,6 +825,59 @@ void SamplerMain() {
           }
         }
         REXLOG_INFO("skate3 profile: {} samples of '{}' | {}", counts.total, wanted, line);
+        // How concentrated is the cost? A flat profile spread over thousands
+        // of functions is the signature of instruction-cache and iTLB
+        // thrashing, which is the pathology to expect from 290 MB of
+        // recompiled code on a 32 KB L1I - and unlike a hotspot it is fixed by
+        // code LAYOUT, not by making any one function cheaper. The answer
+        // decides whether a linker symbol-ordering file is worth building:
+        // a hot set of a few hundred functions can be packed together, a hot
+        // set of tens of thousands cannot.
+        {
+          std::vector<uint64_t> hits;
+          hits.reserve(ranked.size());
+          for (const auto& r : ranked) {
+            if (r.second != 0) {
+              hits.push_back(r.first);
+            }
+          }
+          uint64_t acc = 0;
+          size_t n50 = 0, n80 = 0, n95 = 0;
+          const double guest_total = double(std::accumulate(hits.begin(), hits.end(), uint64_t(0)));
+          for (size_t i = 0; i < hits.size(); ++i) {
+            acc += hits[i];
+            const double frac = double(acc) / guest_total;
+            if (n50 == 0 && frac >= 0.50) n50 = i + 1;
+            if (n80 == 0 && frac >= 0.80) n80 = i + 1;
+            if (n95 == 0 && frac >= 0.95) n95 = i + 1;
+          }
+          REXLOG_INFO("skate3 profile spread: {} distinct guest functions; "
+                      "50% of guest samples in {}, 80% in {}, 95% in {}",
+                      hits.size(), n50, n80, n95);
+          // Write the ranked hot set where the build can pick it up as a
+          // linker symbol-ordering file. The functions are emitted with
+          // -ffunction-sections, so lld can place them in this order and pack
+          // the hot set contiguously instead of leaving it scattered through
+          // 290 MB of recompiled code.
+          if (const std::string path = REXCVAR_GET(skate3_guest_profile_order_file);
+              !path.empty()) {
+            std::ofstream out(path, std::ios::trunc);
+            if (out) {
+              for (const auto& r : ranked) {
+                if (r.second == 0) {
+                  continue;
+                }
+                // Both names: the recompiler emits the guest body as
+                // __imp__sub_X and a thunk sub_X, and the hot path runs
+                // through whichever the caller referenced.
+                out << fmt::format("__imp__sub_{:08X}\n", r.second);
+                out << fmt::format("sub_{:08X}\n", r.second);
+              }
+              REXLOG_INFO("skate3 profile: wrote {} ordered symbols to {}",
+                          ranked.size() * 2, path);
+            }
+          }
+        }
         if (!counts.by_host.empty()) {
           std::vector<std::pair<uint64_t, std::string>> hranked;
           hranked.reserve(counts.by_host.size());

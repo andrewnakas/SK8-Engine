@@ -456,6 +456,31 @@ if(REXGLUE_RUNTIME_STATIC)
         # nothing further, every member already being present.
         target_link_options(skate3 PRIVATE
             "LINKER:--whole-archive,$<TARGET_FILE:rexruntime>,--no-whole-archive")
+
+        # Pack the hot guest functions together.
+        #
+        # 290 MB of recompiled code against a 32 KB L1I and a small iTLB is the
+        # standing pathology of static recompilation, and a profile of the
+        # guest main thread has the shape that predicts: 2,100 functions
+        # executing, no hotspot above 9%, but 50% of samples in ~115 functions
+        # and 80% in ~600. Scattered through the binary that hot set touches
+        # hundreds of pages; in profile order it is a few contiguous MB.
+        # -ffunction-sections is already on, so lld can simply place them.
+        #
+        # The file is produced on the device by skate3_guest_profile_order_file
+        # and is optional - without it the link is unchanged.
+        if(REXGLUE_SYMBOL_ORDER_FILE AND EXISTS "${REXGLUE_SYMBOL_ORDER_FILE}")
+            message(STATUS "skate3: ordering text by ${REXGLUE_SYMBOL_ORDER_FILE}")
+            target_link_options(skate3 PRIVATE
+                "LINKER:--symbol-ordering-file=${REXGLUE_SYMBOL_ORDER_FILE}"
+                # The list comes from a sampled run, so it names symbols that
+                # this link may have inlined or garbage-collected. That is
+                # expected, not a problem, and 4,000 warnings would bury the
+                # ones that matter.
+                "LINKER:--no-warn-symbol-ordering")
+            set_property(TARGET skate3 APPEND PROPERTY LINK_DEPENDS
+                         "${REXGLUE_SYMBOL_ORDER_FILE}")
+        endif()
     else()
         target_link_options(skate3 PRIVATE
             "LINKER:-force_load,$<TARGET_FILE:rexruntime>")
