@@ -1034,14 +1034,17 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_tex_store_mb, 1280, "Skate 3",
                      "the idle guards keep a superseded map's working set "
                      "resident for minutes after a switch; over this budget "
                      "the LRU drains oldest-first with a shortened idle "
-                     "guard so VRAM does not accumulate across map changes.")
-    .range(256, 16384)
+                     "guard so VRAM does not accumulate across map changes. "
+                     "Below about 128 the store sits permanently in byte "
+                     "pressure and re-decodes what it just evicted, so small "
+                     "values trade page faults for decode churn.")
+    .range(64, 16384)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_mesh_store_mb, 1024, "Skate 3",
                      "Mesh cache GPU byte budget in MB (vertex + index "
                      "buffers of cached decodes). Same byte-pressure LRU "
                      "behavior as the texture-store budget.")
-    .range(256, 16384)
+    .range(64, 16384)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_retain_offscreen, true, "Skate 3",
                     "Keep recently seen static items in the scene while the game "
@@ -1261,6 +1264,19 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_build, true,
                     "disocclusion is re-tested and the persistent shadow "
                     "caster cache stays refreshed. Requires "
                     "skate3_native_render_scene_occlusion_cull.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_guest_static_refresh, 1, "Skate 3",
+    "Run the guest engine's static-world draw-list dispatch only every Nth "
+    "frame. 1 is every frame, which is today's behaviour. The dispatch builds "
+    "command packets the native renderer suppresses anyway - nothing consumes "
+    "them - yet it is the guest render thread's dominant per-item cost, so on "
+    "a machine that cannot keep up this buys frames for nothing visible. "
+    "Capture is unaffected and runs every frame, so scene items, shadow "
+    "casters and state stay complete. Raise it only where the CPU is the "
+    "limit; it does nothing for a GPU-bound device.")
+    .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_occlusion_cull_guest, true,

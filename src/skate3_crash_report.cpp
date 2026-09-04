@@ -4,6 +4,10 @@
 
 #include "skate3_native_scene.h"
 
+// For the guest X_KTHREAD pointer, which is the number
+// RtlEnterCriticalSection reports as owner_thread=.
+#include <rex/system/xthread.h>
+
 #if !defined(_WIN32)
 
 #include <dirent.h>
@@ -310,6 +314,18 @@ void ThreadDumpHandler(int, siginfo_t*, void*) {
   if (ts != nullptr && ts->context() != nullptr) {
     r.Str(" guest thid=");
     r.Dec(ts->thread_id());
+    // The same number RtlEnterCriticalSection prints as owner_thread=, which
+    // is the guest X_KTHREAD pointer - NOT the handle set_name embeds and not
+    // thread_id. Without it a "waiting 16s for cs=... owner_thread=..."
+    // warning names a thread that appears nowhere else in the report, and the
+    // one thread worth looking at is the one that cannot be identified.
+    // IsInThread() first: GetCurrentThread() asserts on a null binding, and an
+    // assert inside a signal handler is not something to find out about here.
+    // Both read the same thread_local pointer, so this is signal-safe.
+    if (rex::system::XThread::IsInThread()) {
+      r.Str(" guest_obj=0x");
+      r.Hex(rex::system::XThread::GetCurrentThread()->guest_object(), 8);
+    }
     r.Str(" lr=0x");
     r.Hex(ts->context()->lr, 8);
     r.Str(" r1=0x");

@@ -39,6 +39,7 @@ REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DECLARE(bool, skate3_diagnostics);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
+REXCVAR_DECLARE(int32_t, skate3_native_render_guest_static_refresh);
 REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
                     "Diagnostic: watch the guest D3D command-ring write pointer at every "
                     "deferred render-state flush (D3D::SetPending_RenderStates). The pointer at "
@@ -251,8 +252,39 @@ OcclDispatchFilter g_occl_filter;
 uint32_t FilterSceneDrawList(uint8_t* base, uint32_t sort_vec, uint32_t first,
                              uint32_t count) {
   OcclDispatchFilter& f = g_occl_filter;
-  if (f.active || count == 0 || count > 100000 ||
-      !REXCVAR_GET(skate3_native_render_scene_occlusion_cull_guest)) {
+  if (f.active || count == 0 || count > 100000) {
+    return count;
+  }
+
+  // Whole-list throttle. The reasoning is the same as the per-item cull above,
+  // taken to its conclusion: if nothing consumes the packets this dispatch
+  // builds, a machine that cannot afford to build them can build them less
+  // often. Dropping every entry is exactly the path the cull already takes
+  // when it happens to prove them all hidden, so there is no new mechanism
+  // here - only a different reason to reach it.
+  //
+  // Capture ran before this, every frame, so the native renderer still draws
+  // the complete world; what is skipped is guest work whose output is thrown
+  // away. Frame 0 of each period always dispatches, so anything that depends
+  // on the guest walking its own list still happens regularly.
+  if (const int32_t period = REXCVAR_GET(skate3_native_render_guest_static_refresh);
+      period > 1 && (g_frame_index % uint64_t(period)) != 0) {
+    skate3::native_scene::GuestReadRecoveryScope guest_read_recovery(base);
+    const uint32_t entries = REX_LOAD_U32(sort_vec);
+    if (entries != 0) {
+      const uint32_t seg = entries + first * 8;
+      // Saved and restored like the cull's own path: the guest's list must be
+      // exactly as it left it, even though nothing here rewrites it.
+      f.saved.assign(base + seg, base + seg + size_t(count) * 8);
+      f.active = true;
+      f.saved_addr = seg;
+      f.saved_bytes = count * 8;
+      skate3::native_scene::AddGuestOcclSkipped(count);
+      return 0;
+    }
+  }
+
+  if (!REXCVAR_GET(skate3_native_render_scene_occlusion_cull_guest)) {
     return count;
   }
   if (f.stamp != g_frame_index) {

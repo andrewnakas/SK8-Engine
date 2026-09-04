@@ -14,6 +14,11 @@
 #include <pthread.h>
 #endif
 
+#if defined(__ANDROID__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -203,6 +208,15 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_tex_base_mip_px, 0, "Skate 3",
                      "detail, which at phone resolution is largely unreachable.")
     .range(0, 8192);
 
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_tex_base_mip2_px, 0, "Skate 3",
+                     "Drop a SECOND guest mip for scene textures at least this many texels on "
+                     "their longest side, uploading from mip 2 down. 0 disables. Only applies "
+                     "where tex_base_mip_px already applied, so it must be the larger threshold. "
+                     "16x fewer bytes and 16x less CPU decode for the biggest textures, at the "
+                     "cost of two levels of detail - for devices where memory, not sharpness, is "
+                     "what is limiting.")
+    .range(0, 8192);
+
 namespace {
 bool g_bc_on_cpu = true;
 bool g_bc_resolved = false;
@@ -293,6 +307,13 @@ void RetireGuestTexture(const GuestTexture& t, uint64_t submission) {
 // resident and no rebind can ever serve another binding's art.
 std::atomic<uint64_t> g_store_evicted{0};
 constexpr size_t kTexStoreCap = 12288;
+
+// A sanity floor, not a policy one. This used to be 256, which matched the
+// cvars' own lower bound and so made the budget unlowerable - on a 3 GB
+// device that pinned half a gigabyte of stores while the system paged 16 GB
+// through zram. The cvars now go lower; this only stops a zero or a typo
+// producing a store that thrashes on the first texture.
+constexpr int kStoreFloorMb = 64;
 
 uint32_t SwapU32(uint32_t v);  // defined with the decode helpers below
 
@@ -447,7 +468,7 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
                 g_r.tex_store.size(), g_mesh_store_bytes >> 20, g_r.meshes.size());
   }
   const uint64_t byte_cap =
-      uint64_t(std::max(256, REXCVAR_GET(skate3_native_render_scene_tex_store_mb)))
+      uint64_t(std::max(kStoreFloorMb, REXCVAR_GET(skate3_native_render_scene_tex_store_mb)))
       << 20;
   const uint64_t byte_low = byte_cap - byte_cap / 8;
   const size_t low_water = kTexStoreCap - kTexStoreCap / 8;
@@ -545,7 +566,7 @@ void EvictMeshStore(uint64_t frame_number) {
     g_mesh_store_bytes = total;
   }
   const uint64_t byte_cap =
-      uint64_t(std::max(256, REXCVAR_GET(skate3_native_render_scene_mesh_store_mb)))
+      uint64_t(std::max(kStoreFloorMb, REXCVAR_GET(skate3_native_render_scene_mesh_store_mb)))
       << 20;
   const uint64_t byte_low = byte_cap - byte_cap / 8;
   const size_t low_water = kMeshStoreCap - kMeshStoreCap / 8;
@@ -1964,11 +1985,24 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
   // smaller allocation saves anything. Requires a real chain, which single-mip
   // content (non-pow2 HUD art, composed lightmap pages) does not have.
   uint32_t base_mip = 0;
-  {
+  if (allow_base_mip_shift) {
     const int32_t shift_px = REXCVAR_GET(skate3_native_render_scene_tex_base_mip_px);
-    if (allow_base_mip_shift && shift_px > 0 && mip_count >= 2 &&
-        std::max(width, height) >= uint32_t(shift_px)) {
+    const uint32_t longest = std::max(width, height);
+    if (shift_px > 0 && longest >= uint32_t(shift_px)) {
       base_mip = 1;
+      // A second level for the textures that are still enormous after the
+      // first drop: 16x rather than 4x on exactly the content that fills the
+      // store, and the same proportion off the CPU decode, which on a device
+      // whose GPU cannot sample BC is the same work twice over. Gated on its
+      // own threshold so it is opt-in per device tier.
+      const int32_t shift2_px = REXCVAR_GET(skate3_native_render_scene_tex_base_mip2_px);
+      if (shift2_px > 0 && longest >= uint32_t(shift2_px)) {
+        base_mip = 2;
+      }
+    }
+    // Never consume the whole chain: at least one level has to survive.
+    while (base_mip > 0 && mip_count < base_mip + 1) {
+      --base_mip;
     }
   }
 
@@ -5124,6 +5158,14 @@ void PrewarmWorkerLoop() {
   // Utility parks the workers on the efficiency cores, where soaking spare
   // capacity is exactly what they should be doing.
   pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#elif defined(__ANDROID__)
+  // Same reasoning again, and Android had no branch at all: the thread layer's
+  // priority call needs SCHED_FIFO, which an app is refused, so every worker
+  // ran at the guest's own priority. On a low-end device that is two decode
+  // workers (the pool is hardware_concurrency/3) competing head-on with the
+  // guest threads for eight slow cores. nice is the only lever an unprivileged
+  // app has, and raising it always works where lowering it does not.
+  setpriority(PRIO_PROCESS, gettid(), 5);
 #endif
   for (;;) {
     if (!SceneEnabled()) {
