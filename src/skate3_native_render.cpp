@@ -43,6 +43,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
 REXCVAR_DECLARE(int32_t, skate3_native_render_guest_static_refresh);
 REXCVAR_DECLARE(int32_t, skate3_native_render_lw_refresh);
 REXCVAR_DECLARE(int32_t, skate3_guest_spin_yield);
+REXCVAR_DECLARE(bool, skate3_guest_spin_measure);
 REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
                     "Diagnostic: watch the guest D3D command-ring write pointer at every "
                     "deferred render-state flush (D3D::SetPending_RenderStates). The pointer at "
@@ -1227,6 +1228,40 @@ extern "C" REX_FUNC(sub_82B79FC0) {
   }
 }
 
+// The loop AROUND the spin-wait. Timing it answers the question the profiler
+// could not: the sampler says the render thread is inside this 48% of the
+// time, but a share of samples is not a duration - it cannot say whether the
+// thread is waiting 50 ms of a 122 ms frame or spending the same share of a
+// frame it would have taken anyway. This measures the wall time and how often
+// the wait is entered, which is what decides whether it is worth attacking.
+extern "C" REX_FUNC(sub_82B755C0) {
+  if (!REXCVAR_GET(skate3_guest_spin_measure)) {
+    __imp__sub_82B755C0(ctx, base);
+    return;
+  }
+  static std::atomic<uint64_t> ns{0};
+  static std::atomic<uint64_t> calls{0};
+  static std::atomic<uint64_t> last_report_ns{0};
+  const auto t0 = std::chrono::steady_clock::now();
+  __imp__sub_82B755C0(ctx, base);
+  const auto t1 = std::chrono::steady_clock::now();
+  const uint64_t took =
+      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+  const uint64_t total = ns.fetch_add(took, std::memory_order_relaxed) + took;
+  const uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t now_ns =
+      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count());
+  uint64_t last = last_report_ns.load(std::memory_order_relaxed);
+  if (now_ns - last > 5000000000ull &&
+      last_report_ns.compare_exchange_strong(last, now_ns, std::memory_order_relaxed)) {
+    REXLOG_WARN("guest-wait: {} calls, {:.1f} ms total, {:.3f} ms each, {:.1f} ms/s",
+                n, double(total) / 1e6, double(total) / double(n) / 1e6,
+                double(total) / 1e6 / 5.0);
+    ns.store(0, std::memory_order_relaxed);
+    calls.store(0, std::memory_order_relaxed);
+  }
+}
+
 // The guest's spin-wait body, and by a wide margin the most expensive guest
 // function on a slow device: a sampling profile of the render thread put
 // sub_82B76080 at 35% and its calling loop sub_82B755C0 at 13%, stable across
@@ -1252,10 +1287,21 @@ extern "C" REX_FUNC(sub_82B76080) {
       for (int i = 0; i < 32; ++i) {
         __builtin_arm_yield();
       }
-    } else {
-      // Actually give the core up. The loop is waiting on another guest
-      // thread, so the fastest way out of the wait is to let that thread run.
+    } else if (mode == 2) {
+      // Offer the core to anything else runnable on it. Note this does NOT
+      // idle the core: with nothing else queued, sched_yield returns straight
+      // away and the spin continues at full speed. Measured as a wash, which
+      // is exactly what that implies.
       sched_yield();
+    } else {
+      // Actually stop burning the core. The thread this loop waits on is
+      // saturated on another core, and a sibling spinning flat out costs it
+      // memory bandwidth, shared cache and - on a tablet already sitting at
+      // 48 C - power budget it could otherwise spend on clocks. The wait is
+      // ~43 ms, so sleeping at 100 us granularity cannot meaningfully delay
+      // noticing that it ended.
+      struct timespec ts = {0, 100000};
+      nanosleep(&ts, nullptr);
     }
   }
   __imp__sub_82B76080(ctx, base);

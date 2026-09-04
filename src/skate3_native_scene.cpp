@@ -1279,6 +1279,13 @@ REXCVAR_DEFINE_INT32(
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    skate3_guest_spin_measure, false, "Skate 3",
+    "Time the guest's wait loop (sub_82B755C0) and report how many milliseconds "
+    "per second the render thread spends in it. A profiler share is not a "
+    "duration; this is.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(
     skate3_guest_spin_yield, 0, "Skate 3",
     "Pace the guest's spin-wait (sub_82B76080), which a sampling profile put at "
@@ -1286,8 +1293,9 @@ REXCVAR_DEFINE_INT32(
     "paced that wait with cctpl/db16cyc/cctpm; none of the three survive "
     "recompilation, so it spins flat out and starves the threads it is waiting "
     "for. 0 = today's behaviour, 1 = ARM yield hints (approximates db16cyc), "
-    "2 = sched_yield (actually gives the core up).")
-    .range(0, 2)
+    "2 = sched_yield (which does NOT idle the core), 3 = sleep 100us "
+    "(which does).")
+    .range(0, 3)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(
