@@ -64,19 +64,53 @@ export LD_LIBRARY_PATH="$PWD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # both X11 and Wayland sessions.
 export GDK_BACKEND=${GDK_BACKEND:-x11}
 
+# Keep the screen awake. A desktop session's idle timer only watches the
+# keyboard and the mouse, so playing with a controller looks exactly like
+# sitting idle and the display dims out from under you mid-line. systemd-inhibit
+# tells logind the session is busy for as long as the game runs.
+#
+# --what=idle only. Not "sleep": suspending the Deck by pressing its power
+# button has to keep working, and blocking that would be a worse bug than the
+# one this fixes.
+if command -v systemd-inhibit >/dev/null 2>&1; then
+  exec systemd-inhibit --what=idle --who="Skate 3" --why="Playing Skate 3" \
+       ./skate3 "$@"
+fi
+
 exec ./skate3 "$@"
 TXT
 chmod 755 "$stage/play-skate3.sh"
 
-cat > "$stage/skate3.desktop" <<TXT
+# NOT a .desktop file with a baked-in Exec path. This archive is unpacked
+# wherever the player wants it, so any absolute path written here is wrong for
+# everyone except the machine that built it - and it would ship the builder's
+# home directory to every user. Install it at run time instead, from wherever
+# the folder actually ended up.
+cat > "$stage/install-desktop-entry.sh" <<'TXT'
+#!/usr/bin/env bash
+# Add "Skate 3" to this machine's application menu, pointing at this folder.
+# Re-run it if you move the folder. Nothing is installed system-wide and no
+# root access is needed; delete the file it names to undo it.
+set -euo pipefail
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$apps"
+entry="$apps/skate3-recomp.desktop"
+cat > "$entry" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Skate 3
 Comment=Skate 3 recompilation
-Exec=$stage/play-skate3.sh
+Exec=$here/play-skate3.sh
+Path=$here
 Terminal=false
 Categories=Game;
+DESKTOP
+chmod +x "$entry" 2>/dev/null || true
+echo "installed: $entry"
+echo "    -> $here/play-skate3.sh"
 TXT
+chmod 755 "$stage/install-desktop-entry.sh"
 
 cp "$here/packaging/RELEASE_README.md" "$stage/README.md"
 printf '%s\n' "$version" > "$stage/VERSION"
