@@ -16,6 +16,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__ANDROID__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/overlay/install_wizard_overlay.h>
@@ -193,17 +198,58 @@ struct IsoEntry {
 
 class XboxIsoReader {
  public:
+  ~XboxIsoReader() {
+#if defined(__ANDROID__)
+    if (fd_ >= 0) {
+      ::close(fd_);
+    }
+#endif
+  }
+
   bool Open(const std::filesystem::path& path, std::string& error) {
     iso_path_ = path;
-    file_.open(path, std::ios::binary);
-    if (!file_) {
-      error = "Unable to open the selected ISO.";
-      return false;
-    }
 
-    file_.seekg(0, std::ios::end);
-    file_size_ = static_cast<uint64_t>(file_.tellg());
-    file_.seekg(0, std::ios::beg);
+#if defined(__ANDROID__)
+    // The document picker hands back an open descriptor, and the only way to
+    // name one is /proc/self/fd/N. Do NOT let ifstream open that path: doing
+    // so re-opens the underlying file and runs a fresh permission check
+    // against wherever it really lives, which the app usually fails. A file on
+    // a USB drive sits under /mnt/media_rw, readable only by the system, so
+    // the descriptor works perfectly while the path it points at is refused -
+    // reported as "unable to open the selected ISO" for a file the player can
+    // plainly see.
+    //
+    // Read through the descriptor we were given instead. dup() so this object
+    // owns what it closes and the caller's copy stays valid for a retry.
+    if (const std::string text = path.string();
+        text.rfind("/proc/self/fd/", 0) == 0) {
+      const int picked = std::atoi(text.c_str() + std::strlen("/proc/self/fd/"));
+      fd_ = ::dup(picked);
+      if (fd_ < 0) {
+        error = "The selected file could no longer be read.";
+        return false;
+      }
+      const off_t end = ::lseek(fd_, 0, SEEK_END);
+      if (end <= 0) {
+        error = "The selected file is empty or is not a file that can be read in place.";
+        ::close(fd_);
+        fd_ = -1;
+        return false;
+      }
+      file_size_ = static_cast<uint64_t>(end);
+    } else
+#endif
+    {
+      file_.open(path, std::ios::binary);
+      if (!file_) {
+        error = "Unable to open the selected ISO.";
+        return false;
+      }
+
+      file_.seekg(0, std::ios::end);
+      file_size_ = static_cast<uint64_t>(file_.tellg());
+      file_.seekg(0, std::ios::beg);
+    }
 
     uint64_t game_offset = 0;
     bool found_magic = false;
@@ -213,8 +259,9 @@ class XboxIsoReader {
       if (magic_offset + magic.size() > file_size_) {
         continue;
       }
-      file_.seekg(static_cast<std::streamoff>(magic_offset), std::ios::beg);
-      file_.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+      if (!ReadAt(magic_offset, magic.data(), magic.size())) {
+        continue;
+      }
       if (std::string_view(magic.data(), magic.size()) == kXdvdfsMagic) {
         game_offset = candidate;
         found_magic = true;
@@ -332,6 +379,23 @@ class XboxIsoReader {
     if (offset + size > file_size_) {
       return false;
     }
+#if defined(__ANDROID__)
+    if (fd_ >= 0) {
+      // pread rather than seek-then-read: it leaves the descriptor's offset
+      // alone, which matters because the picker's descriptor may be shared.
+      auto* out = static_cast<uint8_t*>(data);
+      size_t done = 0;
+      while (done < size) {
+        const ssize_t n = ::pread(fd_, out + done, size - done,
+                                  static_cast<off_t>(offset + done));
+        if (n <= 0) {
+          return false;  // short read or error; a partial buffer is not usable
+        }
+        done += static_cast<size_t>(n);
+      }
+      return true;
+    }
+#endif
     file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     file_.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
     return file_.good();
@@ -432,6 +496,10 @@ class XboxIsoReader {
 
   std::filesystem::path iso_path_;
   std::ifstream file_;
+#if defined(__ANDROID__)
+  // Set instead of file_ when the source is a picker descriptor.
+  int fd_ = -1;
+#endif
   uint64_t file_size_ = 0;
   std::vector<IsoEntry> entries_;
 };
