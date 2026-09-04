@@ -30,6 +30,24 @@ enum class Profile {
 // guessing "slow" for a machine that is not would quietly halve its picture.
 Profile DetectProfile();
 
+// Which Steam Deck this is, by DMI board name. The two panels differ in
+// refresh rate, which is the only reason the engine cares.
+enum class DeckModel {
+  kNotDeck,
+  kLcd,   // "Jupiter" - 800p 60Hz
+  kOled,  // "Galileo" - 800p 90Hz
+};
+DeckModel DetectSteamDeckModel();
+
+// On Steam Deck hardware, apply the handheld preset and the panel's refresh
+// cap ONCE, leaving a marker beside the settings so it never runs again.
+//
+// This exists because first-run detection alone does not reach a Deck that has
+// run the game before: saves live in ~/.local/share/skate3 and survive
+// reinstalling the engine, so settings.toml is already there on the "first"
+// run of a new build and the auto preset never fires. Returns whether it ran.
+bool ApplyDeckDefaultsOnce(const std::filesystem::path& user_data_root);
+
 std::string_view ProfileName(Profile profile);
 
 // Apply a bundle by setting the cvars it covers. Only ever called for a

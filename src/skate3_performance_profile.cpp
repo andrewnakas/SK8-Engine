@@ -412,4 +412,66 @@ bool ApplyRequestedProfile(bool first_run) {
   return true;
 }
 
+DeckModel DetectSteamDeckModel() {
+#if defined(__linux__)
+  static constexpr std::array<const char*, 2> kDmiPaths = {
+      "/sys/devices/virtual/dmi/id/product_name",
+      "/sys/devices/virtual/dmi/id/board_name",
+  };
+  for (const char* path : kDmiPaths) {
+    const std::string value = ReadFirstLine(path);
+    if (value.find("galileo") != std::string::npos) {
+      return DeckModel::kOled;
+    }
+    if (value.find("jupiter") != std::string::npos) {
+      return DeckModel::kLcd;
+    }
+  }
+#endif
+  // SteamDeck=1 without a readable board name: it is a Deck, and the LCD's
+  // 60Hz is the safe guess - capping an OLED at 60 costs frames, while letting
+  // an LCD try for 90 asks the panel for a rate it does not have.
+  if (EnvSet("SteamDeck")) {
+    return DeckModel::kLcd;
+  }
+  return DeckModel::kNotDeck;
+}
+
+bool ApplyDeckDefaultsOnce(const std::filesystem::path& user_data_root) {
+  const DeckModel model = DetectSteamDeckModel();
+  if (model == DeckModel::kNotDeck) {
+    return false;
+  }
+  std::error_code ec;
+  const auto marker = user_data_root / ".deck-defaults-applied";
+  if (std::filesystem::exists(marker, ec)) {
+    return false;
+  }
+
+  ApplyProfile(Profile::kDeck);
+
+  // The panel's own refresh rate, as the frame cap. A cap the panel can
+  // actually hold beats a higher target it cannot: on a handheld a steady 60
+  // reads better than an unsteady 75, and the OLED's 90 is real headroom the
+  // LCD does not have.
+  //
+  // skate3_guest_fps_cap, not video_mode_refresh_rate. The guest cap is what
+  // the frame pacer actually reads on this platform, and it is one of the
+  // settings that gets written back to settings.toml - video_mode_refresh_rate
+  // is neither, so setting it looked right and did nothing that survived the
+  // session.
+  const double refresh = model == DeckModel::kOled ? 90.0 : 60.0;
+  if (!rex::cvar::HasNonDefaultValue("skate3_guest_fps_cap")) {
+    rex::cvar::SetFlagByName("skate3_guest_fps_cap", std::to_string(refresh));
+    rex::cvar::SetFlagByName("skate3_guest_fps_cap_auto", "false");
+  }
+  REXLOG_INFO("Steam Deck ({}) detected: handheld preset applied, frame cap {} Hz",
+              model == DeckModel::kOled ? "OLED / Galileo" : "LCD / Jupiter", refresh);
+
+  std::filesystem::create_directories(user_data_root, ec);
+  std::ofstream(marker) << "The handheld preset and this panel's frame cap were applied once.\n"
+                           "Delete this file to have them applied again.\n";
+  return true;
+}
+
 }  // namespace skate3::perf

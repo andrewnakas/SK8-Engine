@@ -97,6 +97,13 @@ REXCVAR_DEFINE_STRING(skate3_dlc_root, "", "Skate 3",
                       "Directory containing Skate 3 DLC package files");
 REXCVAR_DEFINE_BOOL(skate3_auto_install_dlc, true, "Skate 3",
                     "Install DLC package files found in configured DLC folders");
+REXCVAR_DEFINE_BOOL(skate3_hide_cursor_in_game, true, "Skate 3",
+                    "Keep the mouse pointer off the screen during gameplay. The pointer was only "
+                    "AUTO-hidden, which reveals it on every scrap of mouse motion and hides it "
+                    "again a moment later - fine with a mouse sitting still, useless on a Steam "
+                    "Deck, where a trackpad in mouse mode moves the pointer continuously and so "
+                    "parks it permanently on screen. Set false for the old auto-hide behaviour. "
+                    "The settings screen always shows the pointer regardless of this.");
 REXCVAR_DEFINE_BOOL(skate3_ultrawide, false, "Skate 3",
                     "Ultrawide display support: the native renderer draws true widescreen "
                     "frames at the host display aspect (requires the native renderer; the "
@@ -434,6 +441,19 @@ void LoadAndNormalizeSimpleSettings(const std::filesystem::path& settings_path,
     ApplyFirstRunVideoDefaults(settings_path, developer_config_path);
   }
   rex::ui::EnsureSimpleSettingsConfig(settings_path);
+
+  // A Deck that has run the game before already has a settings.toml, so the
+  // first-run path above never fires for it and it keeps a desktop's preset.
+  // This catches exactly that case, once per machine.
+  if (skate3::perf::ApplyDeckDefaultsOnce(settings_path.parent_path())) {
+    // Write the applied preset through to disk. Without this the marker file
+    // records "the handheld preset was applied" while settings.toml still
+    // holds the old values - so the preset is live for exactly one session,
+    // the next launch loads the old settings back, and the marker makes sure
+    // it never applies again. The Deck silently ends up on a desktop's
+    // settings forever.
+    rex::ui::SaveSimpleSettingsConfig(settings_path);
+  }
 }
 
 std::filesystem::path ResolveRuntimeGameDataRoot(const rex::PathConfig& paths) {
@@ -703,17 +723,18 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
       level_select_dialog_->Toggle();
     }
   });
-  rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings", [this] {
-    // Escape backs out of the settings screen level by level (rows ->
-    // category rail -> closed); when the screen is closed it opens it.
+  rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings (close only)", [this] {
+    // Escape CLOSES the settings screen, level by level (rows -> category rail
+    // -> closed). It deliberately does not open it.
+    //
+    // The controller chord is the only way in - Back+Start, i.e. Select+Start.
+    // One entrance means one thing to explain and one thing that can fire by
+    // accident, and on a handheld there is no keyboard to press Escape on
+    // anyway. Escape still works as "back" because a player who opened the
+    // screen needs a way out that is not the same chord.
     if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
       simple_settings_dialog_->NavigateBack();
-    } else {
-      ToggleSimpleSettings();
     }
-  });
-  rex::ui::RegisterBind("bind_skate3_menu_alt", "F1", "Skate 3 settings alternate", [this] {
-    ToggleSimpleSettings();
   });
   // Remembered handle: the F11 paired A/B parity capture (native + emulated
   // screenshots + gsnap, sequenced from the guest frame loop in
@@ -865,7 +886,6 @@ void Skate3BaseApp::OnPreLaunchModule() {
 
 void Skate3BaseApp::OnShutdown() {
   rex::ui::UnregisterBind("bind_skate3_menu");
-  rex::ui::UnregisterBind("bind_skate3_menu_alt");
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
   rex::ui::UnregisterBind("bind_skate3_log_debug_marker");
   rex::ui::UnregisterBind("bind_skate3_log_user_marker");
@@ -1002,7 +1022,13 @@ void Skate3BaseApp::ApplySettingsCursorMode() {
 
 void Skate3BaseApp::ApplyGameplayCursorMode() {
   if (window()) {
-    window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kAutoHidden);
+    // kAutoHidden un-hides on any mouse motion and re-hides on a timer, which
+    // is the wrong shape for a handheld: a Steam Deck trackpad left in mouse
+    // mode emits motion the whole time a thumb rests on it, so the pointer
+    // never gets to the "hidden" half of that cycle. kHidden has no timer.
+    window()->SetCursorVisibility(REXCVAR_GET(skate3_hide_cursor_in_game)
+                                      ? rex::ui::Window::CursorVisibility::kHidden
+                                      : rex::ui::Window::CursorVisibility::kAutoHidden);
   }
 }
 

@@ -12,6 +12,7 @@
 #include <execinfo.h>
 #endif
 #include <fcntl.h>
+#include <ctime>
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -28,9 +29,23 @@
 #include <rex/logging.h>
 #include <rex/logging/api.h>
 #include <rex/ppc/context.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
 
 REXCVAR_DECLARE(int32_t, skate3_hang_watchdog_seconds);
+
+REXCVAR_DEFINE_INT32(
+    skate3_dump_after_resume_seconds, 10, "Skate 3",
+    "Seconds after the machine wakes from suspend to dump every thread's stack, "
+    "automatically (0 = off). This exists because the freeze it is meant to catch takes the "
+    "screen with it: the game is fullscreen and unresponsive, so there is no way to reach a "
+    "terminal and ask it anything, and the automatic hang watchdog does not fire because the "
+    "guest frame counter is still moving. Dumping unprompted a few seconds after every resume "
+    "is the only way to get the evidence out. On a resume where nothing is wrong the cost is "
+    "one harmless dump in the crash file.")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::crash_report {
 
@@ -199,6 +214,17 @@ void WriteGuestState(Report& r) {
 // SIGRTMIN carries no default meaning and is not used by the runtime.
 std::atomic<uint64_t> g_heartbeat{0};
 std::atomic<bool> g_hang_reported{false};
+// Set by SIGUSR1, acted on by the watchdog thread. The handler must stay
+// async-signal-safe, and DumpAllThreads is not - it opens a directory and
+// sleeps - so the signal only raises a flag and the watchdog does the work
+// from ordinary thread context a moment later.
+std::atomic<bool> g_dump_requested{false};
+// Whether the frame heartbeat is still moving, sampled once a second by the
+// watchdog. A freeze where frames KEEP being produced looks identical from
+// outside to one where they stop, and the two have completely different
+// causes, so the dump has to say which it is.
+std::atomic<uint64_t> g_heartbeat_last_change_tick{0};
+std::atomic<uint64_t> g_watchdog_tick{0};
 
 void ThreadDumpHandler(int, siginfo_t*, void*) {
   Report r;
@@ -227,10 +253,29 @@ void ThreadDumpHandler(int, siginfo_t*, void*) {
   WriteHostBacktrace();
 }
 
-void DumpAllThreads() {
+void DumpAllThreads(const char* reason) {
   Report r;
-  r.Str("\n=== skate3: HANG detected - no guest frame for the watchdog period ===\n");
-  r.Str("  every thread's stack follows; the one holding the lock everyone else\n");
+  r.Str("\n=== skate3: THREAD DUMP - ");
+  r.Str(reason);
+  r.Str(" ===\n");
+  // The single most useful number in the whole dump. A frozen game whose frame
+  // counter is STILL MOVING is not stuck in the renderer at all - something
+  // else in the guest is, and the render thread is happily re-presenting an
+  // unchanging picture. A counter that has stopped means the opposite. Without
+  // this line the two are indistinguishable from the outside.
+  const uint64_t tick = g_watchdog_tick.load(std::memory_order_relaxed);
+  const uint64_t changed = g_heartbeat_last_change_tick.load(std::memory_order_relaxed);
+  r.Str("  guest frames so far   ");
+  r.Dec(g_heartbeat.load(std::memory_order_relaxed));
+  r.Str("\n  frame counter moving  ");
+  if (tick > changed + 2) {
+    r.Str("NO - stopped about ");
+    r.Dec(tick - changed);
+    r.Str(" seconds ago");
+  } else {
+    r.Str("YES - the guest is still producing frames RIGHT NOW");
+  }
+  r.Str("\n  every thread's stack follows; the one holding the lock everyone else\n");
   r.Str("  is waiting on is the interesting one.\n");
   r.Flush();
   // Enumerating /proc/self/task from a normal thread (not signal context), so
@@ -259,21 +304,117 @@ void DumpAllThreads() {
   }
   ::closedir(d);
   Report tail;
-  tail.Str("=== end hang report ===\n");
+  tail.Str("=== end thread dump ===\n");
   tail.Flush();
+  // Force it to the disk. The only way out of the freeze this is meant to
+  // catch is holding the power button, and an unsynced write in the page cache
+  // does not survive that - which would lose the one thing worth having.
+  if (g_crash_fd >= 0) {
+    ::fsync(g_crash_fd);
+  }
 }
 
 void WatchdogMain() {
   uint64_t last_seen = 0;
   int stalled_ticks = 0;
+  int64_t last_mono_ms = 0;
+  int64_t last_boot_ms = 0;
+  uint64_t dump_at_tick = 0;
+  uint64_t dump_at_tick_late = 0;
   for (;;) {
     struct timespec ts = {1, 0};
     nanosleep(&ts, nullptr);
+    const uint64_t tick = g_watchdog_tick.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Detect that the machine has been suspended, without asking anyone.
+    // CLOCK_BOOTTIME counts the time spent suspended and CLOCK_MONOTONIC does
+    // not, so the gap between how much each advanced across one sleep IS the
+    // length of the suspend. Nothing else on the system has to cooperate.
+    {
+      struct timespec mono = {}, boot = {};
+      clock_gettime(CLOCK_MONOTONIC, &mono);
+      clock_gettime(CLOCK_BOOTTIME, &boot);
+      const int64_t mono_ms = int64_t(mono.tv_sec) * 1000 + mono.tv_nsec / 1000000;
+      const int64_t boot_ms = int64_t(boot.tv_sec) * 1000 + boot.tv_nsec / 1000000;
+      if (last_mono_ms != 0) {
+        const int64_t boot_delta = boot_ms - last_boot_ms;
+        const int64_t mono_delta = mono_ms - last_mono_ms;
+        const int64_t suspended_ms = boot_delta - mono_delta;
+        // The threshold used to be two seconds, and that is why this kept
+        // missing the thing it was built for. On the Deck a **one second**
+        // suspend is enough to freeze the game: kernel log
+        //
+        //     13:19:32  PM: suspend entry (deep)
+        //     13:19:33  PM: suspend exit
+        //
+        // and from that moment the guest never polled the pad again. The
+        // engine said nothing, so the pad re-attach and every other resume
+        // recovery never ran - they have literally never been tried against
+        // the suspend that actually causes this.
+        //
+        // 250 ms is safe because this difference is not a duration estimate,
+        // it IS suspended time: CLOCK_BOOTTIME counts it and CLOCK_MONOTONIC
+        // does not, so anything else that delays this loop - scheduling, or
+        // this very thread spending a second writing a thread dump - moves
+        // both clocks equally and cancels to zero. A boot-time-only test was
+        // tried here instead and fired spuriously on exactly that.
+        if (suspended_ms > 250) {
+          REXLOG_INFO("skate3: resume check - boot +{} ms, monotonic +{} ms, suspended {} ms",
+                      boot_delta, mono_delta, suspended_ms);
+          REXLOG_WARN("skate3: woke from a {} ms suspend", suspended_ms);
+          // Devices that went away while the machine was asleep get
+          // re-established here. The pad is the one that matters: it is USB, it
+          // re-enumerates across a suspend, and a driver still holding the old
+          // handle reports centred sticks and no buttons forever. The game then
+          // has no reason to move anything, the camera settles, and the result
+          // is indistinguishable from a frozen engine.
+          if (auto* kernel_state = REX_KERNEL_STATE()) {
+            if (auto* emulator = kernel_state->emulator()) {
+              if (auto* input_system = emulator->input_system()) {
+                input_system->OnSystemResume();
+              }
+            }
+          }
+          const int delay = REXCVAR_GET(skate3_dump_after_resume_seconds);
+          // TWO dumps, not one. The first freeze capture was taken nine
+          // seconds after the resume and caught nothing, because every
+          // watchdog here needs longer than that to fire - and the player has
+          // no way to know how long they have been staring at a frozen screen.
+          // A second, later dump means a capture is useful whether they power
+          // the machine off immediately or sit with it for a while.
+          dump_at_tick = delay > 0 ? tick + uint64_t(delay) : 0;
+          dump_at_tick_late = delay > 0 ? tick + uint64_t(delay) + 20 : 0;
+        }
+      }
+      last_mono_ms = mono_ms;
+      last_boot_ms = boot_ms;
+    }
+    if (dump_at_tick != 0 && tick >= dump_at_tick) {
+      dump_at_tick = 0;
+      DumpAllThreads("automatic, shortly after waking from suspend");
+    }
+    if (dump_at_tick_late != 0 && tick >= dump_at_tick_late) {
+      dump_at_tick_late = 0;
+      DumpAllThreads("automatic, a while after waking from suspend");
+    }
+
+    const uint64_t now = g_heartbeat.load(std::memory_order_relaxed);
+    if (now != last_seen) {
+      g_heartbeat_last_change_tick.store(tick, std::memory_order_relaxed);
+    }
+
+    // An explicitly requested dump is honoured whatever the heartbeat is
+    // doing. That is the whole point of it: the freeze that needs explaining
+    // is the one the automatic watchdog cannot see, because frames are still
+    // being produced while the game is dead to input and the audio loops.
+    if (g_dump_requested.exchange(false, std::memory_order_relaxed)) {
+      DumpAllThreads("requested with SIGUSR1");
+    }
+
     const int limit = REXCVAR_GET(skate3_hang_watchdog_seconds);
     if (limit <= 0) {
       continue;
     }
-    const uint64_t now = g_heartbeat.load(std::memory_order_relaxed);
     if (now != last_seen) {
       last_seen = now;
       stalled_ticks = 0;
@@ -284,9 +425,17 @@ void WatchdogMain() {
     // frames at all (alt-tabbed, a long blocking load). Only the first stall
     // past the limit is reported; the next resumed frame re-arms it.
     if (++stalled_ticks >= limit && !g_hang_reported.exchange(true, std::memory_order_relaxed)) {
-      DumpAllThreads();
+      DumpAllThreads("no guest frame for the watchdog period");
     }
   }
+}
+
+// SIGUSR1: "dump every thread, now". Async-signal-safe by design - it only
+// sets a flag. Send it to a frozen game with
+//     pkill -USR1 -x skate3
+// and the dump lands in skate3_crash.txt beside the log.
+void DumpRequestHandler(int, siginfo_t*, void*) {
+  g_dump_requested.store(true, std::memory_order_relaxed);
 }
 
 void StartWatchdog() {
@@ -297,6 +446,12 @@ void StartWatchdog() {
   if (sigaction(SIGRTMIN, &sa, nullptr) != 0) {
     return;
   }
+
+  struct sigaction dump_sa = {};
+  dump_sa.sa_sigaction = DumpRequestHandler;
+  dump_sa.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&dump_sa.sa_mask);
+  sigaction(SIGUSR1, &dump_sa, nullptr);
   std::thread(WatchdogMain).detach();
 }
 
@@ -402,7 +557,10 @@ void EnsureInstalled(uint8_t* guest_base) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, &g_prev_sigabrt);
 
-    REXLOG_INFO("skate3 crash reporter installed (guest faults report to stderr and '{}')", path);
+    REXLOG_INFO(
+        "skate3 crash reporter installed (guest faults report to stderr and '{}'). "
+        "To dump every thread's stack while the game is frozen: pkill -USR1 -x skate3",
+        path);
   });
 }
 
