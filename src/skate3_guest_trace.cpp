@@ -649,7 +649,8 @@ mach_port_t FindThreadByName(const std::string& wanted) {
 // runs on the target thread with the interrupted context, which is exactly
 // what a sampling profiler needs, and the target is only interrupted for the
 // few instructions it takes to store one word.
-bool SampleThreadPc(SampleTarget target, uintptr_t* out_pc) {
+bool SampleThreadPc(SampleTarget target, uintptr_t* out_pc, uint64_t* out_x8) {
+  *out_x8 = 0;
   arm_thread_state64_t state = {};
   mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
   if (thread_suspend(target) != KERN_SUCCESS) {
@@ -676,9 +677,17 @@ constexpr SampleTarget kNoTarget = 0;
 std::atomic<uintptr_t> g_sample_pc{0};
 std::atomic<int> g_sample_ready{0};
 
+std::atomic<uint64_t> g_sample_x8{0};
+
 void SampleSignalHandler(int, siginfo_t*, void* uctx) {
   const auto* uc = static_cast<const ucontext_t*>(uctx);
   g_sample_pc.store(uintptr_t(uc->uc_mcontext.pc), std::memory_order_relaxed);
+  // arm64 puts the syscall number in x8 at the svc, and it is still there
+  // while the thread is inside the call. "libc.so!syscall" was the biggest
+  // single entry on the guest main thread and named nothing on its own; this
+  // says which call it is, and therefore whether the thread is working or
+  // waiting.
+  g_sample_x8.store(uc->uc_mcontext.regs[8], std::memory_order_relaxed);
   g_sample_ready.store(1, std::memory_order_release);
 }
 
@@ -711,7 +720,7 @@ pid_t FindThreadByName(const std::string& wanted) {
   return found;
 }
 
-bool SampleThreadPc(SampleTarget target, uintptr_t* out_pc) {
+bool SampleThreadPc(SampleTarget target, uintptr_t* out_pc, uint64_t* out_x8) {
   static std::once_flag once;
   std::call_once(once, [] {
     struct sigaction sa = {};
@@ -729,6 +738,7 @@ bool SampleThreadPc(SampleTarget target, uintptr_t* out_pc) {
   for (int spin = 0; spin < 2000; ++spin) {
     if (g_sample_ready.load(std::memory_order_acquire)) {
       *out_pc = g_sample_pc.load(std::memory_order_relaxed);
+      *out_x8 = g_sample_x8.load(std::memory_order_relaxed);
       return true;
     }
     std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -753,6 +763,9 @@ void SamplerMain() {
   // Raw pcs, resolved after the target is running again.
   std::vector<uintptr_t> pending;
   pending.reserve(4096);
+  std::vector<uint64_t> pending_x8;
+  pending_x8.reserve(4096);
+  std::map<uint64_t, uint64_t> syscalls;
 
   while (true) {
     if (target == kNoTarget) {
@@ -765,40 +778,54 @@ void SamplerMain() {
     }
 
     uintptr_t pc = 0;
-    if (!SampleThreadPc(target, &pc)) {
+    uint64_t x8 = 0;
+    if (!SampleThreadPc(target, &pc, &x8)) {
       // The thread went away - find it again next time round.
       ReleaseTarget(target);
       target = kNoTarget;
       continue;
     }
     pending.push_back(pc);
+    pending_x8.push_back(x8);
 
     // Resolve off the suspended path.
     if (pending.size() >= 256) {
-      for (uintptr_t pc : pending) {
+      for (size_t i = 0; i < pending.size(); ++i) {
+        const uintptr_t pc = pending[i];
         const uint32_t guest =
             GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr);
         counts.by_function[guest]++;
         if (guest == 0) {
-          counts.by_host[HostSite(pc)]++;
+          const std::string site = HostSite(pc);
+          counts.by_host[site]++;
+          if (site.find("syscall") != std::string::npos && i < pending_x8.size()) {
+            syscalls[pending_x8[i]]++;
+          }
         }
         counts.total++;
       }
       pending.clear();
+      pending_x8.clear();
     }
 
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_report) {
-      for (uintptr_t pc : pending) {
+      for (size_t i = 0; i < pending.size(); ++i) {
+        const uintptr_t pc = pending[i];
         const uint32_t guest =
             GuestFunctionForHostPc(reinterpret_cast<const void*>(pc), nullptr);
         counts.by_function[guest]++;
         if (guest == 0) {
-          counts.by_host[HostSite(pc)]++;
+          const std::string site = HostSite(pc);
+          counts.by_host[site]++;
+          if (site.find("syscall") != std::string::npos && i < pending_x8.size()) {
+            syscalls[pending_x8[i]]++;
+          }
         }
         counts.total++;
       }
       pending.clear();
+      pending_x8.clear();
       next_report = now + report_every;
 
       if (counts.total) {
@@ -898,6 +925,26 @@ void SamplerMain() {
             hline += fmt::format("{}={:.1f}%", hranked[i].second, percent);
           }
           REXLOG_INFO("skate3 profile host: {}", hline);
+          if (!syscalls.empty()) {
+            // arm64 numbers: 98 futex, 101 nanosleep, 113 clock_gettime,
+            // 115 clock_nanosleep, 73 ppoll, 63 read, 64 write.
+            std::vector<std::pair<uint64_t, uint64_t>> sr;
+            for (const auto& [nr, hits] : syscalls) {
+              sr.emplace_back(hits, nr);
+            }
+            std::sort(sr.begin(), sr.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string sline;
+            for (size_t i = 0; i < sr.size() && i < 6; ++i) {
+              if (!sline.empty()) {
+                sline += ' ';
+              }
+              sline += fmt::format("nr={}:{:.1f}%", sr[i].second,
+                                   100.0 * double(sr[i].first) / double(counts.total));
+            }
+            REXLOG_INFO("skate3 profile syscalls: {}", sline);
+            syscalls.clear();
+          }
         }
         counts.by_function.clear();
         counts.by_host.clear();
