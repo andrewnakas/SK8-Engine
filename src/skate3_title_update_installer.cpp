@@ -568,6 +568,18 @@ bool DownloadToFile(const std::string& /*url*/, const std::filesystem::path& /*d
   return false;
 }
 
+#elif defined(__ANDROID__)
+
+// Android has no curl, so the branch below would always fail with exit code
+// 127 - "sh: curl: inaccessible or not found" - and read to the player as a
+// connection problem. The activity performs the transfer instead.
+bool DownloadToFile(const std::string& url, const std::filesystem::path& destination,
+                    std::atomic<uint64_t>& /*copied_bytes*/,
+                    std::atomic<uint64_t>& /*total_bytes*/, std::string& error) {
+  REXLOG_INFO("Downloading Skate 3 title update through the activity");
+  return skate3::android::DownloadFile(url, destination, error);
+}
+
 #else
 
 bool DownloadToFile(const std::string& url, const std::filesystem::path& destination,

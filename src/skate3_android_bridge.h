@@ -21,4 +21,11 @@ std::filesystem::path PickDocument(std::string_view title);
 // whether it accepted; the caller still has to quit.
 bool RequestRestart();
 
+// Downloads `url` to `destination`, blocking the calling SDL thread. Android
+// has no curl, so the engine's usual route - shelling out to it - fails on
+// every device with exit code 127. The activity does the transfer instead.
+// Returns whether the file arrived; `error` carries something worth showing.
+bool DownloadFile(std::string_view url, const std::filesystem::path& destination,
+                  std::string& error);
+
 }  // namespace skate3::android

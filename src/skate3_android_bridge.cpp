@@ -85,6 +85,36 @@ std::filesystem::path PickDocument(std::string_view title) {
   return std::filesystem::path("/proc/self/fd") / std::to_string(fd);
 }
 
+bool DownloadFile(std::string_view url, const std::filesystem::path& destination,
+                  std::string& error) {
+  ActivityMethod m;
+  if (!Resolve(m, "downloadTo", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")) {
+    error = "This build cannot download on Android.";
+    return false;
+  }
+  jstring java_url = m.env->NewStringUTF(std::string(url).c_str());
+  jstring java_dest = m.env->NewStringUTF(destination.string().c_str());
+  auto result = static_cast<jstring>(
+      m.env->CallStaticObjectMethod(m.cls, m.method, java_url, java_dest));
+  m.env->DeleteLocalRef(java_url);
+  m.env->DeleteLocalRef(java_dest);
+  if (m.Failed("downloadTo")) {
+    error = "The download could not be started.";
+    return false;
+  }
+  // null means success; anything else is the reason it failed.
+  if (result == nullptr) {
+    return true;
+  }
+  const char* text = m.env->GetStringUTFChars(result, nullptr);
+  error = text ? text : "The download failed.";
+  if (text) {
+    m.env->ReleaseStringUTFChars(result, text);
+  }
+  m.env->DeleteLocalRef(result);
+  return false;
+}
+
 bool RequestRestart() {
   ActivityMethod m;
   if (!Resolve(m, "requestRestart", "()Z")) {
