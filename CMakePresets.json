@@ -159,6 +159,14 @@
         "REXGLUE_ANDROID_ARM_MTUNE": "cortex-a53",
         "REXGLUE_ANDROID_ARM_NO_OUTLINE_ATOMICS": "ON"
       }
+    },
+    {
+      "name": "android-arm64-heapwatch",
+      "displayName": "Android arm64 with the guest store watch armed (debugging only)",
+      "inherits": "android-base",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-DSKATE3_HEAP_WATCH=1"
+      }
     }
   ],
   "buildPresets": [

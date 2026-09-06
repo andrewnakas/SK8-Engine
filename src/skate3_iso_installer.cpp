@@ -772,7 +772,35 @@ bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context
     std::atomic<uint64_t> total_bytes{0};
     std::string error;
     REXLOG_INFO("Installing Skate 3 game files from {}", automated_iso);
-    if (!install(std::filesystem::path(automated_iso), copied_bytes, total_bytes, error)) {
+    // Report it while it happens.
+    //
+    // This path skips the wizard, so the extraction runs before anything is
+    // drawn and the player watches a black screen for minutes with no sign of
+    // life. The usual conclusion is that it has hung, and force-closing it
+    // half way leaves a broken install - which is the most common "the port
+    // doesn't work" report there is, from people whose install was in fact
+    // working. Progress was already being counted; nothing was reading it.
+    std::atomic<bool> installing{true};
+    std::thread progress([&installing, &copied_bytes, &total_bytes] {
+      uint64_t last_logged = 0;
+      while (installing.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        const uint64_t done = copied_bytes.load(std::memory_order_relaxed);
+        const uint64_t total = total_bytes.load(std::memory_order_relaxed);
+        if (total == 0 || done == last_logged) {
+          continue;
+        }
+        last_logged = done;
+        REXLOG_INFO("Installing Skate 3 game files: {:.1f}% ({:.2f} of {:.2f} GB)",
+                    100.0 * double(done) / double(total), double(done) / 1e9,
+                    double(total) / 1e9);
+      }
+    });
+    const bool installed =
+        install(std::filesystem::path(automated_iso), copied_bytes, total_bytes, error);
+    installing.store(false, std::memory_order_relaxed);
+    progress.join();
+    if (!installed) {
       REXLOG_ERROR("Automated ISO installation failed: {}", error);
       return false;
     }
