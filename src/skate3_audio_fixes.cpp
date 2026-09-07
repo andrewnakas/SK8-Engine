@@ -110,15 +110,22 @@ constexpr uint32_t kPlayerRate = 340;      // float
 constexpr uint32_t kPlayerChannels = 351;  // u8
 constexpr uint32_t kPlayerFormat = 352;    // u8, indexes the tag table below
 constexpr uint32_t kFormatTagTable = 0x8210A310;
-// How many entries of the tag table to treat as printable. NOT a claim about
-// how many formats exist: an earlier version of this file asserted the table
-// held exactly two ('P6L0', 'PFN0') and printed "valid: 0-1" beside every
-// failure, which made an AYN Thor report reading byte=1 look like an
-// out-of-range index. It was not. The same byte succeeds on a working device,
-// and that device's registry holds FOURTEEN formats - 'Esp0','PFN0','P8U0',
-// 'P8S0','P2L0','P2B0','P6L0','P6B0','MP30','L32S','L32P','EL31','EXm0',
-// 'Xas1'. The table is read directly instead, and what the log now compares is
-// the tag the index resolved to against the tags actually registered.
+// How many entries of the tag table to PRINT. The table itself really does hold
+// only two ('P6L0', 'PFN0'); a dump of the neighbourhood on a working device
+// reads
+//
+//   table[0..7] = ['P6L0','PFN0','Pack','etPl','ayer','....','Pack','etPl']
+//
+// so entry 2 onwards is the string "PacketPlayer", not codec tags. The original
+// two-entry assertion in this file was right, and a note here briefly claimed
+// otherwise on the strength of the System's registry holding fourteen formats -
+// but the registry is every format the System knows, while this table maps this
+// player type's own two options. They are different things.
+//
+// Printing past the end is deliberate: an AYN Thor and a Retroid Pocket 6 both
+// resolve index 1 to 'rwar' where this device resolves it to 'PFN0', and seeing
+// the surrounding bytes says whether one entry was overwritten or the whole
+// region belongs to a different image.
 constexpr uint32_t kFormatTagReadable = 16;
 
 // The byte the game ACTUALLY indexes the tag table with is not the one at
@@ -254,6 +261,39 @@ void DescribeFormatRegistry(uint8_t* base, uint32_t sys, std::string& out) {
   }
 }
 
+// Render the first entries of the codec tag table itself.
+//
+// This is here because of a result that rules out everything easy. A Retroid
+// Pocket 6 and an AYN Thor both resolve index 1 to 'rwar', which is not in the
+// registry; the developer's phone resolves the SAME index, through the same
+// static address, in the same binary, to 'PFN0', which is. And the diagnostic
+// report now proves the inputs are identical - size and hash of default.xex,
+// default.xexp, EAWebkit.xexp and all three .mus stream files match byte for
+// byte. Same code, same data, different value read from the same address.
+//
+// That leaves the table's CONTENT differing at run time, so print it. If only
+// one entry is wrong, something wrote over it - and 'rwar' carries RenderWare's
+// own two-letter prefix, so the writer is likely rw::audio itself. If the whole
+// table is wrong, it was never initialised on these devices. The two need
+// different fixes, and one line of log separates them.
+void DescribeFormatTagTable(uint8_t* base, std::string& out) {
+  out.clear();
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t tag = REX_LOAD_U32(kFormatTagTable + i * 4);
+    char quad[8] = {};
+    for (int k = 0; k < 4; ++k) {
+      const char c = char((tag >> (8 * (3 - k))) & 0xFF);
+      quad[k] = (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    if (!out.empty()) {
+      out += ',';
+    }
+    out += '\'';
+    out += quad;
+    out += '\'';
+  }
+}
+
 // Volatile guest state the lock helpers may disturb. RtlEnterCriticalSection
 // is a host implementation that only writes r3, but the +84/+88 function
 // pointers - null in this build, honoured anyway - would run guest code, and
@@ -383,11 +423,14 @@ extern "C" REX_FUNC(sub_82B3CD38) {
       }
       std::string registry;
       DescribeFormatRegistry(base, REX_LOAD_U32(player + kPlayerSystem), registry);
+      std::string table;
+      DescribeFormatTagTable(base, table);
       REXLOG_WARN(
           "skate3-audio: decoder OK (occurrence {}) player={:08X} format byte={} "
-          "(stored copy {}), tag={:08X} '{}', channels={}, registry=[{}]",
+          "(stored copy {}), tag={:08X} '{}', channels={}, registry=[{}], "
+          "table[0..7]=[{}]",
           ok, player, used, stored, ok_tag, static_cast<const char*>(ok_quad),
-          REX_LOAD_U8(player + kPlayerChannels), registry);
+          REX_LOAD_U8(player + kPlayerChannels), registry, table);
     }
     __imp__sub_82B3CD38(ctx, base);
     return;
@@ -427,16 +470,19 @@ extern "C" REX_FUNC(sub_82B3CD38) {
       // entries - and an empty registry says which.
       std::string registry;
       DescribeFormatRegistry(base, REX_LOAD_U32(player + kPlayerSystem), registry);
+      std::string table;
+      DescribeFormatTagTable(base, table);
       REXLOG_ERROR(
           "skate3-audio: decoder requested with a NULL format descriptor "
           "(occurrence {}), from PacketPlayer::CreateDecoder player={:08X}: "
           "format byte={} (used; stored copy {}), tag={:08X} '{}', "
-          "channels={}, rate={}, registry=[{}] - the tag is what the lookup "
-          "searched for; if it is absent from the registry the registration is "
-          "the fault, not the byte. Returning failure instead of calling "
-          "through guest address 0",
+          "channels={}, rate={}, registry=[{}], table[0..7]=[{}] - the tag is "
+          "what the lookup searched for. The table is static data in the game "
+          "image; if an entry here differs between devices running the same "
+          "build and the same disc, that memory was written over at run time. "
+          "Returning failure instead of calling through guest address 0",
           n, player, used, format, tag,
-          static_cast<const char*>(quad), channels, rate, registry);
+          static_cast<const char*>(quad), channels, rate, registry, table);
     } else {
       // The other lookup. sub_82B33D40 keys the same registry off a codec id
       // through a DIFFERENT table (0x82119870), and an AYN Thor report showed it
