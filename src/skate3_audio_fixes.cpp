@@ -75,7 +75,11 @@
  *
  * The hooks below:
  *   - the five appenders run under the System lock, exactly the lock the drain
- *     takes, which serialises them against it and against each other.
+ *     takes, which serialises them against it and against each other. The
+ *     acquire NEVER blocks: these run on the game's own threads, and parking
+ *     one behind an audio worker that Android stopped mid-callback would trade
+ *     a glitch for a freeze. If the lock cannot be had, the append proceeds
+ *     exactly as it does today.
  *   - sub_82B3CD38 refuses a NULL descriptor instead of calling through it.
  *     Its callers all handle a 0 return (sub_82B29018 stores 255 at +344 and
  *     reports failure), so the guest takes its own error path. If this one
@@ -85,6 +89,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <thread>
 
 #include <rex/logging.h>
 
@@ -95,7 +100,7 @@ namespace {
 // System object layout, from sub_82B48530 (the queue drain) and sub_82B47E68
 // (the constructor).
 constexpr uint32_t kSysLockFn = 84;    // void (*)() - null on every build seen
-constexpr uint32_t kSysUnlockFn = 88;  // ditto
+constexpr uint32_t kSysUnlockFn = 88;  // unused: we only ever take the critical section
 constexpr uint32_t kSysCritSec = 96;   // RTL_CRITICAL_SECTION*, the real lock
 
 // PacketPlayer, from sub_82B28B78 (the SetFormat handler).
@@ -111,30 +116,45 @@ constexpr uint32_t kFormatTagCount = 2;  // 'P6L0', 'PFN0'
 // are worth printing.
 constexpr uint32_t kCreateDecoderReturn = 0x82B290AC;
 
-// Take and release the System lock the way sub_82B48530 does. The function
-// pointers at +84/+88 are null in this build, so this is the critical section
-// in practice, but honour them if a build ever sets them: the lock site passes
-// the System in r3, and the unlock site (faithfully) passes nothing.
-void SystemLock(PPCContext& __restrict ctx, uint8_t* base, uint32_t sys) {
-  const uint32_t lock_fn = REX_LOAD_U32(sys + kSysLockFn);
-  if (lock_fn != 0) {
-    ctx.r3.u64 = sys;
-    ctx.lr = kCreateDecoderReturn;  // any in-image return address
-    REX_CALL_INDIRECT_FUNC(lock_fn);
-    return;
+// How many times to try for the lock before giving up and appending without
+// it. The append is a dozen stores and the drain holds the lock only for the
+// commands already queued, so a few hundred attempts is far more than a live
+// holder ever needs.
+constexpr int kLockAttempts = 256;
+
+// Take the System lock WITHOUT ever blocking, and say whether we got it.
+//
+// Blocking here would be a new way to freeze the whole game. These appends run
+// on the game's own threads, which never touched this lock before; if the
+// audio worker is stopped while holding it - which is exactly what happens
+// when Android suspends the app mid-callback - a blocking acquire would park
+// the game thread behind a holder that is not running. Falling through
+// unlocked is precisely today's behaviour, so the worst case is the bug we
+// are fixing, not a hang.
+//
+// The custom lock at +84 is null on this title. If some build ever sets it we
+// cannot try-acquire a guest function, so leave that path alone rather than
+// risk blocking on it.
+bool SystemTryLock(PPCContext& __restrict ctx, uint8_t* base, uint32_t sys) {
+  if (REX_LOAD_U32(sys + kSysLockFn) != 0) {
+    return false;
   }
-  ctx.r3.u64 = REX_LOAD_U32(sys + kSysCritSec);
-  __imp__RtlEnterCriticalSection(ctx, base);
+  const uint32_t cs = REX_LOAD_U32(sys + kSysCritSec);
+  if (cs == 0) {
+    return false;
+  }
+  for (int attempt = 0; attempt < kLockAttempts; ++attempt) {
+    ctx.r3.u64 = cs;
+    __imp__RtlTryEnterCriticalSection(ctx, base);
+    if (ctx.r3.u32 != 0) {
+      return true;  // recursion is handled inside; one release balances this
+    }
+    std::this_thread::yield();
+  }
+  return false;
 }
 
 void SystemUnlock(PPCContext& __restrict ctx, uint8_t* base, uint32_t sys) {
-  const uint32_t unlock_fn = REX_LOAD_U32(sys + kSysUnlockFn);
-  if (unlock_fn != 0) {
-    ctx.r3.u64 = sys;
-    ctx.lr = kCreateDecoderReturn;
-    REX_CALL_INDIRECT_FUNC(unlock_fn);
-    return;
-  }
   ctx.r3.u64 = REX_LOAD_U32(sys + kSysCritSec);
   __imp__RtlLeaveCriticalSection(ctx, base);
 }
@@ -218,14 +238,16 @@ void RunUnderSystemLock(PPCContext& __restrict ctx, uint8_t* base, uint32_t sys,
     return;
   }
   const VolatileState saved(ctx);
-  SystemLock(ctx, base, sys);
+  const bool locked = SystemTryLock(ctx, base, sys);
   saved.Restore(ctx);
 
   original(ctx, base);
 
-  const VolatileState returned(ctx);
-  SystemUnlock(ctx, base, sys);
-  returned.Restore(ctx);
+  if (locked) {
+    const VolatileState returned(ctx);
+    SystemUnlock(ctx, base, sys);
+    returned.Restore(ctx);
+  }
 }
 
 }  // namespace
