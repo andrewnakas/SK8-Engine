@@ -882,6 +882,13 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     runtime_paths = std::move(installed_paths);
   }
 
+  // Say straight away whether the player's executable is the one this binary was
+  // compiled from. The title update is verified by pinned hash below; the base
+  // executable never was, and it is the file every static address in the
+  // recompiled code refers into. Checked here rather than in the installer so it
+  // also covers an install carried over from an earlier release.
+  skate3::VerifyBaseExecutable(runtime_paths.game_data_root);
+
 #if SKATE3_HAS_TITLE_UPDATE
   // This build executes Title Update 3 code; the game cannot boot without the
   // TU payloads staged next to the installed game files. Existing installs
