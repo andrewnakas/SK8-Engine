@@ -343,18 +343,42 @@ void ApplyUltrawideVideoDefaults() {
   double target_aspect = rex::cvar::HasNonDefaultValue("skate3_ultrawide_target_aspect")
                              ? REXCVAR_GET(skate3_ultrawide_target_aspect)
                              : 0.0;
+
+  const std::optional<DisplaySize> target_size = ResolveUltrawideTargetDisplaySize();
+  const double display_aspect =
+      target_size && target_size->width > 0 && target_size->height > 0
+          ? static_cast<double>(target_size->width) / static_cast<double>(target_size->height)
+          : 0.0;
+
   if (target_aspect <= kSixteenNineAspect + kUltrawideAspectEpsilon) {
-    const std::optional<DisplaySize> target_size = ResolveUltrawideTargetDisplaySize();
-    if (!target_size || target_size->width <= 0 || target_size->height <= 0) {
+    // Derive from the display.
+    if (display_aspect <= kSixteenNineAspect + kUltrawideAspectEpsilon) {
       return;
     }
-    target_aspect =
-        static_cast<double>(target_size->width) / static_cast<double>(target_size->height);
-    if (target_aspect <= kSixteenNineAspect + kUltrawideAspectEpsilon) {
-      return;
-    }
-    rex::cvar::SetFlagByName("skate3_ultrawide_target_aspect", std::to_string(target_aspect));
+    target_aspect = display_aspect;
+  } else if (display_aspect > kSixteenNineAspect + kUltrawideAspectEpsilon &&
+             target_aspect > display_aspect) {
+    // NEVER render wider than the screen can show. A guest output wider than
+    // the display is letterboxed straight back to fit, so every pixel past the
+    // display's own aspect costs fill rate and is then cropped away unseen -
+    // and it is not only wasted, it is harmful: the widening also patches the
+    // GAME's cull frustum (skate3_ultrawide_guest.h), and asking for more
+    // width than the view needs pushes geometry that belongs outside the frame
+    // into the cull test, where it flickers in and out at the widened
+    // boundary. Reported on a 19.5:9 phone set to 24:9 as map sections
+    // blinking, worse the wider the setting went.
+    //
+    // Clamping rather than refusing keeps the preset list honest on every
+    // device: "32:9" on a phone means "as wide as this phone gets", which is
+    // what a player picking the widest option is asking for.
+    REXLOG_INFO(
+        "skate3: ultrawide target aspect {:.4f} is wider than the display's {:.4f}; "
+        "clamping - a wider frame would be letterboxed back and widens the game's "
+        "cull frustum for pixels that are never shown",
+        target_aspect, display_aspect);
+    target_aspect = display_aspect;
   }
+  rex::cvar::SetFlagByName("skate3_ultrawide_target_aspect", std::to_string(target_aspect));
 
   // The native renderer draws true wide frames at this aspect (wide guest
   // output + Hor+ projection + centered 2D band). Emulated fallback frames
