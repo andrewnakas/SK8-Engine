@@ -671,14 +671,21 @@ extern "C" REX_FUNC(sub_82D19648) {
 extern "C" REX_FUNC(sub_82B7F828) {
   const int32_t size = int32_t(ctx.r7.u32);
   if (size < 0) {
+    // Report the neighbouring arguments too. The caller, sub_82B7F8A8, gets
+    // this size out of a struct that sub_82B7F998 fills, and it validates the
+    // fields at +96 and +116 for negative values while never checking the one
+    // that lands here. Printing r4/r5/r6 alongside says how far off the whole
+    // set is, which is what identifies the parse that produced it.
     uint64_t n = 0;
     if (ShouldLog(g_bad_buffer_size, &n)) {
       REXLOG_ERROR(
           "skate3-audio: buffer setup asked to zero {} bytes (size={:08X}) at "
           "guest {:08X}, from lr={:08X} - a negative byte count. Clamping to 0; "
           "unclamped this is the memset that walks 4 GB of guest memory and "
-          "kills the process (occurrence {})",
-          size, ctx.r7.u32, ctx.r6.u32, uint32_t(ctx.lr), n);
+          "kills the process. base={:08X} span={} total_buf={:08X} "
+          "(occurrence {})",
+          size, ctx.r7.u32, ctx.r6.u32, uint32_t(ctx.lr), ctx.r4.u32,
+          int32_t(ctx.r5.u32), ctx.r4.u32, n);
     }
     ctx.r7.u64 = 0;
   }
