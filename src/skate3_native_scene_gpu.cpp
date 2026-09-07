@@ -67,6 +67,7 @@
 #endif
 #include "skate3_native_scene_state.h"
 #include "skate3_crash_report.h"
+#include "skate3_image_watch.h"
 #include "skate3_native_scene_gpu_internal.h"
 
 // Cvars defined in skate3_native_scene.cpp (and SDK cvars re-declared there).
@@ -7623,6 +7624,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
           g_draws_2d.load(std::memory_order_relaxed),
           draws_all_now - s_beat_draws_all);
       s_beat_draws_all = draws_all_now;
+      // Same cadence: does the static image still match what was loaded?
+      skate3::image_watch::Tick(frames);
     }
   }
 

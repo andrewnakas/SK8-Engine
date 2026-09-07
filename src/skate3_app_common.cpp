@@ -35,6 +35,7 @@ REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
 #include "skate3_touch_controls.h"
 #include "skate3_native_scene.h"
 #include "skate3_crash_report.h"
+#include "skate3_image_watch.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
 #include "skate3_win_icon.h"
@@ -1109,6 +1110,11 @@ void Skate3BaseApp::OnPostSetup() {
   // freeze where the main thread is resumed and then simply never executes -
   // produced no thread dump at all, which is why that failure had no evidence.
   skate3::crash_report::StartWatchdogEarly();
+  // The base image and its title update are applied by now and the guest has
+  // not run: the one moment the static image is known-good. Snapshot it and
+  // make its read-only pages read-only, so the first write to any of them is
+  // caught with its writer (see skate3_image_watch.h).
+  skate3::image_watch::Install();
   // Before anything that might want to be measured, and after the cvars are
   // parsed, so an ios_args.txt that asks for diagnostics gets them from frame
   // one rather than from whenever the settings screen is first opened.

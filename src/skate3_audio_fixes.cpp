@@ -96,6 +96,7 @@
 #include <rex/logging.h>
 
 #include "generated/skate3_init.h"
+#include "skate3_image_watch.h"
 
 REXCVAR_DEFINE_BOOL(
     skate3_audio_repair_format_table, true, "Skate 3",
@@ -475,8 +476,29 @@ extern "C" REX_FUNC(sub_82B3CD38) {
                  : "Leaving it as found (skate3_audio_repair_format_table=false).");
     }
     if (repair) {
-      REX_STORE_U32(kFormatTagTable, kFormatTag0);
-      REX_STORE_U32(kFormatTagTable + 4, kFormatTag1);
+      // Show the whole damage first, then put the neighbourhood back from the
+      // copy taken right after load: the two tags AND the two "PacketPlayer"
+      // strings after them, which the player constructor hands out as names.
+      skate3::image_watch::DiffNow("codec-miss");
+      const uint32_t restored = skate3::image_watch::RestoreFromSnapshot(kFormatTagTable, 0x40);
+      if (skate3::image_watch::Installed() && restored == 0) {
+        // The table is corrupt AND matches the snapshot: the image was already
+        // wrong when it finished loading. That is the loader, not a writer.
+        REXLOG_ERROR(
+            "skate3-audio: the load-time snapshot ALREADY holds these bytes at {:08X} - the "
+            "image was wrong when loading finished, before any guest code ran. Compare the "
+            "'hash of the static image after load+patch' line against a working device",
+            kFormatTagTable);
+      } else if (restored != 0) {
+        REXLOG_ERROR("skate3-audio: restored {} byte(s) of {:08X}..{:08X} from the load-time "
+                     "snapshot",
+                     restored, kFormatTagTable, kFormatTagTable + 0x40);
+      }
+      if (REX_LOAD_U32(kFormatTagTable) != kFormatTag0 ||
+          REX_LOAD_U32(kFormatTagTable + 4) != kFormatTag1) {
+        REX_STORE_U32(kFormatTagTable, kFormatTag0);
+        REX_STORE_U32(kFormatTagTable + 4, kFormatTag1);
+      }
     }
   }
 

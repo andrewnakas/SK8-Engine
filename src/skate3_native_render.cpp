@@ -7,6 +7,7 @@
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_palette.h"
 #include "skate3_crash_report.h"
+#include "skate3_image_watch.h"
 #include "skate3_native_scene.h"
 
 #include "generated/skate3_init.h"
@@ -687,6 +688,9 @@ extern "C" REX_FUNC(sub_82B82E08) {
   // Liveness for the hang watchdog: this is the guest's own frame boundary, so
   // it stops exactly when the game stops producing frames.
   skate3::crash_report::Heartbeat();
+  // Drain the static-image write watch's trap records (logged here, off the
+  // fault handler) and re-arm its hot pages for the next frame.
+  skate3::image_watch::FlushPending();
   // Publish the guest base for the level picker, which reads the frontend's
   // selection cursor so it can walk menus with feedback instead of pressing
   // 'down' a fixed number of times.
