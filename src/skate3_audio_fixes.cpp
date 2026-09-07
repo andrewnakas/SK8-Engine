@@ -92,9 +92,27 @@
 #include <string>
 #include <thread>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include "generated/skate3_init.h"
+
+REXCVAR_DEFINE_BOOL(
+    skate3_audio_repair_format_table, true, "Skate 3",
+    "Put the two codec tags back when something has overwritten them.\n"
+    "\n"
+    "Two QCS8550 handhelds stop on a frontend screen and never load the world. "
+    "The cause is upstream in audio: the table the codec lookup indexes has "
+    "English text in it - 'd-forward and feed-back elements' - where a working "
+    "device has 'P6L0' and 'PFN0'. Both devices load the same default.xex this "
+    "build was compiled from and apply the title update successfully, so the "
+    "table is correct when the image loads and wrong by the time audio starts.\n"
+    "\n"
+    "This is a mitigation and not a fix: the write that put a sentence there "
+    "covered at least thirty-two bytes, this restores eight, and it will happen "
+    "again. What it buys is a device that gets past the frontend and can report "
+    "what else is broken. Turn it off to see the failure unrepaired.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace {
 
@@ -127,6 +145,40 @@ constexpr uint32_t kFormatTagTable = 0x8210A310;
 // the surrounding bytes says whether one entry was overwritten or the whole
 // region belongs to a different image.
 constexpr uint32_t kFormatTagReadable = 16;
+
+// The two tags this table is supposed to hold, and a switch to put them back.
+//
+// A Retroid Pocket 6 and an AYN Thor read the table as
+//
+//   ['d-fo','rwar','d an','d fe','ed-b','ack ','elem','ents']
+//
+// which is the sentence "d-forward and feed-back elements" - filter
+// terminology, so audio library text - sitting exactly where the codec tags
+// belong. A healthy device reads ['P6L0','PFN0','Pack','etPl','ayer',...].
+// So the 'rwar' those reports show was never a RenderWare four-character code;
+// it is the letters inside the word "forward".
+//
+// Both devices pass the default.xex check and apply the title update
+// successfully, so the image they load is the same file as the one this build
+// was compiled from. The table is therefore right when it is loaded and wrong
+// by the time audio starts: something writes over it at run time.
+//
+// Restoring it is a mitigation, not a cure. Whatever wrote that sentence wrote
+// at least thirty-two bytes and this puts back eight; anything else it landed
+// on stays broken, and the write will happen again. But the lookup that fails
+// here is retried every audio quantum, so repairing the two entries lets the
+// very next retry succeed, and a device that reaches the game is a device that
+// can report what else is wrong. The log says loudly what was found.
+constexpr uint32_t kFormatTag0 = 0x50364C30;  // 'P6L0'
+constexpr uint32_t kFormatTag1 = 0x50464E30;  // 'PFN0'
+
+std::atomic<uint64_t> g_table_repairs{0};
+
+// True when the table no longer holds the two tags it is built with.
+bool FormatTagTableIsCorrupt(uint8_t* base) {
+  return REX_LOAD_U32(kFormatTagTable) != kFormatTag0 ||
+         REX_LOAD_U32(kFormatTagTable + 4) != kFormatTag1;
+}
 
 // The byte the game ACTUALLY indexes the tag table with is not the one at
 // +352. sub_82B29018 reads it from *(*(player + 80) + 4):
@@ -400,6 +452,34 @@ extern "C" REX_FUNC(sub_82B1E458) {
 // A NULL descriptor here means a format lookup missed; calling through it
 // reads guest address 0 and dispatches to whatever that page holds.
 extern "C" REX_FUNC(sub_82B3CD38) {
+  // A null descriptor means the tag lookup missed. Before blaming the caller,
+  // check whether the table it searched still holds the tags this build was
+  // compiled with - on two devices it holds a sentence instead. Repairing it
+  // here works because this call is retried every audio quantum: the next
+  // retry indexes a table that is right again.
+  if (ctx.r3.u32 == 0 && FormatTagTableIsCorrupt(base)) {
+    std::string found;
+    DescribeFormatTagTable(base, found);
+    const bool repair = REXCVAR_GET(skate3_audio_repair_format_table);
+    uint64_t n = 0;
+    if (ShouldLog(g_table_repairs, &n)) {
+      REXLOG_ERROR(
+          "skate3-audio: the codec tag table at {:08X} has been overwritten "
+          "(occurrence {}). Found [{}]; this build was compiled with 'P6L0' and "
+          "'PFN0' at [0] and [1]. Something wrote over static image data at run "
+          "time - the executable itself matches, and the title update applied. "
+          "{}",
+          kFormatTagTable, n, found,
+          repair ? "Putting both entries back so the next retry can resolve; "
+                   "whatever else that write covered is still wrong."
+                 : "Leaving it as found (skate3_audio_repair_format_table=false).");
+    }
+    if (repair) {
+      REX_STORE_U32(kFormatTagTable, kFormatTag0);
+      REX_STORE_U32(kFormatTagTable + 4, kFormatTag1);
+    }
+  }
+
   if (ctx.r3.u32 != 0) {
     // Baseline for the failure below: on a device where audio works, say what
     // the first few decoders actually asked for. A report that carries both
