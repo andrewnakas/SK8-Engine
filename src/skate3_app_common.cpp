@@ -17,6 +17,10 @@
 #include "skate3_pack_select.h"
 #include "skate3_performance_profile.h"
 #include <rex/ui/windowed_app_context_sdl.h>
+// SDL_GetPrimaryDisplay / SDL_GetCurrentDisplayMode, for the display size
+// the ultrawide aspect is derived from off Windows. The context header above
+// only pulls SDL_events.h.
+#include <SDL3/SDL_video.h>
 
 REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, false, "Skate 3",
                     "Ask which content pack to load when several are installed. Off: the first "
@@ -270,8 +274,42 @@ std::optional<DisplaySize> QueryFullscreenMonitorSize() {
   return DisplaySize{width, height};
 }
 #else
+// Everywhere but Windows, ask SDL. This used to return nullopt unconditionally,
+// which quietly made "derive the aspect from the display" a no-op on Android
+// and macOS: ApplyUltrawideVideoDefaults would bail and the whole ultrawide
+// path stayed off however the cvar was set. SDL_INIT_VIDEO is up well before
+// OnConfigurePaths runs (windowed_app_main_sdl.cpp initialises it before
+// OnInitialize), so the display is there to be asked.
 std::optional<DisplaySize> QueryFullscreenMonitorSize() {
-  return std::nullopt;
+  SDL_DisplayID display = SDL_GetPrimaryDisplay();
+  // `monitor` is 1-based and desktop-only; 0 means "wherever the window lands".
+  const int32_t monitor_index = REXCVAR_GET(monitor);
+  if (monitor_index > 0) {
+    int display_count = 0;
+    if (SDL_DisplayID* displays = SDL_GetDisplays(&display_count)) {
+      if (monitor_index <= display_count) {
+        display = displays[monitor_index - 1];
+      }
+      SDL_free(displays);
+    }
+  }
+  if (display == 0) {
+    return std::nullopt;
+  }
+  // The current mode, not the desktop mode: on a phone these are the same, and
+  // where they differ the current one is what is actually being scanned out.
+  const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
+  if (mode == nullptr || mode->w <= 0 || mode->h <= 0) {
+    return std::nullopt;
+  }
+  // Android reports the panel in its natural portrait orientation on some
+  // devices even when the activity is landscape-locked. The game is always
+  // landscape, so take the long edge as the width rather than trusting the
+  // order - a portrait reading would compute an aspect below 16:9 and silently
+  // disable the widening.
+  const int32_t long_edge = std::max(mode->w, mode->h);
+  const int32_t short_edge = std::min(mode->w, mode->h);
+  return DisplaySize{long_edge, short_edge};
 }
 #endif
 

@@ -118,9 +118,16 @@ constexpr uint32_t kCreateDecoderReturn = 0x82B290AC;
 
 // How many times to try for the lock before giving up and appending without
 // it. The append is a dozen stores and the drain holds the lock only for the
-// commands already queued, so a few hundred attempts is far more than a live
+// commands already queued, so a handful of attempts is far more than a live
 // holder ever needs.
-constexpr int kLockAttempts = 256;
+//
+// This was 256. The uncontended case takes the lock on the first attempt and
+// never yields, so that number only ever showed up under real contention -
+// but there it is 256 yields, and each yield is a syscall, on one of the
+// game's own threads. Falling through unlocked is safe by design (see above),
+// so spinning long enough to outlast a stalled holder buys nothing: it just
+// makes the bad case more expensive than the fallback it is avoiding.
+constexpr int kLockAttempts = 16;
 
 // Take the System lock WITHOUT ever blocking, and say whether we got it.
 //
