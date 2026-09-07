@@ -287,6 +287,7 @@ include(cmake/CodegenTargets.cmake)
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
+    src/skate3_audio_fixes.cpp
     src/skate3_crash_report.cpp
     src/skate3_demo_path.cpp
     src/skate3_diagnostics.cpp
