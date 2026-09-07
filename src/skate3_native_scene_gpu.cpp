@@ -7597,6 +7597,36 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
   }
   const uint64_t interval = uint64_t(
       std::max(60, REXCVAR_GET(skate3_native_render_scene_perf_interval)));
+  // A thirty-second heartbeat at WARN, so it survives the shipped log level.
+  //
+  // Every instrument that says what the renderer is putting on screen logs at
+  // INFO, and shipped builds log at warn - so a tester report comes back with a
+  // clean log for a device the player describes as hung on a menu, and there is
+  // no way to tell "frozen" from "running but not drawing the world" from
+  // "drawing a world the player cannot see". An AYN Thor report cost a round to
+  // exactly that: its living world was updating sixty times a second for four
+  // minutes and the log could not say what was on screen.
+  //
+  // One short line per thirty seconds is nothing against a 256 KB report tail,
+  // and it answers the question directly: items and draws are the world, 2d is
+  // the menu and HUD layer, and a frame counter that stops moving is a freeze.
+  {
+    static uint64_t s_beat_frame = 0;
+    static uint64_t s_beat_draws_all = 0;
+    if (frames - s_beat_frame >= 1800) {  // ~30 s at 60 fps
+      s_beat_frame = frames;
+      const uint64_t draws_all_now = g_draws_all.load(std::memory_order_relaxed);
+      REXLOG_WARN(
+          "native-scene: alive frame={} items={} draws={} draws_2d={} "
+          "draws_since_last={}",
+          frames, scene.items.size(), drawn,
+          g_draws_2d.load(std::memory_order_relaxed),
+          draws_all_now - s_beat_draws_all);
+      s_beat_draws_all = draws_all_now;
+    }
+  }
+
+
   if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     // CPU-side perf snapshot for this window. guest_fps is derived
     // from the guest frame interval; capture/build run on the guest render

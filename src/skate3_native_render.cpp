@@ -61,8 +61,9 @@ REXCVAR_DEFINE_DOUBLE(skate3_guest_fps_cap, 0.0, "Skate 3",
                       "turns that variance into visible irregular judder that no content "
                       "smoothing can fix. An even cap a few fps below the display refresh "
                       "(e.g. 140 on a 144 Hz panel) is the standard VRR recipe: every "
-                      "frame arrives on a steady beat. Precise pacing: coarse sleep to "
-                      "~1.5 ms before the target, then spin.")
+                      "frame arrives on a steady beat. Pacing is an absolute-deadline "
+                      "sleep to the target, with skate3_guest_fps_cap_spin_us of spin "
+                      "on the tail.")
     .range(0.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, true, "Skate 3",
@@ -79,6 +80,27 @@ REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, true, "Skate 3",
                     "landing inside the panel's minimum refresh period tears even "
                     "under VRR. Overrides skate3_guest_fps_cap while the display "
                     "refresh is known.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_guest_fps_cap_spin_us, 300, "Skate 3",
+    "How long the frame cap spins at the end of its wait, in microseconds.\n"
+    "\n"
+    "This was a hard-coded 2000 us. Measured on a Galaxy S23 FE during "
+    "gameplay, that put sched_yield at 14.4% of the guest render thread's "
+    "cycles - an eighth of every frame - while a scheduler trace of the same "
+    "session showed the emulated command processor runnable with no core for "
+    "7.8 of 50 seconds. The spin holds a performance core to do nothing while "
+    "the thread the next frame is waiting for is queued behind it.\n"
+    "\n"
+    "The long window bought nothing: Android gives a thread 50 us of timer "
+    "slack by default, so a multi-millisecond sleep already lands inside a few "
+    "hundred microseconds of its deadline and the rest was pure yielding. "
+    "0 disables the spin "
+    "entirely and sleeps the whole way, which is fine under vsync - the cap is "
+    "there to stop the guest running AHEAD of the panel, not to hit a deadline "
+    "to the microsecond. Raise it if frames start landing late on a device "
+    "whose scheduler wakes threads slowly.")
+    .range(0, 4000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_render {
@@ -402,23 +424,33 @@ void PaceGuestFrame() {
     s_next = now + interval;
     return;
   }
-  // Coarse sleep to just before the target, then spin for precision.
+  // Sleep to the deadline; spin only the last few hundred microseconds.
   //
-  // The spin window was 2 ms, chosen against a 33 ms period. At 16.6 ms that
-  // is an eighth of the frame spent yielding on the guest render thread - and
-  // on a phone with two performance cores, that thread yielding in a loop is
-  // not free time, it is time taken from the command processor sharing those
-  // cores. Sleep closer and spin briefly; sleep_for's overshoot is what the
-  // spin covers, and it does not need milliseconds of runway.
-  constexpr auto kSpinWindow = std::chrono::milliseconds(2);
-  while (true) {
-    const auto remaining = s_next - std::chrono::steady_clock::now();
-    if (remaining <= std::chrono::steady_clock::duration::zero()) {
-      break;
-    }
-    if (remaining > kSpinWindow) {
-      std::this_thread::sleep_for(remaining - kSpinWindow);
-    } else if (remaining > std::chrono::microseconds(50)) {
+  // The spin window was 2 ms against a 16.6 ms period - an eighth of every
+  // frame spent in a yield loop on the guest render thread. A simpleperf
+  // profile of that thread during gameplay put `sched_yield` at 14.4% of its
+  // cycles, all of it from here, while a Perfetto trace of the same session
+  // showed the emulated command processor RUNNABLE WITH NO CORE for 7.8 of 50
+  // seconds. The two facts are the same fact: this loop holds a big core to do
+  // nothing while the thread the next frame waits on is queued behind it.
+  //
+  // Both the old code and this one sleep once and then spin the tail, so the
+  // only question is how long the tail has to be. Android sets a 50 us timer
+  // slack per thread by default and a sleep of a few milliseconds lands well
+  // inside a few hundred microseconds of its deadline, so 2000 us of runway
+  // was never buying accuracy - it was 2000 us of yielding. And the accuracy
+  // barely matters here: under vsync the presenter blocks on the panel anyway,
+  // and this cap exists to stop the guest running AHEAD of the display, not to
+  // hit a deadline to the microsecond. Raise the cvar on a device whose
+  // scheduler wakes threads late.
+  const auto spin_window =
+      std::chrono::microseconds(REXCVAR_GET(skate3_guest_fps_cap_spin_us));
+  const auto wake_at = s_next - spin_window;
+  if (std::chrono::steady_clock::now() < wake_at) {
+    std::this_thread::sleep_until(wake_at);
+  }
+  if (spin_window.count() > 0) {
+    while (std::chrono::steady_clock::now() < s_next) {
       std::this_thread::yield();
     }
   }

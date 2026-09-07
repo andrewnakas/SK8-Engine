@@ -89,6 +89,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <thread>
 
 #include <rex/logging.h>
@@ -109,7 +110,40 @@ constexpr uint32_t kPlayerRate = 340;      // float
 constexpr uint32_t kPlayerChannels = 351;  // u8
 constexpr uint32_t kPlayerFormat = 352;    // u8, indexes the tag table below
 constexpr uint32_t kFormatTagTable = 0x8210A310;
-constexpr uint32_t kFormatTagCount = 2;  // 'P6L0', 'PFN0'
+// How many entries of the tag table to treat as printable. NOT a claim about
+// how many formats exist: an earlier version of this file asserted the table
+// held exactly two ('P6L0', 'PFN0') and printed "valid: 0-1" beside every
+// failure, which made an AYN Thor report reading byte=1 look like an
+// out-of-range index. It was not. The same byte succeeds on a working device,
+// and that device's registry holds FOURTEEN formats - 'Esp0','PFN0','P8U0',
+// 'P8S0','P2L0','P2B0','P6L0','P6B0','MP30','L32S','L32P','EL31','EXm0',
+// 'Xas1'. The table is read directly instead, and what the log now compares is
+// the tag the index resolved to against the tags actually registered.
+constexpr uint32_t kFormatTagReadable = 16;
+
+// The byte the game ACTUALLY indexes the tag table with is not the one at
+// +352. sub_82B29018 reads it from *(*(player + 80) + 4):
+//
+//   lwz  r30,80(r3)      ; the stream/source object
+//   lbz  r10,4(r30)      ; the codec index
+//   lwzx r9,r7,r8        ; table_8210A310[index]
+//
+// sub_82B28B78 writes both from the same command record, so they agree while
+// the queue is intact and disagree exactly when it is not. An AYN Thor report
+// showed the +352 copy reading 1 and resolving to tag 'rwar', which is not one
+// of the two formats this title registers - so the report could not say
+// whether the byte was wrong or the registry was short. Printing both, plus
+// the registry itself, separates those two for the next report.
+constexpr uint32_t kPlayerSource = 80;   // -> the object holding the codec index
+constexpr uint32_t kSourceFormat = 4;    // u8, the index actually used
+
+// The System's format registry: sub_82B488D0 stores it at System+60 and
+// sub_82B48840 hands it back. Its list head is at +0; each link p is preceded
+// by its descriptor (desc = p - 16), whose four-character codec tag lives at
+// desc + 20, i.e. p + 4. sub_82B29018 walks exactly this.
+constexpr uint32_t kSysFormatRegistry = 60;
+constexpr uint32_t kRegistryTagFromLink = 4;
+constexpr int kRegistryWalkMax = 32;  // a title with 2 entries; a cap, not a size
 
 // The return address inside sub_82B29018, i.e. "this call came from
 // PacketPlayer::CreateDecoder", which is the only caller whose object fields
@@ -176,6 +210,49 @@ bool ShouldLog(std::atomic<uint64_t>& counter, uint64_t* out_n) {
 }
 
 std::atomic<uint64_t> g_null_desc{0};
+std::atomic<uint64_t> g_decoder_ok{0};
+std::atomic<uint64_t> g_named_lookup_miss{0};
+std::atomic<uint64_t> g_bad_buffer_size{0};
+
+// Render the System's registered codec tags into a caller-supplied buffer, as
+// "'P6L0','PFN0'". Every load is bounds-checked against the guest address
+// space and the walk is capped, because this runs on a path that has already
+// established that something is wrong.
+void DescribeFormatRegistry(uint8_t* base, uint32_t sys, std::string& out) {
+  out.clear();
+  if (sys == 0) {
+    out = "<no system>";
+    return;
+  }
+  const uint32_t registry = REX_LOAD_U32(sys + kSysFormatRegistry);
+  if (registry == 0) {
+    out = "<registry null - none registered>";
+    return;
+  }
+  uint32_t link = REX_LOAD_U32(registry);
+  int n = 0;
+  while (link >= 0x10000 && n < kRegistryWalkMax) {
+    const uint32_t tag = REX_LOAD_U32(link + kRegistryTagFromLink);
+    char quad[8] = {};
+    for (int i = 0; i < 4; ++i) {
+      const char c = char((tag >> (8 * (3 - i))) & 0xFF);
+      quad[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    if (!out.empty()) {
+      out += ',';
+    }
+    out += '\'';
+    out += quad;
+    out += '\'';
+    link = REX_LOAD_U32(link);
+    ++n;
+  }
+  if (n == 0) {
+    out = "<empty>";
+  } else if (n >= kRegistryWalkMax) {
+    out += ",...";
+  }
+}
 
 // Volatile guest state the lock helpers may disturb. RtlEnterCriticalSection
 // is a host implementation that only writes r3, but the +84/+88 function
@@ -284,6 +361,34 @@ extern "C" REX_FUNC(sub_82B1E458) {
 // reads guest address 0 and dispatches to whatever that page holds.
 extern "C" REX_FUNC(sub_82B3CD38) {
   if (ctx.r3.u32 != 0) {
+    // Baseline for the failure below: on a device where audio works, say what
+    // the first few decoders actually asked for. A report that carries both
+    // this and the failure names the difference directly instead of leaving
+    // "is the byte wrong, or is the format missing" open for another round.
+    uint64_t ok = 0;
+    if (ShouldLog(g_decoder_ok, &ok) && ok <= 16 &&
+        uint32_t(ctx.lr) == kCreateDecoderReturn && ctx.r31.u32 != 0) {
+      const uint32_t player = ctx.r31.u32;
+      const uint32_t source = REX_LOAD_U32(player + kPlayerSource);
+      const uint32_t used = source != 0 ? REX_LOAD_U8(source + kSourceFormat) : 0xFFu;
+      const uint32_t stored = REX_LOAD_U8(player + kPlayerFormat);
+      uint32_t ok_tag = 0;
+      if (used < kFormatTagReadable) {
+        ok_tag = REX_LOAD_U32(kFormatTagTable + used * 4);
+      }
+      char ok_quad[8] = {};
+      for (int i = 0; i < 4; ++i) {
+        const char c = char((ok_tag >> (8 * (3 - i))) & 0xFF);
+        ok_quad[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+      }
+      std::string registry;
+      DescribeFormatRegistry(base, REX_LOAD_U32(player + kPlayerSystem), registry);
+      REXLOG_WARN(
+          "skate3-audio: decoder OK (occurrence {}) player={:08X} format byte={} "
+          "(stored copy {}), tag={:08X} '{}', channels={}, registry=[{}]",
+          ok, player, used, stored, ok_tag, static_cast<const char*>(ok_quad),
+          REX_LOAD_U8(player + kPlayerChannels), registry);
+    }
     __imp__sub_82B3CD38(ctx, base);
     return;
   }
@@ -296,28 +401,160 @@ extern "C" REX_FUNC(sub_82B3CD38) {
       // produced the miss can be printed. Anything but 0 or 1 is the race.
       const uint32_t player = ctx.r31.u32;
       const uint32_t format = REX_LOAD_U8(player + kPlayerFormat);
+      // The index the lookup actually used, and the tag it actually resolved
+      // to. The previous version of this line printed only the +352 copy and
+      // only tags it could find in the two-entry table, so an out-of-range
+      // index printed tag=00000000 and an in-range one printed a tag the
+      // lookup may never have seen. Print what the game read.
+      const uint32_t source = REX_LOAD_U32(player + kPlayerSource);
+      const uint32_t used = source != 0 ? REX_LOAD_U8(source + kSourceFormat) : 0xFFu;
       const uint32_t channels = REX_LOAD_U8(player + kPlayerChannels);
       const uint32_t rate_bits = REX_LOAD_U32(player + kPlayerRate);
       float rate = 0.0f;
       __builtin_memcpy(&rate, &rate_bits, sizeof(rate));
       uint32_t tag = 0;
-      if (format < kFormatTagCount) {
-        tag = REX_LOAD_U32(kFormatTagTable + format * 4);
+      if (used < kFormatTagReadable) {
+        tag = REX_LOAD_U32(kFormatTagTable + used * 4);
       }
+      char quad[8] = {};
+      for (int i = 0; i < 4; ++i) {
+        const char c = char((tag >> (8 * (3 - i))) & 0xFF);
+        quad[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+      }
+      // What IS registered. If the tag the index resolves to appears here the
+      // lookup should have hit, and the fault is in the walk, not the byte;
+      // if it does not, the byte is garbage or the registry never got its
+      // entries - and an empty registry says which.
+      std::string registry;
+      DescribeFormatRegistry(base, REX_LOAD_U32(player + kPlayerSystem), registry);
       REXLOG_ERROR(
           "skate3-audio: decoder requested with a NULL format descriptor "
           "(occurrence {}), from PacketPlayer::CreateDecoder player={:08X}: "
-          "format byte={} (valid: 0-{}), tag={:08X}, channels={}, rate={} - "
-          "returning failure instead of calling through guest address 0",
-          n, player, format, kFormatTagCount - 1, tag, channels, rate);
+          "format byte={} (used; stored copy {}), tag={:08X} '{}', "
+          "channels={}, rate={}, registry=[{}] - the tag is what the lookup "
+          "searched for; if it is absent from the registry the registration is "
+          "the fault, not the byte. Returning failure instead of calling "
+          "through guest address 0",
+          n, player, used, format, tag,
+          static_cast<const char*>(quad), channels, rate, registry);
     } else {
+      // The other lookup. sub_82B33D40 keys the same registry off a codec id
+      // through a DIFFERENT table (0x82119870), and an AYN Thor report showed it
+      // failing here too, with channels=1 and 5 and an r5 that is not a sample
+      // rate. Two independent lookups missing the same registry is worth
+      // separating from one bad index, so dump the registry on this path as
+      // well - the System is reachable from r31 in this caller the same way.
+      std::string registry;
+      const uint32_t maybe_sys = ctx.r31.u32 != 0
+                                     ? REX_LOAD_U32(ctx.r31.u32 + kPlayerSystem)
+                                     : 0;
+      DescribeFormatRegistry(base, maybe_sys, registry);
       REXLOG_ERROR(
           "skate3-audio: decoder requested with a NULL format descriptor "
-          "(occurrence {}), guest lr={:08X}, channels={}, rate={:08X} - "
-          "returning failure instead of calling through guest address 0",
-          n, lr, ctx.r4.u32, ctx.r5.u32);
+          "(occurrence {}), guest lr={:08X}, r4={} r5={:08X}, r31={:08X}, "
+          "registry=[{}] - returning failure instead of calling through guest "
+          "address 0",
+          n, lr, ctx.r4.u32, ctx.r5.u32, ctx.r31.u32, registry);
     }
   }
 
   ctx.r3.u64 = 0;
+}
+
+// rw::core named-object lookup: sub_82D19648(r3 = the collection, r4 = the
+// name, r5, r6) walks a list calling sub_82D1B5B8 per entry and returns the
+// match, or 0.
+//
+// This is here because of what a NULL return did on an AYN Thor. In
+// sub_82B95620 the game formats a name into a stack buffer and looks it up:
+//
+//   sub_82861930(r1+80, 256, 256, fmt, *0x82FE1FF4)   ; snprintf
+//   sub_82D19648(r3 = this, r4 = r1+80, ...)          ; find it
+//   lwz r9,0(r3)                                      ; r3 is 0
+//   lwz r8,20(r9)  /  mtctr r8  /  bctrl              ; call *(0 + 20)
+//
+// so the miss becomes "Call to invalid or unregistered function at guest
+// address 0x00000000, guest lr=0x82B9568C", with r31 = 0 - which is the
+// signature the Thor filled its log with, twice per run, ten seconds after the
+// audio format lookup failed the same way. The report could name the fault but
+// not the object, because the name never reached the log.
+//
+// The hook does nothing but read the name back on a miss. It is bounded to the
+// first misses of a session: this lookup is generic and a miss is a legitimate
+// answer for a caller that is only testing existence, so unbounded logging
+// would be its own performance bug.
+extern "C" REX_FUNC(sub_82D19648) {
+  const uint32_t name_ptr = ctx.r4.u32;
+  const uint32_t lr = uint32_t(ctx.lr);
+  __imp__sub_82D19648(ctx, base);
+  if (ctx.r3.u32 != 0) {
+    return;
+  }
+  uint64_t n = 0;
+  if (!ShouldLog(g_named_lookup_miss, &n) || n > 24) {
+    return;
+  }
+  char name[96] = {};
+  if (name_ptr >= 0x10000) {
+    for (int i = 0; i < 95; ++i) {
+      const char c = char(REX_LOAD_U8(name_ptr + uint32_t(i)));
+      if (c == '\0') {
+        break;
+      }
+      name[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+  }
+  REXLOG_WARN(
+      "skate3-audio: named lookup MISS (occurrence {}) name='{}' from guest "
+      "lr={:08X} - the caller dereferences this result without checking it",
+      n, static_cast<const char*>(name), lr);
+}
+
+// rw::audio buffer setup: sub_82B7F828(r3 = the descriptor, r4, r5,
+// r6 = buffer, r7 = size in bytes).
+//
+// It records the buffer and its size into the descriptor and then zeroes the
+// buffer:
+//
+//   stw r6,0(r3)      ; desc->buffer = r6
+//   stw r7,8(r3)      ; desc->size   = r7
+//   cmplwi cr6,r6,0
+//   beq   cr6,0x82b7f870
+//   mr r5,r7 / li r4,0 / mr r3,r6
+//   bl 0x82f52040     ; memset(buffer, 0, size)
+//
+// THIS IS THE AYN THOR CRASH. Five tombstones across three builds, including
+// v0.1.12, are all the same: SIGSEGV on `render_thread` four to seven minutes
+// in, escalated to SIGABRT by ART's signal chain. The engine's own fault report
+// names the site exactly - WRITE to guest 0x70000000, `guest lr=0x82B7F870`,
+// which is the return address of that memset call, with `r5 = r7 = 0xFFFFFFF4`.
+//
+// The size is -12. sub_82F52040 is a normal PowerPC memset: it takes the count
+// as UNSIGNED, computes a 16-byte block count of `size >> 4` - and the crash
+// dump's `r0 = 0x0FFFFFFF` is exactly 0xFFFFFFF4 >> 4 - then stores its way
+// through 4.29 GB of guest address space until it reaches memory that is
+// reserved but not committed, and dies there. 0x70000000 is not a meaningful
+// address; it is simply how far it got.
+//
+// A negative size cannot be legitimate: the argument is a byte count and the
+// whole guest space is 4 GB. Clamping it to zero leaves the descriptor in a
+// coherent state (a buffer of zero length, which its callers already handle -
+// sub_82B7F8A8 tests this family of results for negative values before using
+// them) and turns a session-ending crash into one logged line naming the
+// caller, which is what the next report needs to find whoever computed -12.
+extern "C" REX_FUNC(sub_82B7F828) {
+  const int32_t size = int32_t(ctx.r7.u32);
+  if (size < 0) {
+    uint64_t n = 0;
+    if (ShouldLog(g_bad_buffer_size, &n)) {
+      REXLOG_ERROR(
+          "skate3-audio: buffer setup asked to zero {} bytes (size={:08X}) at "
+          "guest {:08X}, from lr={:08X} - a negative byte count. Clamping to 0; "
+          "unclamped this is the memset that walks 4 GB of guest memory and "
+          "kills the process (occurrence {})",
+          size, ctx.r7.u32, ctx.r6.u32, uint32_t(ctx.lr), n);
+    }
+    ctx.r7.u64 = 0;
+  }
+  __imp__sub_82B7F828(ctx, base);
 }

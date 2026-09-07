@@ -4826,6 +4826,132 @@ void OnSetStreamSource(uint32_t stream, uint32_t vb_obj, uint32_t offset, uint32
   }
 }
 
+// One cached read of a shader object's debug path (guest object + 0x54).
+//
+// OnDrawDone classifies draws by matching needles against this path, and it did
+// so in five independent places, each of which read 119 bytes out of guest
+// memory ONE BYTE AT A TIME and then ran strstr over the result - for every
+// draw, of every frame. Two of the five cached their answer; three did not.
+//
+// Measured on a Galaxy S23 FE with the v0.1.14 build: `twoway_strstr` was 4.3%
+// of the guest render thread's cycles over a whole run and **14% inside the
+// streaming hitches**, where it was the single largest entry. The guest byte
+// loop feeding it is additional and is not counted in that figure.
+//
+// A shader object's path does not change, so read it once and let the callers
+// match against a host copy. The risk this takes is the one the per-site caches
+// already took: a freed guest object whose address is reused by a different
+// shader would answer with the old path. That is bounded here in a way it was
+// not before - the table is dropped wholesale every kShaderPathCacheFrames and
+// whenever it outgrows its cap, where the old per-site caches held their
+// answers for the life of the process.
+//
+// Returns nullptr when the object is unreadable or its path is empty, which is
+// what every caller treated as "no match" anyway.
+constexpr uint64_t kShaderPathCacheFrames = 1800;  // ~30 s at 60 fps
+constexpr size_t kShaderPathCacheCap = 8192;
+
+// Age a per-shader classification memo. Call this BEFORE looking a key up.
+//
+// Two things are wrong with how these memos were bounded. They stopped
+// inserting once they reached a cap (1024, 4096) and then rescanned everything
+// they had not already seen for the rest of the session - which is most of what
+// the strstr profile was measuring. And they never expired, so a freed guest
+// object whose address was reused by a different shader kept its old
+// classification for the life of the process.
+//
+// Dropping the whole table costs one rebuild and fixes both. The cadence
+// matches ShaderDebugPath's own, so a classification can never outlive the path
+// it was derived from.
+template <typename Map>
+void AgeShaderMemo(Map& memo, uint64_t& stamp) {
+  const uint64_t frame_now = g_guest_frame;
+  if (frame_now - stamp > kShaderPathCacheFrames || memo.size() >= kShaderPathCacheCap) {
+    memo.clear();
+    stamp = frame_now;
+  }
+}
+
+const char* ShaderDebugPath(uint8_t* base, uint32_t obj) {
+  if (obj < 0x10000) {
+    return nullptr;
+  }
+  static std::unordered_map<uint32_t, std::array<char, 120>> cache;
+  static uint64_t cache_frame = 0;
+  const uint64_t frame_now = g_guest_frame;
+  if (frame_now - cache_frame > kShaderPathCacheFrames ||
+      cache.size() >= kShaderPathCacheCap) {
+    cache.clear();
+    cache_frame = frame_now;
+  }
+  const auto it = cache.find(obj);
+  if (it != cache.end()) {
+    return it->second[0] != '\0' ? it->second.data() : nullptr;
+  }
+  std::array<char, 120> text{};
+  if (GuestReadableApprox(base, obj)) {
+    for (int k = 0; k < 119; ++k) {
+      text[k] = char(REX_LOAD_U8(obj + 0x54 + uint32_t(k)));
+      if (text[k] == '\0') {
+        break;
+      }
+    }
+  }
+  const auto ins = cache.emplace(obj, text).first;
+  return ins->second[0] != '\0' ? ins->second.data() : nullptr;
+}
+
+// Memoised "does this shader object's debug path contain this needle".
+//
+// Caching the path read was not enough. The material probes below each run
+// until their capture succeeds FOR THE FRAME, and over most of the map it never
+// does - there is no water, no ocean, no scrolling sign in view - so they matched
+// against every draw's shader path on every frame, forever. bionic's strstr
+// builds a two-way shift table per call, which is why a profile of the render
+// thread still put `twoway_strstr` at 5% of its cycles with the read already
+// free, and at 14% inside the streaming hitches.
+//
+// Needles here are string literals, so their address identifies them; a small
+// registry folds (object, needle) into one key. An unreadable path is NOT
+// memoised, so an object still loading gets another chance.
+bool ShaderPathHas(uint8_t* base, uint32_t obj, const char* needle) {
+  constexpr int kMaxNeedles = 16;
+  static const char* needles[kMaxNeedles] = {};
+  static int needle_count = 0;
+  int id = -1;
+  for (int i = 0; i < needle_count; ++i) {
+    if (needles[i] == needle) {
+      id = i;
+      break;
+    }
+  }
+  if (id < 0) {
+    if (needle_count >= kMaxNeedles) {
+      // More distinct needles than expected: fall back to matching directly
+      // rather than silently answering from the wrong key.
+      const char* text = ShaderDebugPath(base, obj);
+      return text != nullptr && std::strstr(text, needle) != nullptr;
+    }
+    id = needle_count++;
+    needles[id] = needle;
+  }
+  static std::unordered_map<uint64_t, bool> memo;
+  static uint64_t memo_frame = 0;
+  AgeShaderMemo(memo, memo_frame);
+  const uint64_t key = (uint64_t(obj) << 8) | uint64_t(id);
+  const auto it = memo.find(key);
+  if (it != memo.end()) {
+    return it->second;
+  }
+  const char* text = ShaderDebugPath(base, obj);
+  if (text == nullptr) {
+    return false;
+  }
+  const bool hit = std::strstr(text, needle) != nullptr;
+  memo.emplace(key, hit);
+  return hit;
+}
+
 void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t r6,
                 uint32_t r7) {
   g_draw_seq.fetch_add(1, std::memory_order_relaxed);
@@ -4919,28 +5045,22 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       // families that share the c10.x/c11.y layout are eligible.
       const auto env_receiver_ps = [&]() -> bool {
         const auto check = [&](uint32_t obj) -> int {  // 0 unknown, 1 no, 2 yes
-          if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
-            return 0;
-          }
-          static std::unordered_map<uint32_t, int> cache;
-          auto it = cache.find(obj);
-          if (it != cache.end()) {
+          static std::unordered_map<uint32_t, int> memo;
+          static uint64_t memo_frame = 0;
+          AgeShaderMemo(memo, memo_frame);
+          const auto it = memo.find(obj);
+          if (it != memo.end()) {
             return it->second;
           }
-          char text[120] = {};
-          for (int k = 0; k < 119; ++k) {
-            text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-            if (text[k] == '\0') break;
+          const char* text = ShaderDebugPath(base, obj);
+          if (text == nullptr) {
+            return 0;  // unreadable or empty: unknown, and not memoised
           }
           const bool hit = std::strstr(text, "\\baseenvironment") != nullptr ||
                            std::strstr(text, "\\defaultenvironment") != nullptr ||
                            std::strstr(text, "\\decalenvironment") != nullptr;
-          // Empty/garbled paths stay unknown (0) and are not cached-in as
-          // negatives forever.
-          const int result = text[0] == '\0' ? 0 : (hit ? 2 : 1);
-          if (result != 0 && cache.size() < 4096) {
-            cache.emplace(obj, result);
-          }
+          const int result = hit ? 2 : 1;
+          memo.emplace(obj, result);
           return result;
         };
         const int a = check(g_cur_ps_obj.load(std::memory_order_relaxed));
@@ -5028,15 +5148,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       if (!g_water_frame_done && ps_bank != 0) {
         const auto water_ps = [&]() -> bool {
           const auto check = [&](uint32_t obj) -> bool {
-            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
-              return false;
-            }
-            char text[120] = {};
-            for (int k = 0; k < 119; ++k) {
-              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-              if (text[k] == '\0') break;
-            }
-            return std::strstr(text, "\\flowingwateralpha") != nullptr;
+            return ShaderPathHas(base, obj, "\\flowingwateralpha");
           };
           return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
                  check(g_cur_vs_obj.load(std::memory_order_relaxed));
@@ -5094,15 +5206,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       if (!g_scroll_frame_done && ps_bank != 0) {
         const auto scroll_ps = [&]() -> bool {
           const auto check = [&](uint32_t obj) -> bool {
-            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
-              return false;
-            }
-            char text[120] = {};
-            for (int k = 0; k < 119; ++k) {
-              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-              if (text[k] == '\0') break;
-            }
-            return std::strstr(text, "\\scrollincandescent") != nullptr;
+            return ShaderPathHas(base, obj, "\\scrollincandescent");
           };
           return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
                  check(g_cur_vs_obj.load(std::memory_order_relaxed));
@@ -5132,15 +5236,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       if ((!g_ocean_frame_done || !g_oceanrefl_frame_done) && ps_bank != 0) {
         const auto ps_name_has = [&](const char* needle) -> bool {
           const auto check = [&](uint32_t obj) -> bool {
-            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
-              return false;
-            }
-            char text[120] = {};
-            for (int k = 0; k < 119; ++k) {
-              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-              if (text[k] == '\0') break;
-            }
-            return std::strstr(text, needle) != nullptr;
+            return ShaderPathHas(base, obj, needle);
           };
           return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
                  check(g_cur_vs_obj.load(std::memory_order_relaxed));
@@ -5299,14 +5395,15 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
             return 0;
           }
           static std::unordered_map<uint32_t, int> cache;
+          static uint64_t cache_frame = 0;
+          AgeShaderMemo(cache, cache_frame);
           auto it = cache.find(obj);
           if (it != cache.end()) {
             return it->second;
           }
-          char text[96] = {};
-          for (int k = 0; k < 95; ++k) {
-            text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-            if (text[k] == '\0') break;
+          const char* text = ShaderDebugPath(base, obj);
+          if (text == nullptr) {
+            return 0;
           }
           int fam = 0;
           if (std::strstr(text, "\\tree_defaultPS") != nullptr ||
@@ -5441,20 +5538,19 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       }
       // Guest-render-thread only (like the fog capture globals).
       static std::unordered_map<uint32_t, bool> cache;
+      static uint64_t cache_frame = 0;
+      AgeShaderMemo(cache, cache_frame);
       auto it = cache.find(obj);
       if (it != cache.end()) {
         return it->second;
       }
       // Debug path at +0x54, e.g. ".../blur_hBlurPS.updb".
-      char text[96] = {};
-      for (int k = 0; k < 95; ++k) {
-        text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-        if (text[k] == '\0') break;
+      const char* text = ShaderDebugPath(base, obj);
+      if (text == nullptr) {
+        return false;
       }
       const bool hit = std::strstr(text, "blur_hBlurPS") != nullptr;
-      if (cache.size() < 1024) {
-        cache.emplace(obj, hit);
-      }
+      cache.emplace(obj, hit);
       return hit;
     };
     // Shader labels can be swapped in the hook; accept either slot.
@@ -5525,14 +5621,15 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         return 0;
       }
       static std::unordered_map<uint32_t, int> cache;
+      static uint64_t cache_frame = 0;
+      AgeShaderMemo(cache, cache_frame);
       auto it = cache.find(obj);
       if (it != cache.end()) {
         return it->second;
       }
-      char text[120] = {};
-      for (int k = 0; k < 119; ++k) {
-        text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-        if (text[k] == '\0') break;
+      const char* text = ShaderDebugPath(base, obj);
+      if (text == nullptr) {
+        return 0;
       }
       int fam = 0;
       if (std::strstr(text, "\\sky_") != nullptr) {
@@ -5543,9 +5640,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       } else if (std::strstr(text, "postfx_edgedetectstencil") != nullptr) {
         fam = 3;
       }
-      if (cache.size() < 4096) {
-        cache.emplace(obj, fam);
-      }
+      cache.emplace(obj, fam);
       return fam;
     };
     // Shader labels can be swapped in the hook; accept either slot.
