@@ -606,7 +606,15 @@ void DumpAllThreads() {
 
 // How long the guest may take to produce its first frame before the watchdog
 // calls it a hang. Boot to gameplay measures ~25s on an iPhone 13 mini.
+#if defined(__SWITCH__)
+// Shorter here while the port is being brought up. The watchdog only writes a
+// report and lets the process carry on, so calling a slow load a hang costs
+// nothing but a diagnostic, whereas waiting 75 seconds for every attempt costs
+// a real one. Worth raising once the game boots.
+constexpr int kPreFirstFrameGraceSeconds = 30;
+#else
 constexpr int kPreFirstFrameGraceSeconds = 75;
+#endif
 
 void WatchdogMain() {
   uint64_t last_seen = 0;
