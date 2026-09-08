@@ -588,18 +588,28 @@ void DumpAllThreads() {
           if (next <= frame || (next & 3) != 0) {
             break;
           }
-          auto* link_ptr = memory->TranslateVirtual<const uint32_t*>(next + 4);
-          if (link_ptr == nullptr) {
-            break;
-          }
-          const uint32_t link = __builtin_bswap32(*link_ptr);
-          // The title is loaded at 0x82000000; anything outside the image is
-          // fill or a frame that was never written, and printing it only makes
-          // the report harder to read.
-          if (link >= 0x82000000u && link < 0x84000000u) {
-            r.Str("        0x");
-            r.Hex(link, 8);
-            r.Str("\n");
+          // Where the return address lives, from the recompiler's own output:
+          // __savegprlr_N does "stw r12,-8(r1)" with r12 holding the link
+          // register, and that store happens before "stwu" allocates the frame.
+          // So the saved address sits 8 bytes below the frame this one chains
+          // to. Functions that save the link inline use the SysV slot at +4
+          // instead, so both are tried and whichever lands inside the title's
+          // image is the real one.
+          const uint32_t candidates[] = {next - 8, next + 4};
+          for (uint32_t at : candidates) {
+            auto* link_ptr = memory->TranslateVirtual<const uint32_t*>(at);
+            if (link_ptr == nullptr) {
+              continue;
+            }
+            const uint32_t link = __builtin_bswap32(*link_ptr);
+            // The title is loaded at 0x82000000; anything outside it is fill or
+            // a frame that was never written.
+            if (link >= 0x82000000u && link < 0x84000000u) {
+              r.Str("        0x");
+              r.Hex(link, 8);
+              r.Str("\n");
+              break;
+            }
           }
           frame = next;
         }
