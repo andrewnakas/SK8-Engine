@@ -656,6 +656,17 @@ void WatchdogMain() {
                   g_heartbeat.load(std::memory_order_relaxed),
                   g_guest_work.load(std::memory_order_relaxed));
     }
+
+    // Two unconditional thread dumps while the port is being brought up. The
+    // hang watchdog below only fires when frames stop, which does not cover a
+    // title that renders and plays audio quite happily but never advances - and
+    // that is exactly where this one sits. Taken a minute apart so they can be
+    // compared: identical stacks mean the guest is parked, different ones mean
+    // it is working and waiting on something that never completes.
+    if (uptime == 60 || uptime == 120) {
+      REXSYS_WARN("[dump] periodic thread dump at {}s (not a hang report)", uptime);
+      DumpAllThreads();
+    }
 #endif
 
     const int limit = REXCVAR_GET(skate3_hang_watchdog_seconds);
