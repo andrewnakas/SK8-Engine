@@ -184,7 +184,8 @@
                 "SKATE3_GENERATED_ROOT": "/Users/nakas/skate3/skate3recomp-dev/generated",
                 "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
                 "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
-                "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
+                "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out",
+                "REXGLUE_SWITCH_NVK_ROOT": "${sourceDir}/../nxvk-prefix"
             }
         },
         {
