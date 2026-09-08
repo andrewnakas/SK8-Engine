@@ -39,12 +39,15 @@
 
 #include "generated/skate3_init.h"
 
-REXCVAR_DEFINE_BOOL(skate3_image_watch, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_image_watch, false, "Skate 3",
                     "Make the game image's read-only pages read-only after load, catch and "
                     "log the first write to each, keep a load-time copy and diff it every "
                     "heartbeat. Built for the QCS8550 handhelds whose codec tag table at "
                     "0x8210A310 is overwritten with English text before the first decoder is "
-                    "made. Costs nothing while nothing writes.")
+                    "made. It did its job - the image turned out to be wrong before any guest "
+                    "code ran, which is what led to the overlapping memcpy in the title-update "
+                    "patcher - so it is OFF by default now. Turn it on to investigate a new "
+                    "report of static data changing under the game.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(skate3_image_watch_mode, "rodata", "Skate 3",
