@@ -706,7 +706,7 @@ std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
       return;
     }
     std::error_code ec;
-    dir = std::filesystem::absolute(dir, ec);
+    dir = rex::filesystem::ToAbsolute(dir, ec);
     if (ec) {
       return;
     }
@@ -1973,7 +1973,7 @@ void Skate3BaseApp::InstallDlcPackages() {
       std::error_code canonical_ec;
       auto package_key = std::filesystem::weakly_canonical(package_path, canonical_ec).string();
       if (canonical_ec) {
-        package_key = std::filesystem::absolute(package_path).string();
+        package_key = rex::filesystem::ToAbsolute(package_path).string();
       }
       if (!seen_packages.insert(package_key).second) {
         continue;

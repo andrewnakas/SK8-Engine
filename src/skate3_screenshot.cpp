@@ -1,4 +1,5 @@
 #include "skate3_screenshot.h"
+#include <rex/filesystem.h>
 
 #include <rex/logging.h>
 
@@ -75,7 +76,7 @@ std::filesystem::path ScreenshotPath(const char* tag) {
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
                   tm.tm_sec);
   }
-  return std::filesystem::absolute(std::filesystem::path("screenshots") / name);
+  return rex::filesystem::ToAbsolute(std::filesystem::path("screenshots") / name);
 }
 
 void EncodeAndSave(HBITMAP bitmap, int crop_x, int crop_y, int crop_w, int crop_h,
