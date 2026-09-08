@@ -643,7 +643,21 @@ void WatchdogMain() {
   for (;;) {
     struct timespec ts = {1, 0};
     nanosleep(&ts, nullptr);
-    g_uptime_seconds.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t uptime = g_uptime_seconds.fetch_add(1, std::memory_order_relaxed) + 1;
+
+#if defined(__SWITCH__)
+    // A periodic sign of life. The watchdog only speaks up when it decides
+    // something is wrong, which leaves "booting slowly" and "stopped dead"
+    // looking identical from the outside - and turning on debug logging to tell
+    // them apart is slow enough to change the behaviour being measured. Frames
+    // and guest work are the two counters that answer it directly.
+    if ((uptime % 5) == 0) {
+      REXSYS_WARN("[progress] uptime={}s frames={} guest_work={}", uptime,
+                  g_heartbeat.load(std::memory_order_relaxed),
+                  g_guest_work.load(std::memory_order_relaxed));
+    }
+#endif
+
     const int limit = REXCVAR_GET(skate3_hang_watchdog_seconds);
     if (limit <= 0) {
       continue;
