@@ -60,7 +60,7 @@ bool GuestTryCopy(void* dst, const void* src, size_t size);
 // ArmGuestReadRecoveryForThread: permanently arm a thread that only ever
 // reads guest memory on the renderer's behalf (the render thread, the
 // prewarm decode workers). Idempotent and cheap; call per frame/iteration.
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__SWITCH__)
 class GuestReadRecoveryScope {
  public:
   explicit GuestReadRecoveryScope(uint8_t* /*base*/) {}

@@ -1321,7 +1321,13 @@ extern "C" REX_FUNC(sub_82B76080) {
       // trip through the scheduler. Cheapest, and it cannot lose the thread's
       // timeslice while it holds anything.
       for (int i = 0; i < 32; ++i) {
+#if defined(__clang__)
         __builtin_arm_yield();
+#else
+        // The same AArch64 YIELD hint. Written out because devkitA64's
+        // arm_acle.h does not carry the __yield intrinsic.
+        __asm__ __volatile__("yield" ::: "memory");
+#endif
       }
     } else if (mode == 2) {
       // Offer the core to anything else runnable on it. Note this does NOT

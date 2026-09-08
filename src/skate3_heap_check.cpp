@@ -53,15 +53,16 @@
 
 #include "generated/skate3_init.h"
 
-#if defined(__ANDROID__)
-// bionic has no <execinfo.h>; this supplies backtrace* over the unwinder.
+#if defined(__ANDROID__) || defined(__SWITCH__)
+// Neither bionic nor newlib has <execinfo.h>; this supplies backtrace* over
+// the unwinder for both.
 #include <rex/execinfo_android.h>
 #else
 #include <execinfo.h>
 #endif
 #include <pthread.h>
 #include <signal.h>
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) && !defined(__SWITCH__)
 #include <sys/prctl.h>
 #endif
 
@@ -310,6 +311,9 @@ const char* ThreadName() {
 #if defined(__APPLE__)
   // Darwin has no prctl; pthread_getname_np is the equivalent read.
   if (name[0] == 0 && pthread_getname_np(pthread_self(), name, sizeof(name)) != 0) {
+#elif defined(__SWITCH__)
+  // No OS-level thread name to read back on Horizon.
+  if (name[0] == 0) {
 #else
   if (name[0] == 0 &&
       prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) != 0) {

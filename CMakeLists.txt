@@ -435,7 +435,11 @@ endif()
 if(EXISTS "${SKATE3_GENERATED_ROOT}/sources.cmake")
     include("${SKATE3_GENERATED_ROOT}/sources.cmake")
     target_sources(skate3 PRIVATE ${GENERATED_SOURCES})
-    target_include_directories(skate3 PRIVATE "${SKATE3_GENERATED_ROOT}")
+    # Both: sources reach the recompiled headers as <generated/skate3_init.h>
+    # as well as by bare name, so the directory and its parent are needed.
+    target_include_directories(skate3 PRIVATE
+        "${SKATE3_GENERATED_ROOT}"
+        "${SKATE3_GENERATED_ROOT}/..")
 else()
     message(STATUS "generated/sources.cmake not found; run the generate-all target before building skate3")
 endif()

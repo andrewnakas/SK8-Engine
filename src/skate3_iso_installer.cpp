@@ -41,6 +41,9 @@
 #elif defined(__ANDROID__)
 // The system document picker, through the activity; see skate3_android_bridge.
 #include "skate3_android_bridge.h"
+#elif defined(__SWITCH__)
+// No file chooser on a console. The disc image is copied to the SD card before
+// the first launch and found by scanning, so there is nothing to include.
 #else
 #include <gtk/gtk.h>
 #endif
@@ -152,6 +155,14 @@ std::filesystem::path PickIsoFile() {
   // for the chosen document, which std::ifstream reads like any file. Empty
   // when the player cancelled, which the caller reports as "no ISO selected".
   return skate3::android::PickDocument("Select Skate 3 Xbox 360 ISO");
+}
+#elif defined(__SWITCH__)
+std::filesystem::path PickIsoFile() {
+  // No file chooser on a console, and nothing to choose between: the disc image
+  // is copied to the SD card before the first launch. The caller scans the
+  // install directory itself when this returns empty, which is the same path it
+  // takes when a player cancels a dialog elsewhere.
+  return {};
 }
 #else
 std::filesystem::path PickIsoFile() {
@@ -850,7 +861,7 @@ bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context
     if (window) {
       window->RequestPaint();
     }
-#if !defined(__APPLE__) && !defined(__ANDROID__)
+#if !defined(__APPLE__) && !defined(__ANDROID__) && !defined(__SWITCH__)
     while (gtk_events_pending()) {
       gtk_main_iteration_do(FALSE);
     }

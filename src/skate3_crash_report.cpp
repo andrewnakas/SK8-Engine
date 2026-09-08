@@ -11,8 +11,9 @@
 #if !defined(_WIN32)
 
 #include <dirent.h>
-#if defined(__ANDROID__)
-// bionic has no <execinfo.h>; this supplies backtrace* over the unwinder.
+#if defined(__ANDROID__) || defined(__SWITCH__)
+// Neither bionic nor newlib has <execinfo.h>; this supplies backtrace* over
+// the unwinder for both.
 #include <rex/execinfo_android.h>
 #else
 #include <execinfo.h>
@@ -26,11 +27,18 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <pthread/pthread.h>
+#elif defined(__SWITCH__)
+// No prctl and no syscall table: thread names live on the thread object here,
+// and the reporter reads them from the kernel state rather than from the OS.
+#include <unistd.h>
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 #else
 #include <sys/prctl.h>
-#endif
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -126,6 +134,10 @@ uint64_t HostTid() {
   uint64_t tid = 0;
   pthread_threadid_np(nullptr, &tid);
   return tid;
+#elif defined(__SWITCH__)
+  u64 tid = 0;
+  svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+  return tid;
 #else
   return uint64_t(syscall(SYS_gettid));
 #endif
@@ -134,6 +146,13 @@ uint64_t HostTid() {
 bool HostThreadName(char* name, size_t len) {
 #if defined(__APPLE__)
   return pthread_getname_np(pthread_self(), name, len) == 0 && name[0] != 0;
+#elif defined(__SWITCH__)
+  // Horizon threads carry no name the OS will hand back; the engine keeps its
+  // own on the thread object. Reporting failure lets the caller fall back to
+  // that rather than print something invented here.
+  (void)name;
+  (void)len;
+  return false;
 #else
   (void)len;
   return prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) == 0;
@@ -570,6 +589,7 @@ void StartWatchdog() {
 // signature that actually reproduces on map transitions, so it needs the same
 // register dump: ctr names the bogus call target and lr names the guest caller
 // that loaded it.
+#if !defined(__SWITCH__)
 struct sigaction g_prev_sigabrt;
 
 void AbortHandler(int sig, siginfo_t* info, void* uctx) {
@@ -590,6 +610,7 @@ void AbortHandler(int sig, siginfo_t* info, void* uctx) {
     g_prev_sigabrt.sa_handler(sig);
   }
 }
+#endif  // !__SWITCH__
 
 bool CrashReportHandler(rex::arch::Exception* ex, void* /*data*/) {
   if (ex->code() != rex::arch::Exception::Code::kAccessViolation &&
@@ -685,11 +706,20 @@ void EnsureInstalled(uint8_t* guest_base) {
     rex::arch::ExceptionHandler::Install(CrashReportHandler, nullptr);
     StartWatchdog();
 
+#if !defined(__SWITCH__)
     struct sigaction sa = {};
     sa.sa_sigaction = AbortHandler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, &g_prev_sigabrt);
+#else
+    // Horizon has no signals, so a guest abort cannot be intercepted this way
+    // and that one report is not produced here. Faults still are: the kernel
+    // hands them to __libnx_exception_handler, which runs CrashReportHandler
+    // installed just above, so an access violation reports exactly as it does
+    // everywhere else. What is lost is the REX_FATAL path, where the runtime
+    // has already logged the reason before calling abort.
+#endif
 
     REXLOG_INFO("skate3 crash reporter installed (guest faults report to stderr and '{}')", path);
   });

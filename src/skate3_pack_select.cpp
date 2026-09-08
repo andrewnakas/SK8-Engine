@@ -5,7 +5,11 @@
 #include <memory>
 #include <thread>
 
+#if defined(__SWITCH__)
+#include <switch.h>
+#else
 #include <SDL3/SDL.h>
+#endif
 #include <imgui.h>
 
 #include <rex/logging.h>
@@ -32,12 +36,42 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
   // navigation configured - but a player on a phone with a pad attached still
   // has to be able to answer this, and it is the one screen between them and
   // the game.
+#if defined(__SWITCH__)
+  ~PackSelectDialog() = default;
+#else
   ~PackSelectDialog() {
     for (SDL_Gamepad* pad : opened_) {
       SDL_CloseGamepad(pad);
     }
   }
+#endif
 
+#if defined(__SWITCH__)
+  void PollPad(size_t count) {
+    if (!pad_ready_) {
+      padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+      padInitializeDefault(&pad_);
+      pad_ready_ = true;
+      REXLOG_INFO("Skate 3 pack chooser: gamepad input ready");
+    }
+    padUpdate(&pad_);
+    const u64 buttons = padGetButtons(&pad_);
+    const HidAnalogStickState stick = padGetStickPos(&pad_, 0);
+
+    bool up = (buttons & HidNpadButton_Up) != 0;
+    bool down = (buttons & HidNpadButton_Down) != 0;
+    // Either face button below the thumb accepts. This is a one-off bootstrap
+    // menu rather than gameplay, so it is not worth making the player think
+    // about which of A and B this port calls "south" - see
+    // switch_pad_positional for where that distinction does matter.
+    const bool accept = (buttons & (HidNpadButton_A | HidNpadButton_B)) != 0;
+    // The stick too - a d-pad is not everyone's first reach.
+    up |= stick.y > 16000;
+    down |= stick.y < -16000;
+
+    ApplyPadEdges(count, up, down, accept);
+  }
+#else
   void PollPad(size_t count) {
     // Bring the gamepad subsystem up ourselves. It is normally started by the
     // SDL input driver, which belongs to the runtime's input system - and that
@@ -85,7 +119,12 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
     }
     SDL_free(pads);
 
-    // Edge-triggered: held is one move, not one per frame.
+    ApplyPadEdges(count, up, down, accept);
+  }
+#endif  // __SWITCH__
+
+  // Edge-triggered: held is one move, not one per frame.
+  void ApplyPadEdges(size_t count, bool up, bool down, bool accept) {
     if (up && !up_held_ && selected_ > 0) {
       --selected_;
     }
@@ -175,8 +214,13 @@ class PackSelectDialog final : public rex::ui::ImGuiDialog {
   size_t selected_ = 0;
   bool up_held_ = false, down_held_ = false, accept_held_ = false;
   bool accept_pressed_ = false;
+#if defined(__SWITCH__)
+  bool pad_ready_ = false;
+  PadState pad_{};
+#else
   bool pad_subsystem_ready_ = false;
   std::vector<SDL_Gamepad*> opened_;
+#endif
 };
 
 }  // namespace

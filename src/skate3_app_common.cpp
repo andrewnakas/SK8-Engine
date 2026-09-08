@@ -2,8 +2,9 @@
 
 #if defined(__ANDROID__)
 #include "skate3_android_bridge.h"
-#include "skate3_switch_bridge.h"
 #endif
+// Compiles to no-ops off the console, so it needs no guard of its own.
+#include "skate3_switch_bridge.h"
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -17,11 +18,16 @@
 #include "skate3_native_render.h"
 #include "skate3_pack_select.h"
 #include "skate3_performance_profile.h"
+#if defined(__SWITCH__)
+#include <switch.h>
+#include <rex/ui/windowed_app_context_switch.h>
+#else
 #include <rex/ui/windowed_app_context_sdl.h>
 // SDL_GetPrimaryDisplay / SDL_GetCurrentDisplayMode, for the display size
 // the ultrawide aspect is derived from off Windows. The context header above
 // only pulls SDL_events.h.
 #include <SDL3/SDL_video.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, false, "Skate 3",
                     "Ask which content pack to load when several are installed. Off: the first "
@@ -274,6 +280,17 @@ std::optional<DisplaySize> QueryFullscreenMonitorSize() {
     return std::nullopt;
   }
   return DisplaySize{width, height};
+}
+#elif defined(__SWITCH__)
+// Two displays exist and the operation mode says which one is live, so there is
+// nothing to enumerate. Both are 16:9, which means the ultrawide path derives
+// an aspect it will not widen - correct, and better than returning nothing,
+// which would leave the aspect logic guessing.
+std::optional<DisplaySize> QueryFullscreenMonitorSize() {
+  if (appletGetOperationMode() == AppletOperationMode_Console) {
+    return DisplaySize{1920, 1080};
+  }
+  return DisplaySize{1280, 720};
 }
 #else
 // Everywhere but Windows, ask SDL. This used to return nullopt unconditionally,
