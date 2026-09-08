@@ -7,6 +7,7 @@
 // For the guest X_KTHREAD pointer, which is the number
 // RtlEnterCriticalSection reports as owner_thread=.
 #include <rex/system/kernel_state.h>
+#include <rex/system/xobject.h>
 #include <rex/system/xthread.h>
 
 #if !defined(_WIN32)
@@ -44,6 +45,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <malloc.h>
 #include <vector>
 #include <ctime>
 #include <mutex>
@@ -549,6 +551,31 @@ void DumpAllThreads() {
       r.Hex(c->ctr.u64 & 0xFFFFFFFFull, 8);
       r.Str("  r1=0x");
       r.Hex(c->r1.u64 & 0xFFFFFFFFull, 8);
+      // r3 is the handle argument at every NtWaitForSingleObjectEx call site,
+      // and "thread 6 is waiting on F8000054" is only useful once F8000054 has
+      // a name. Resolving it says what kind of object the guest is parked on
+      // and, where the title named it, which one.
+      const uint32_t maybe_handle = uint32_t(c->r3.u64 & 0xFFFFFFFFull);
+      if ((maybe_handle & 0xFF000000u) == 0xF8000000u) {
+        auto object = ks->object_table()->LookupObject<rex::system::XObject>(maybe_handle);
+        if (object) {
+          static const char* kTypeNames[] = {
+              "Undefined", "Enumerator", "Event",   "File",  "IOCompletion",
+              "Module",    "Mutant",     "Notify",  "Semaphore", "Session",
+              "Socket",    "SymLink",    "Thread",  "Timer"};
+          const uint32_t type_index = uint32_t(object->type());
+          r.Str("\n      waiting on ");
+          r.Str(type_index < (sizeof(kTypeNames) / sizeof(kTypeNames[0])) ? kTypeNames[type_index]
+                                                                          : "?");
+          const std::string& object_name = object->name();
+          if (!object_name.empty()) {
+            r.Str(" '");
+            r.Str(object_name.c_str());
+            r.Str("'");
+          }
+        }
+      }
+
       r.Str("\n      r3=0x");
       r.Hex(c->r3.u64 & 0xFFFFFFFFull, 8);
       r.Str("  r4=0x");
@@ -652,9 +679,16 @@ void WatchdogMain() {
     // them apart is slow enough to change the behaviour being measured. Frames
     // and guest work are the two counters that answer it directly.
     if ((uptime % 5) == 0) {
-      REXSYS_WARN("[progress] uptime={}s frames={} guest_work={}", uptime,
+      // Memory belongs on this line: the process was killed outright with the
+      // log still flowing - no fault, no terminate, no crash file - and running
+      // out of a 3189 MB pool is the way that happens on Horizon. The guest
+      // memory backend only reports at commit time, which is all in the first
+      // few seconds and says nothing about a death eight minutes in.
+      const struct mallinfo mi = mallinfo();
+      REXSYS_WARN("[progress] uptime={}s frames={} guest_work={} heap={}MB free={}MB", uptime,
                   g_heartbeat.load(std::memory_order_relaxed),
-                  g_guest_work.load(std::memory_order_relaxed));
+                  g_guest_work.load(std::memory_order_relaxed),
+                  size_t(mi.arena) >> 20, size_t(mi.fordblks) >> 20);
     }
 
     // Two unconditional thread dumps while the port is being brought up. The
@@ -663,7 +697,7 @@ void WatchdogMain() {
     // that is exactly where this one sits. Taken a minute apart so they can be
     // compared: identical stacks mean the guest is parked, different ones mean
     // it is working and waiting on something that never completes.
-    if (uptime == 60 || uptime == 120) {
+    if (uptime == 60 || uptime == 120 || uptime == 240) {
       REXSYS_WARN("[dump] periodic thread dump at {}s (not a hang report)", uptime);
       DumpAllThreads();
     }
