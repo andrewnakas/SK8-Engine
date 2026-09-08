@@ -548,6 +548,11 @@ if(SKATE3_SWITCH)
     # use on the platforms it was written for.
     target_link_options(skate3 PRIVATE "LINKER:--wrap=pthread_create")
 
+    # pthread_detach is not implemented by libnx at all and returns ENOSYS,
+    # which std::thread::detach() turns into a thrown exception. See
+    # pthread_stack_switch.cpp.
+    target_link_options(skate3 PRIVATE "LINKER:--wrap=pthread_detach")
+
     find_program(SKATE3_ELF2NRO elf2nro HINTS "${DEVKITPRO}/tools/bin" REQUIRED)
     find_program(SKATE3_NACPTOOL nacptool HINTS "${DEVKITPRO}/tools/bin" REQUIRED)
 
