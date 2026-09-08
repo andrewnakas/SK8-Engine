@@ -2,6 +2,7 @@
 
 #if defined(__ANDROID__)
 #include "skate3_android_bridge.h"
+#include "skate3_switch_bridge.h"
 #endif
 
 #if defined(__APPLE__)
@@ -1115,6 +1116,10 @@ void Skate3BaseApp::OnPostSetup() {
   // make its read-only pages read-only, so the first write to any of them is
   // caught with its writer (see skate3_image_watch.h).
   skate3::image_watch::Install();
+  // After the cvars are parsed, so a profile on the SD card can ask for it, and
+  // before the guest starts, so the frames it buys are the ones being measured.
+  // A no-op unless switch_overclock was set, and on every other platform.
+  skate3::switch_bridge::ApplyClocks();
   // Before anything that might want to be measured, and after the cvars are
   // parsed, so an ios_args.txt that asks for diagnostics gets them from frame
   // one rather than from whenever the settings screen is first opened.
