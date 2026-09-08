@@ -560,37 +560,46 @@ void DumpAllThreads() {
 
       // Guest call stack from the PowerPC back chain. Registers alone say every
       // thread is in NtWaitForSingleObjectEx, which is true and useless; what
-      // matters is who called it. The Xbox 360 ABI keeps the caller's frame
-      // pointer at [r1] and the return address at [frame + 4], so the chain can
-      // be walked without any unwind data.
+      // matters is who called it.
+      //
+      // [r1] holds the caller's frame pointer, and a function saves its return
+      // address into its CALLER's frame, at [caller + 4] - not into its own. So
+      // the link for a frame is read one frame up the chain. Reading [r1 + 4]
+      // instead lands on the slot this frame's own callee would use, which is
+      // uninitialised here and comes back as stack fill.
       auto* memory = ks->memory();
-      if (memory != nullptr) {
+      if (memory != nullptr && c->lr != 0) {
         r.Str("      guest stack:\n");
+        r.Str("        0x");
+        r.Hex(c->lr, 8);
+        r.Str("\n");
         uint32_t frame = uint32_t(c->r1.u64 & 0xFFFFFFFFull);
         for (int depth = 0; depth < 16; ++depth) {
-          // Guest stacks live high in the address space; a frame pointer that
-          // is null, misaligned or below the image is the end of the chain, not
-          // something to dereference.
           if (frame == 0 || (frame & 3) != 0 || frame < 0x10000) {
             break;
           }
           auto* next_ptr = memory->TranslateVirtual<const uint32_t*>(frame);
-          auto* link_ptr = memory->TranslateVirtual<const uint32_t*>(frame + 4);
-          if (next_ptr == nullptr || link_ptr == nullptr) {
+          if (next_ptr == nullptr) {
             break;
           }
-          // Guest memory is big-endian.
-          const uint32_t next = __builtin_bswap32(*next_ptr);
+          const uint32_t next = __builtin_bswap32(*next_ptr);  // guest is big-endian
+          // Stacks grow down, so the chain must ascend; anything else is a
+          // corrupt or uninitialised frame and would loop forever.
+          if (next <= frame || (next & 3) != 0) {
+            break;
+          }
+          auto* link_ptr = memory->TranslateVirtual<const uint32_t*>(next + 4);
+          if (link_ptr == nullptr) {
+            break;
+          }
           const uint32_t link = __builtin_bswap32(*link_ptr);
-          if (link != 0) {
+          // The title is loaded at 0x82000000; anything outside the image is
+          // fill or a frame that was never written, and printing it only makes
+          // the report harder to read.
+          if (link >= 0x82000000u && link < 0x84000000u) {
             r.Str("        0x");
             r.Hex(link, 8);
             r.Str("\n");
-          }
-          // Stacks grow down, so the chain must ascend; anything else is a
-          // corrupt or uninitialised frame and would loop forever.
-          if (next <= frame) {
-            break;
           }
           frame = next;
         }
