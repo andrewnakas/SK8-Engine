@@ -336,8 +336,12 @@ if(NOT REXGLUE_RUNTIME_STATIC)
     list(APPEND SKATE3_COMMON_SOURCES
          third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp)
 endif()
+# elf2nro supplies its own placeholder when no icon is given, so a missing one
+# is not worth failing over - but it must then contribute no argument at all.
 if(SKATE3_SWITCH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/switch/icon.jpg")
-    set(SKATE3_HAS_ICON ON)
+    set(SKATE3_ICON_ARG "--icon=${CMAKE_CURRENT_SOURCE_DIR}/cmake/switch/icon.jpg")
+else()
+    set(SKATE3_ICON_ARG "")
 endif()
 
 if(SKATE3_IOS)
@@ -555,8 +559,13 @@ if(SKATE3_SWITCH)
         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:skate3>" "${SKATE3_DEBUG_ELF}"
         COMMAND "${SKATE3_NACPTOOL}" --create "Skate 3" "EA / recompiled"
                 "${SKATE3_FULL_VERSION}" "${SKATE3_NACP}"
+        # Each argument is one quoted string. Writing --nacp="${...}" instead
+        # puts literal quote characters into the argument, and elf2nro then
+        # looks for a file whose name begins with one. The icon is appended to
+        # a list rather than through a generator expression, which would leave
+        # an empty argument behind when there is no icon.
         COMMAND "${SKATE3_ELF2NRO}" "$<TARGET_FILE:skate3>" "${SKATE3_NRO}"
-                --nacp="${SKATE3_NACP}" $<$<BOOL:${SKATE3_HAS_ICON}>:--icon=${SKATE3_ICON}>
+                "--nacp=${SKATE3_NACP}" ${SKATE3_ICON_ARG}
         DEPENDS skate3
         COMMENT "Packaging skate3.nro"
         VERBATIM)
