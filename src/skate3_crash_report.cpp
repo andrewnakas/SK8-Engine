@@ -6,6 +6,7 @@
 
 // For the guest X_KTHREAD pointer, which is the number
 // RtlEnterCriticalSection reports as owner_thread=.
+#include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 
 #if !defined(_WIN32)
@@ -43,6 +44,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 #include <ctime>
 #include <mutex>
 #include <string>
@@ -492,6 +494,71 @@ void DumpAllThreads() {
   mach_port_deallocate(mach_task_self(), self_thread);
   vm_deallocate(mach_task_self(), vm_address_t(threads),
                 vm_size_t(thread_count * sizeof(thread_t)));
+#elif defined(__SWITCH__)
+  // Horizon has neither signals nor a way to read another thread's registers
+  // from inside the same process, so the two approaches above are both out: a
+  // process cannot debug itself, and backtrace() only ever walks the calling
+  // thread. What is still reachable is the guest side, which is the half that
+  // matters for a hang - a deadlock here is guest threads waiting on each
+  // other, and every one of them has a PPC context the runtime keeps updated.
+  //
+  // The contexts are read while their threads are running, so a value can be
+  // caught mid-update. That is acceptable for a report whose purpose is to say
+  // which thread is parked where; a torn register is obvious when it appears.
+  r.Str("  guest threads and where each one is parked. lr names the caller:\n");
+  r.Str("    grep -n 'DEFINE_REX_FUNC' generated/*.cpp and take the nearest\n");
+  r.Str("    definition below the address.\n");
+  r.Flush();
+
+  auto* ks = rex::system::kernel_state();
+  if (ks == nullptr) {
+    r.Str("  no kernel state - the guest never started\n");
+    r.Flush();
+  } else {
+    const std::vector<rex::system::object_ref<rex::system::XThread>> threads =
+        ks->object_table()->GetObjectsByType<rex::system::XThread>();
+    r.Str("  ");
+    r.Dec(uint64_t(threads.size()));
+    r.Str(" guest thread(s)\n");
+    r.Flush();
+
+    for (const auto& thread : threads) {
+      if (!thread) {
+        continue;
+      }
+      r.Str("\n  [");
+      const std::string name = thread->thread_name();
+      r.Str(name.empty() ? "(unnamed)" : name.c_str());
+      r.Str("] thid=");
+      r.Dec(thread->thread_id());
+      r.Str(" guest_obj=0x");
+      r.Hex(thread->guest_object(), 8);
+      r.Str(thread->is_running() ? " running" : " NOT running");
+      r.Str("\n");
+
+      auto* ts = thread->thread_state();
+      const ::PPCContext* c = ts ? ts->context() : nullptr;
+      if (c == nullptr) {
+        r.Str("      no guest context bound\n");
+        r.Flush();
+        continue;
+      }
+      r.Str("      lr=0x");
+      r.Hex(c->lr, 8);
+      r.Str("  ctr=0x");
+      r.Hex(c->ctr.u64 & 0xFFFFFFFFull, 8);
+      r.Str("  r1=0x");
+      r.Hex(c->r1.u64 & 0xFFFFFFFFull, 8);
+      r.Str("\n      r3=0x");
+      r.Hex(c->r3.u64 & 0xFFFFFFFFull, 8);
+      r.Str("  r4=0x");
+      r.Hex(c->r4.u64 & 0xFFFFFFFFull, 8);
+      r.Str("  r5=0x");
+      r.Hex(c->r5.u64 & 0xFFFFFFFFull, 8);
+      r.Str("\n");
+      r.Flush();
+    }
+  }
 #endif
   Report tail;
   tail.Str("=== end hang report ===\n");
