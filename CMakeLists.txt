@@ -542,6 +542,12 @@ if(SKATE3_SWITCH)
     # than the toolchain so a genuine duplicate anywhere else still fails.
     target_link_options(skate3 PRIVATE "LINKER:--allow-multiple-definition")
 
+    # Sends every pthread_create through pthread_stack_switch.cpp, which raises
+    # the default stack from libnx's 128 KB. std::thread has no way to ask for a
+    # bigger stack, and 128 KB is far below what this engine's worker threads
+    # use on the platforms it was written for.
+    target_link_options(skate3 PRIVATE "LINKER:--wrap=pthread_create")
+
     find_program(SKATE3_ELF2NRO elf2nro HINTS "${DEVKITPRO}/tools/bin" REQUIRED)
     find_program(SKATE3_NACPTOOL nacptool HINTS "${DEVKITPRO}/tools/bin" REQUIRED)
 
