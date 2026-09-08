@@ -1,231 +1,271 @@
 {
-  "version": 6,
-  "cmakeMinimumRequired": {
-    "major": 3,
-    "minor": 25,
-    "patch": 0
-  },
-  "configurePresets": [
-    {
-      "name": "base",
-      "hidden": true,
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/out/build/${presetName}",
-      "cacheVariables": {
-        "REXSDK_DIR": "${sourceDir}/third_party/rexglue-sdk",
-        "SKATE3_GAME_DATA_ROOT": "${sourceDir}/game",
-        "REXGLUE_USE_VULKAN": "ON"
-      }
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
     },
-    {
-      "name": "linux-base",
-      "hidden": true,
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_C_COMPILER": "clang-20",
-        "CMAKE_CXX_COMPILER": "clang++-20",
-        "CMAKE_LINKER": "ld.lld-20"
-      },
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Linux"
-      }
-    },
-    {
-      "name": "macos-base",
-      "hidden": true,
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_C_COMPILER": "/opt/homebrew/opt/llvm/bin/clang",
-        "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/llvm/bin/clang++",
-        "CMAKE_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
-        "CMAKE_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib",
-        "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0"
-      },
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Darwin"
-      }
-    },
-    {
-      "name": "debug",
-      "displayName": "Debug",
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
-      }
-    },
-    {
-      "name": "release",
-      "displayName": "Release",
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
-      }
-    },
-    {
-      "name": "relwithdebinfo",
-      "displayName": "RelWithDebInfo",
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-      }
-    },
-    {
-      "name": "linux-relwithdebinfo",
-      "displayName": "Linux RelWithDebInfo",
-      "inherits": "linux-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-      }
-    },
-    {
-      "name": "linux-release",
-      "displayName": "Linux Release",
-      "inherits": "linux-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
-      }
-    },
-    {
-      "name": "macos-relwithdebinfo",
-      "displayName": "macOS RelWithDebInfo",
-      "inherits": "macos-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-      }
-    },
-    {
-      "name": "macos-release",
-      "displayName": "macOS Release",
-      "inherits": "macos-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
-      }
-    },
-    {
-      "name": "macos-fast",
-      "displayName": "macOS Release, optimised for Apple Silicon",
-      "inherits": "macos-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_C_FLAGS": "--no-default-config",
-        "CMAKE_CXX_FLAGS": "--no-default-config",
-        "CMAKE_OBJC_FLAGS": "--no-default-config",
-        "CMAKE_OBJCXX_FLAGS": "--no-default-config",
-        "CMAKE_OSX_ARCHITECTURES": "arm64",
-        "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
-        "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
-        "REXGLUE_RUNTIME_STATIC": "ON",
-        "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
-      }
-    },
-    {
-      "name": "android-base",
-      "hidden": true,
-      "inherits": "base",
-      "toolchainFile": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
-      "cacheVariables": {
-        "ANDROID_ABI": "arm64-v8a",
-        "ANDROID_PLATFORM": "android-28",
-        "ANDROID_STL": "c++_static",
-        "CMAKE_BUILD_TYPE": "Release",
-        "REXGLUE_RUNTIME_STATIC": "ON",
-        "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
-        "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
-        "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
-      }
-    },
-    {
-      "name": "android-arm64-release",
-      "displayName": "Android arm64-v8a Release, tuned for Snapdragon 8 Gen 1 (no SVE)",
-      "inherits": "android-base",
-      "cacheVariables": {
-        "REXGLUE_ANDROID_ARM_MCPU": "cortex-a710+nosve+nosve2"
-      }
-    },
-    {
-      "name": "android-arm64-generic",
-      "displayName": "Android arm64-v8a Release, generic ARMv8.2 (any 2018+ phone)",
-      "inherits": "android-base"
-    },
-    {
-      "name": "android-arm64-lowend",
-      "displayName": "Android arm64-v8a Release, scheduled for in-order cores (low-end phones and tablets)",
-      "inherits": "android-base",
-      "cacheVariables": {
-        "REXGLUE_ANDROID_ARM_MTUNE": "cortex-a53",
-        "REXGLUE_ANDROID_ARM_NO_OUTLINE_ATOMICS": "ON"
-      }
-    },
-    {
-      "name": "android-arm64-heapwatch",
-      "displayName": "Android arm64 with the guest store watch armed (debugging only)",
-      "inherits": "android-base",
-      "cacheVariables": {
-        "CMAKE_CXX_FLAGS": "-DSKATE3_HEAP_WATCH=1"
-      }
-    }
-  ],
-  "buildPresets": [
-    {
-      "name": "debug",
-      "configurePreset": "debug"
-    },
-    {
-      "name": "release",
-      "configurePreset": "release"
-    },
-    {
-      "name": "relwithdebinfo",
-      "configurePreset": "relwithdebinfo"
-    },
-    {
-      "name": "linux-relwithdebinfo",
-      "configurePreset": "linux-relwithdebinfo"
-    },
-    {
-      "name": "linux-release",
-      "configurePreset": "linux-release"
-    },
-    {
-      "name": "macos-relwithdebinfo",
-      "configurePreset": "macos-relwithdebinfo"
-    },
-    {
-      "name": "macos-release",
-      "configurePreset": "macos-release"
-    },
-    {
-      "name": "macos-fast",
-      "configurePreset": "macos-fast",
-      "jobs": 3
-    },
-    {
-      "name": "android-arm64-release",
-      "configurePreset": "android-arm64-release",
-      "targets": [
-        "skate3"
-      ],
-      "jobs": 3
-    },
-    {
-      "name": "android-arm64-generic",
-      "configurePreset": "android-arm64-generic",
-      "targets": [
-        "skate3"
-      ],
-      "jobs": 3
-    },
-    {
-      "name": "android-arm64-lowend",
-      "configurePreset": "android-arm64-lowend",
-      "targets": [
-        "skate3"
-      ],
-      "jobs": 3
-    }
-  ]
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "REXSDK_DIR": "${sourceDir}/third_party/rexglue-sdk",
+                "SKATE3_GAME_DATA_ROOT": "${sourceDir}/game",
+                "REXGLUE_USE_VULKAN": "ON"
+            }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang-20",
+                "CMAKE_CXX_COMPILER": "clang++-20",
+                "CMAKE_LINKER": "ld.lld-20"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        },
+        {
+            "name": "macos-base",
+            "hidden": true,
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "/opt/homebrew/opt/llvm/bin/clang",
+                "CMAKE_CXX_COMPILER": "/opt/homebrew/opt/llvm/bin/clang++",
+                "CMAKE_AR": "/opt/homebrew/opt/llvm/bin/llvm-ar",
+                "CMAKE_RANLIB": "/opt/homebrew/opt/llvm/bin/llvm-ranlib",
+                "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "debug",
+            "displayName": "Debug",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "release",
+            "displayName": "Release",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "relwithdebinfo",
+            "displayName": "RelWithDebInfo",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "linux-relwithdebinfo",
+            "displayName": "Linux RelWithDebInfo",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "linux-release",
+            "displayName": "Linux Release",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "macos-relwithdebinfo",
+            "displayName": "macOS RelWithDebInfo",
+            "inherits": "macos-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "macos-release",
+            "displayName": "macOS Release",
+            "inherits": "macos-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "macos-fast",
+            "displayName": "macOS Release, optimised for Apple Silicon",
+            "inherits": "macos-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_FLAGS": "--no-default-config",
+                "CMAKE_CXX_FLAGS": "--no-default-config",
+                "CMAKE_OBJC_FLAGS": "--no-default-config",
+                "CMAKE_OBJCXX_FLAGS": "--no-default-config",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
+                "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
+                "REXGLUE_RUNTIME_STATIC": "ON",
+                "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
+            }
+        },
+        {
+            "name": "android-base",
+            "hidden": true,
+            "inherits": "base",
+            "toolchainFile": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+            "cacheVariables": {
+                "ANDROID_ABI": "arm64-v8a",
+                "ANDROID_PLATFORM": "android-28",
+                "ANDROID_STL": "c++_static",
+                "CMAKE_BUILD_TYPE": "Release",
+                "REXGLUE_RUNTIME_STATIC": "ON",
+                "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
+                "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
+                "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
+            }
+        },
+        {
+            "name": "android-arm64-release",
+            "displayName": "Android arm64-v8a Release, tuned for Snapdragon 8 Gen 1 (no SVE)",
+            "inherits": "android-base",
+            "cacheVariables": {
+                "REXGLUE_ANDROID_ARM_MCPU": "cortex-a710+nosve+nosve2"
+            }
+        },
+        {
+            "name": "android-arm64-generic",
+            "displayName": "Android arm64-v8a Release, generic ARMv8.2 (any 2018+ phone)",
+            "inherits": "android-base"
+        },
+        {
+            "name": "android-arm64-lowend",
+            "displayName": "Android arm64-v8a Release, scheduled for in-order cores (low-end phones and tablets)",
+            "inherits": "android-base",
+            "cacheVariables": {
+                "REXGLUE_ANDROID_ARM_MTUNE": "cortex-a53",
+                "REXGLUE_ANDROID_ARM_NO_OUTLINE_ATOMICS": "ON"
+            }
+        },
+        {
+            "name": "android-arm64-heapwatch",
+            "displayName": "Android arm64 with the guest store watch armed (debugging only)",
+            "inherits": "android-base",
+            "cacheVariables": {
+                "CMAKE_CXX_FLAGS": "-DSKATE3_HEAP_WATCH=1"
+            }
+        },
+        {
+            "name": "switch-base",
+            "hidden": true,
+            "inherits": "base",
+            "displayName": "Nintendo Switch (Horizon, devkitA64)",
+            "toolchainFile": "${sourceDir}/cmake/switch/devkitA64.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "REXGLUE_RUNTIME_STATIC": "ON",
+                "REXGLUE_USE_VULKAN": "ON",
+                "REXGLUE_USE_SDL": "OFF",
+                "REXGLUE_ENABLE_TRACY": "OFF",
+                "REXGLUE_ENABLE_PERF_COUNTERS": "ON",
+                "SKATE3_GENERATED_ROOT": "/Users/nakas/skate3/skate3recomp-dev/generated",
+                "SKATE3_GAME_DATA_ROOT": "/Users/nakas/skate3/game",
+                "SKATE3_TITLE_UPDATE_PACKAGE": "/Users/nakas/skate3/TU_12K2276_000000C000000.00000000000O3",
+                "REXGLUE_OUTPUT_DIR": "${sourceDir}/out/build/${presetName}/sdk-out"
+            }
+        },
+        {
+            "name": "switch-release",
+            "displayName": "Nintendo Switch Release",
+            "inherits": "switch-base"
+        },
+        {
+            "name": "switch-relwithdebinfo",
+            "displayName": "Nintendo Switch RelWithDebInfo",
+            "inherits": "switch-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "debug",
+            "configurePreset": "debug"
+        },
+        {
+            "name": "release",
+            "configurePreset": "release"
+        },
+        {
+            "name": "relwithdebinfo",
+            "configurePreset": "relwithdebinfo"
+        },
+        {
+            "name": "linux-relwithdebinfo",
+            "configurePreset": "linux-relwithdebinfo"
+        },
+        {
+            "name": "linux-release",
+            "configurePreset": "linux-release"
+        },
+        {
+            "name": "macos-relwithdebinfo",
+            "configurePreset": "macos-relwithdebinfo"
+        },
+        {
+            "name": "macos-release",
+            "configurePreset": "macos-release"
+        },
+        {
+            "name": "macos-fast",
+            "configurePreset": "macos-fast",
+            "jobs": 3
+        },
+        {
+            "name": "android-arm64-release",
+            "configurePreset": "android-arm64-release",
+            "targets": [
+                "skate3"
+            ],
+            "jobs": 3
+        },
+        {
+            "name": "android-arm64-generic",
+            "configurePreset": "android-arm64-generic",
+            "targets": [
+                "skate3"
+            ],
+            "jobs": 3
+        },
+        {
+            "name": "android-arm64-lowend",
+            "configurePreset": "android-arm64-lowend",
+            "targets": [
+                "skate3"
+            ],
+            "jobs": 3
+        },
+        {
+            "name": "switch-release",
+            "configurePreset": "switch-release"
+        },
+        {
+            "name": "switch-relwithdebinfo",
+            "configurePreset": "switch-relwithdebinfo"
+        }
+    ]
 }
