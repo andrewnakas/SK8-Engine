@@ -2,6 +2,29 @@
 
 #include "skate3_crash_report.h"
 #include "skate3_guest_trace.h"
+#include "skate3_native_render.h"
+
+#include <rex/thread/timer_queue.h>
+
+// Timer delivery counters, defined in the runtime's Switch threading and timer
+// queue. Declared here rather than in a shared header: those headers reach most
+// of the tree and a change to one costs a twenty minute rebuild.
+extern "C" {
+extern std::atomic<uint64_t> rex_diag_timer_setonce;
+extern std::atomic<uint64_t> rex_diag_timer_setonce_armed;
+extern std::atomic<uint64_t> rex_diag_timer_completion;
+extern std::atomic<uint64_t> rex_diag_timer_signal;
+extern std::atomic<uint64_t> rex_diag_disarm_blocked;
+extern std::atomic<uint64_t> rex_diag_disarm_woke;
+extern std::atomic<uint64_t> rex_diag_timer_cancel;
+extern std::atomic<uint64_t> rex_diag_tq_dropped;
+extern std::atomic<uint32_t> rex_diag_tq_drop_state;
+extern std::atomic<int64_t> rex_diag_timer_last_due_ms;
+extern std::atomic<int64_t> rex_diag_timer_max_due_ms;
+extern std::atomic<uint64_t> rex_diag_shmem_upload_pages;
+extern std::atomic<uint64_t> rex_diag_shmem_upload_calls;
+extern std::atomic<uint32_t> rex_diag_shmem_page_size;
+}
 
 #include "skate3_native_scene.h"
 
@@ -537,6 +560,28 @@ void DumpAllThreads() {
       r.Str(" guest_obj=0x");
       r.Hex(thread->guest_object(), 8);
       r.Str(thread->is_running() ? " running" : " NOT running");
+      // Which cores this thread may actually run on, and at what priority.
+      // Placement decides the frame rate on a three core machine and there was
+      // no way to check it after the fact: the map says what was asked for,
+      // this says what the kernel gave. Read through the raw handle rather than
+      // Thread::affinity_mask(), which waits for the thread to have started and
+      // would hang a report whose whole purpose is to describe a hang.
+      if (auto* host = thread->thread()) {
+        const Handle h = Handle(uintptr_t(host->native_handle()));
+        s32 ideal = 0;
+        u64 mask = 0;
+        s32 prio = 0;
+        if (R_SUCCEEDED(svcGetThreadCoreMask(&ideal, &mask, h))) {
+          r.Str(" cores=0x");
+          r.Hex(uint32_t(mask), 1);
+          r.Str(" ideal=");
+          r.Dec(uint64_t(uint32_t(ideal)));
+        }
+        if (R_SUCCEEDED(svcGetThreadPriority(&prio, h))) {
+          r.Str(" prio=");
+          r.Dec(uint64_t(uint32_t(prio)));
+        }
+      }
       r.Str("\n");
 
       auto* ts = thread->thread_state();
@@ -686,10 +731,54 @@ void WatchdogMain() {
       // memory backend only reports at commit time, which is all in the first
       // few seconds and says nothing about a death eight minutes in.
       const struct mallinfo mi = mallinfo();
+      // Fragmentation, not just size. Frame time on this port grows steadily
+      // from the moment the front end appears, and an allocator walking an
+      // ever-longer free list inside a 2 GB arena degrades exactly that way.
+      // in-use vs free-chunk-count separates "we are simply out of room" from
+      // "every allocation now costs a search".
+      REXSYS_WARN("[heap] in-use={}MB free-chunks={} free={}MB mmapped={}MB",
+                  size_t(mi.uordblks) >> 20, size_t(mi.ordblks), size_t(mi.fordblks) >> 20,
+                  size_t(mi.hblkhd) >> 20);
       REXSYS_WARN("[progress] uptime={}s frames={} guest_work={} heap={}MB free={}MB", uptime,
                   g_heartbeat.load(std::memory_order_relaxed),
                   g_guest_work.load(std::memory_order_relaxed),
                   size_t(mi.arena) >> 20, size_t(mi.fordblks) >> 20);
+      // Frames and guest work say the guest is running. They do not say it is
+      // getting anywhere, and this title renders perfectly happily while its
+      // screen manager waits for something that never arrives.
+      skate3::native_render::LogScreenManagerState();
+      skate3::native_render::LogFrameBudget();
+      skate3::native_render::LogJobScan();
+      // The guest's timer thread is what drains the queue the main loop needs
+      // drained, so a timer that stops arriving stops the whole title. These
+      // counters say whether the dispatch thread is alive, stuck inside a
+      // callback, or unable to accept new timers at all.
+      REXSYS_WARN("[timerd] set={} armed={} fired={} signalled={} disarm-blocked={} woke={}",
+                  rex_diag_timer_setonce.load(std::memory_order_relaxed),
+                  rex_diag_timer_setonce_armed.load(std::memory_order_relaxed),
+                  rex_diag_timer_completion.load(std::memory_order_relaxed),
+                  rex_diag_timer_signal.load(std::memory_order_relaxed),
+                  rex_diag_disarm_blocked.load(std::memory_order_relaxed),
+                  rex_diag_disarm_woke.load(std::memory_order_relaxed));
+      REXSYS_WARN("[timerd] cancels={} dropped={} last-drop-state={}",
+                  rex_diag_timer_cancel.load(std::memory_order_relaxed),
+                  rex_diag_tq_dropped.load(std::memory_order_relaxed),
+                  rex_diag_tq_drop_state.load(std::memory_order_relaxed));
+      REXSYS_WARN("[timerd] last-arm-due={}ms max-arm-due={}ms",
+                  rex_diag_timer_last_due_ms.load(std::memory_order_relaxed),
+                  rex_diag_timer_max_due_ms.load(std::memory_order_relaxed));
+      {
+        const uint64_t pages = rex_diag_shmem_upload_pages.load(std::memory_order_relaxed);
+        const uint32_t psz = rex_diag_shmem_page_size.load(std::memory_order_relaxed);
+        REXSYS_WARN("[shmem] uploads={} pages={} ({} MB total, page {} B)",
+                    rex_diag_shmem_upload_calls.load(std::memory_order_relaxed), pages,
+                    (pages * uint64_t(psz ? psz : 4096)) >> 20, psz);
+      }
+      const auto tq = rex::thread::GetTimerQueueDiagnostics();
+      REXSYS_WARN("[timerq] loops={} dispatched={} completed={} queued={} claim-waits={} "
+                  "pending={}{}",
+                  tq.iterations, tq.dispatched, tq.completed, tq.queued, tq.claim_waits,
+                  tq.pending, tq.in_callback ? "  IN CALLBACK" : "");
     }
 
     // Two unconditional thread dumps while the port is being brought up. The
@@ -701,11 +790,13 @@ void WatchdogMain() {
     // The trace answers "which guest functions ran in this window". Armed
     // once the title has settled into the freeze, dumped 30s later, so the
     // recorded set is the code that keeps running while nothing advances.
-    if (uptime == 45) {
+    // Armed late enough to catch the front end rather than the intro movie:
+    // the slow part starts once menus appear, well past a minute in.
+    if (uptime == 120) {
       REXSYS_WARN("[trace] arming guest call trace");
       skate3::guest_trace::Arm("switch-freeze");
     }
-    if (uptime == 75) {
+    if (uptime == 150) {
       REXSYS_WARN("[trace] dumping guest call trace");
       skate3::guest_trace::Dump("switch-freeze");
     }

@@ -45,6 +45,7 @@
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -5143,7 +5144,14 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
 }
 
 void PrewarmWorkerLoop() {
-#if defined(_WIN32)
+#if defined(__SWITCH__)
+  // Horizon has no nice(), and no priority lever an unprivileged process can
+  // use downward - everything below the preemptive level runs until it blocks,
+  // which is the opposite of what these workers want. Naming them is what
+  // matters instead: the placement map is matched by name, and without one they
+  // are stuck on the core they were created on, at the guest's own priority.
+  rex::thread::set_current_thread_name("decode_worker");
+#elif defined(_WIN32)
   // Below-normal priority: the workers flood in exactly when the guest's
   // single-threaded world ACTIVATION runs (registration is the final load
   // phase), and at normal priority they stretch the game's own black

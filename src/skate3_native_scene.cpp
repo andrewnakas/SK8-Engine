@@ -35,6 +35,7 @@
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -1294,8 +1295,54 @@ REXCVAR_DEFINE_INT32(
     "recompilation, so it spins flat out and starves the threads it is waiting "
     "for. 0 = today's behaviour, 1 = ARM yield hints (approximates db16cyc), "
     "2 = sched_yield (which does NOT idle the core), 3 = sleep 100us "
-    "(which does).")
+    "(which does), 4 = yield WITH core migration (Horizon only: lets the "
+    "kernel pull the thread this one waits for onto this core).")
+    .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// The job manager's scan is the busiest thing the guest does, and on this
+// console it is the frame. Three of the game's threads wait for a job by
+// calling the scan in a loop with nothing else in the loop body: no sleep, no
+// yield, no kernel wait. On a 360 that is free - six hardware threads, and a
+// waiting one costs its sibling little. Here it means the two threads that are
+// the frame hold their timeslices against the workers they are waiting for, and
+// the front end falls from 30 fps to 1 as more waiters pile in.
+//
+// The scan answers "no work" 99.9% of the time, so backing off when it does is
+// the whole fix: the same loop, minus the part where the waiter refuses to give
+// up the core.
+REXCVAR_DEFINE_INT32(
+    skate3_job_scan_backoff, 3, "Skate 3",
+    "Back off when the guest's job scan (sub_8290AFA0) finds nothing, for every "
+    "caller except the worker loop, which already takes a real 1 ms wait. "
+    "0 = off, 1 = yield without core migration, 2 = yield with core migration, "
+    "3 = migrate for the first N misses then sleep (see the _yields and "
+    "_sleep_us settings).")
     .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_job_scan_backoff_yields, 32, "Skate 3",
+    "How many consecutive empty scans to answer with a yield before sleeping "
+    "instead, in job scan backoff mode 3. Low sleeps sooner and frees the core "
+    "harder; high stays more responsive to a job that is about to arrive.")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_job_scan_backoff_sleep_us, 50, "Skate 3",
+    "How long to sleep once a waiter has yielded its way past the threshold "
+    "above. This is the only thing that actually idles the core, and idling it "
+    "is what lets a worker on another core be migrated here.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    skate3_job_scan_stats, false, "Skate 3",
+    "Record which guest addresses call the job scan, and walk the back chain "
+    "once to name the first caller. Answered the question of where the time was "
+    "going; at 140,000 calls a second it is not free, so it is off unless asked "
+    "for.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(
@@ -6434,6 +6481,13 @@ std::atomic<bool> g_cam_sampler_started{false};
 std::atomic<uint64_t> g_cam_sampler_pushes{0};  // telemetry
 
 void CamSamplerLoop() {
+#if defined(__SWITCH__)
+  // Naming is what places a thread on Horizon: the placement map is matched
+  // against the name, and a thread that never names itself is left at the
+  // priority and single-core mask it was created with. This one sampled at
+  // 1 kHz on whichever core the guest's main thread was already using.
+  rex::thread::set_current_thread_name("cam_sampler");
+#endif
   float last_view[16] = {};
   double syn_next_emit = 0.0;
   int syn_cadence_i = 0;

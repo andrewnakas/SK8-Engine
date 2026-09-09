@@ -12,6 +12,14 @@
 
 #include "generated/skate3_init.h"
 
+#if defined(__SWITCH__)
+// Declared rather than pulled in from <switch.h>: libnx puts Thread, Event,
+// Handle, Mutex and Result in the global namespace, and this file already has
+// all five names from the runtime and the renderer. One syscall is not worth
+// that fight. The signature is libnx's, and it is C.
+extern "C" void svcSleepThread(int64_t nano);
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <sched.h>
@@ -44,6 +52,10 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
 REXCVAR_DECLARE(int32_t, skate3_native_render_guest_static_refresh);
 REXCVAR_DECLARE(int32_t, skate3_native_render_lw_refresh);
 REXCVAR_DECLARE(int32_t, skate3_guest_spin_yield);
+REXCVAR_DECLARE(int32_t, skate3_job_scan_backoff);
+REXCVAR_DECLARE(int32_t, skate3_job_scan_backoff_yields);
+REXCVAR_DECLARE(int32_t, skate3_job_scan_backoff_sleep_us);
+REXCVAR_DECLARE(bool, skate3_job_scan_stats);
 REXCVAR_DECLARE(bool, skate3_guest_spin_measure);
 REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
                     "Diagnostic: watch the guest D3D command-ring write pointer at every "
@@ -675,8 +687,33 @@ extern "C" REX_FUNC(sub_827FAF50) {
 }
 
 
+namespace {
+// Frame time accounting, read by LogFrameBudget below.
+std::atomic<uint64_t> g_frame_outside_swap_us{0};
+std::atomic<uint64_t> g_frame_hooks_us{0};
+std::atomic<uint64_t> g_frame_inner_us{0};
+std::atomic<uint64_t> g_frame_count{0};
+}  // namespace
+
 // Guest D3D Swap: frame boundary.
+//
+// Also where the frame time is measured. The guest render thread completes one
+// frame a second on this port while the command processor happily executes 70
+// batches a second and the graphics submission itself accounts for 30 ms of
+// that second - so the time is inside the guest's own swap, and this says how
+// much of it. Split three ways: the runtime's swap handling, whatever the hook
+// layer does at frame end, and the rest of the guest's frame.
 extern "C" REX_FUNC(sub_82B82E08) {
+  const auto swap_enter = std::chrono::steady_clock::now();
+  {
+    static std::atomic<int64_t> last_exit_ns{0};
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(swap_enter.time_since_epoch()).count();
+    const int64_t last = last_exit_ns.exchange(now_ns, std::memory_order_relaxed);
+    if (last != 0) {
+      g_frame_outside_swap_us.fetch_add(uint64_t((now_ns - last) / 1000), std::memory_order_relaxed);
+    }
+  }
   // Install point for the guest fault reporter: this runs on the guest render
   // thread every frame whatever else is switched off, and by the first Swap the
   // runtime's own fault handlers (MMIO write watches, the guarded-read
@@ -698,7 +735,19 @@ extern "C" REX_FUNC(sub_82B82E08) {
   if (skate3::native_render::Enabled()) {
     skate3::native_render::OnFrameEnd(base);
   }
+  const auto hooks_done = std::chrono::steady_clock::now();
+  g_frame_hooks_us.fetch_add(
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(hooks_done - swap_enter)
+                   .count()),
+      std::memory_order_relaxed);
+  g_frame_count.fetch_add(1, std::memory_order_relaxed);
+  const auto inner_begin = std::chrono::steady_clock::now();
   __imp__sub_82B82E08(ctx, base);
+  g_frame_inner_us.fetch_add(
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - inner_begin)
+                   .count()),
+      std::memory_order_relaxed);
 }
 
 // cProcessArenaAsset::RegisterTexture(cAssetList*, cAssetID,
@@ -1040,6 +1089,598 @@ extern "C" REX_FUNC(sub_827F0D00) {
   }
 }
 
+// The title's screen manager loop, and the reason the port sits where it does.
+//
+// The guest main thread enters sub_82965C90 during startup and never leaves:
+// it switches on a state word at +96 and asks a loader object at +16 whether
+// the screen it wants is ready. Everything else on the thread - the per-frame
+// wait a thread dump catches it in - is the tail of this loop. So the dump
+// looks identical whether the machine is advancing normally or stuck waiting
+// for a screen that will never load, and the only thing that tells them apart
+// is the state word itself.
+//
+// The loop is entered once, so this records where the object lives and lets a
+// host thread read it. Nothing is written and nothing is inferred: the state,
+// the current and pending screens, and the two callback slots, exactly as the
+// guest left them.
+namespace {
+
+std::atomic<uint32_t> g_screen_mgr_obj{0};
+std::atomic<uint8_t*> g_screen_mgr_base{nullptr};
+
+// The counter the load is waiting for, and who is still ticking it.
+//
+// sub_82481A98 is the game's "advance this counter by one" helper, shared by
+// every subsystem that publishes a heartbeat. Three of those heartbeats gate
+// the end of a load; one of them stops. Watching the helper splits the two
+// explanations that a frozen counter allows and that nothing else can tell
+// apart: either the callers stopped calling, which is a fault in the game's
+// own logic, or they are still calling and the increment is not landing,
+// which would be a fault in how this port implements the atomic.
+std::atomic<uint32_t> g_tick_watch_addr{0};
+std::atomic<uint32_t> g_tick_watch_calls{0};
+std::atomic<uint32_t> g_tick_watch_lr{0};
+
+}  // namespace
+
+// The job manager's "pick the next job" scan, and by a wide margin the most
+// expensive thing the guest does on this port.
+//
+// A call trace of the front end put 75% of all guest cycles inside this one
+// function: 9,447 calls burning 59.3 million cycles, about 6,278 each. It walks
+// an array of [this+16] eight-byte entries hunting for the best candidate, so
+// its cost is entirely the length of that list - and a list that grows because
+// nothing is draining it would look exactly like the slowdown here, which
+// starts fast and degrades. Recording the length says whether that is what is
+// happening.
+namespace {
+
+std::atomic<uint64_t> g_jobscan_calls{0};
+std::atomic<uint64_t> g_jobscan_entries{0};
+std::atomic<uint32_t> g_jobscan_max{0};
+constexpr size_t kJobCallerSlots = 6;
+std::atomic<uint32_t> g_jobcaller_lr[kJobCallerSlots] = {};
+std::atomic<uint64_t> g_jobcaller_hits[kJobCallerSlots] = {};
+std::atomic<uint64_t> g_jobcaller_other{0};
+std::atomic<uint64_t> g_jobwait_calls{0};
+std::atomic<uint32_t> g_jobwait_timeout{0xFFFFFFFFu};
+std::atomic<uint32_t> g_jobwait_handle{0};
+std::atomic<uint32_t> g_jobmgr_vt100{0};
+std::atomic<uint32_t> g_jobmgr_vt96{0};
+std::atomic<uint64_t> g_jobscan_worked{0};
+std::atomic<bool> g_jobscan_walked{false};
+uint32_t g_jobscan_stack[7] = {0};
+std::atomic<uint64_t> g_jobscan_yields{0};
+std::atomic<uint64_t> g_jobscan_sleeps{0};
+
+// The worker thread's own call. It is the one caller that already does the
+// right thing - scan, and if there was nothing, take a real 1 ms kernel wait -
+// so it must not be paced twice.
+constexpr uint32_t kJobWorkerScanLr = 0x8290B788u;
+
+// Consecutive empty scans on THIS thread. Per-thread because the whole point is
+// how long this particular waiter has been getting nothing; a shared counter
+// would let a busy thread reset a starving one.
+thread_local uint32_t tl_jobscan_misses = 0;
+
+// Give up the core after an empty scan.
+//
+// Three guest functions wait for a job by calling the scan in a loop with
+// nothing else in the loop body - sub_82596DB8 (the main thread's per-frame
+// flush), sub_824741F0 and sub_8290AE38. On the console a spinning thread cost
+// its SMT sibling little and the loops were paced by instructions the
+// recompiler cannot emit. Here each one holds a whole core, at the one priority
+// where Horizon time-slices, against the workers that would end its wait.
+void JobScanBackOff() {
+#if defined(__SWITCH__)
+  const int32_t mode = REXCVAR_GET(skate3_job_scan_backoff);
+  if (mode <= 0) {
+    return;
+  }
+  ++tl_jobscan_misses;
+  if (mode == 1) {
+    // Offer the core to a sibling already queued on it.
+    svcSleepThread(0);
+  } else if (mode == 2 ||
+             tl_jobscan_misses <= uint32_t(REXCVAR_GET(skate3_job_scan_backoff_yields))) {
+    // -1 is YieldType_WithCoreMigration: the kernel may pull a runnable thread
+    // from another core's queue onto this one. That is the case that matters,
+    // because the thread this waiter needs is on a different core by design.
+    svcSleepThread(-1);
+  } else {
+    // A yield with nothing to yield to returns immediately and the spin
+    // continues at full speed. Sleeping is the only thing that actually idles
+    // the core, and an idle core is what lets the scheduler move work here.
+    const int32_t us = REXCVAR_GET(skate3_job_scan_backoff_sleep_us);
+    svcSleepThread(int64_t(us) * 1000);
+    g_jobscan_sleeps.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  g_jobscan_yields.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+}  // namespace
+
+extern "C" REX_FUNC(sub_8290AFA0) {
+  const uint32_t self = ctx.r3.u32;
+  if (self >= 0x1000u && self < 0xC0000000u) {
+    if (g_jobmgr_vt100.load(std::memory_order_relaxed) == 0) {
+      const auto rd = [&](uint32_t a) {
+        uint32_t v = 0;
+        std::memcpy(&v, base + a, sizeof(v));
+        return __builtin_bswap32(v);
+      };
+      const uint32_t vt = rd(self);
+      if (vt >= 0x82000000u && vt < 0x84000000u) {
+        g_jobmgr_vt96.store(rd(vt + 96), std::memory_order_relaxed);
+        g_jobmgr_vt100.store(rd(vt + 100), std::memory_order_relaxed);
+      }
+    }
+    uint32_t be = 0;
+    std::memcpy(&be, base + self + 16, sizeof(be));
+    const uint32_t count = __builtin_bswap32(be);
+    if (count < 0x100000u) {
+      g_jobscan_calls.fetch_add(1, std::memory_order_relaxed);
+      g_jobscan_entries.fetch_add(count, std::memory_order_relaxed);
+      uint32_t prev = g_jobscan_max.load(std::memory_order_relaxed);
+      while (count > prev &&
+             !g_jobscan_max.compare_exchange_weak(prev, count, std::memory_order_relaxed)) {
+      }
+    }
+  }
+  // Who actually drives this. The worker loop reaches its wait only ~500 times
+  // a second while the scan runs ~140,000 times a second, so the worker cannot
+  // be making most of these calls - something else is calling the job manager
+  // in a tight loop, and a histogram of return addresses names it.
+  //
+  // It named them - sub_82596DB8, sub_824741F0 and sub_8290AE38 - and is off by
+  // default now. This runs at 140 kHz and the answer is already known.
+  const bool stats = REXCVAR_GET(skate3_job_scan_stats);
+  if (stats) {
+    const uint32_t lr = uint32_t(ctx.lr);
+    bool placed = false;
+    for (size_t i = 0; i < kJobCallerSlots; ++i) {
+      const uint32_t seen = g_jobcaller_lr[i].load(std::memory_order_relaxed);
+      if (seen == lr) {
+        g_jobcaller_hits[i].fetch_add(1, std::memory_order_relaxed);
+        placed = true;
+        break;
+      }
+      if (seen == 0) {
+        uint32_t expected_zero = 0;
+        if (g_jobcaller_lr[i].compare_exchange_strong(expected_zero, lr,
+                                                      std::memory_order_relaxed)) {
+          g_jobcaller_hits[i].fetch_add(1, std::memory_order_relaxed);
+          placed = true;
+          break;
+        }
+      }
+    }
+    if (!placed) {
+      g_jobcaller_other.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  bool expected = false;
+  if (stats && g_jobscan_walked.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    const auto be32 = [&](uint32_t addr) -> uint32_t {
+      uint32_t v = 0;
+      std::memcpy(&v, base + addr, sizeof(v));
+      return __builtin_bswap32(v);
+    };
+    size_t depth = 0;
+    g_jobscan_stack[depth++] = uint32_t(ctx.lr);
+    uint32_t frame = ctx.r1.u32;
+    while (depth < std::size(g_jobscan_stack)) {
+      if (frame == 0 || (frame & 3) != 0 || frame < 0x10000u) {
+        break;
+      }
+      const uint32_t next = be32(frame);
+      if (next <= frame || (next & 3) != 0) {
+        break;
+      }
+      for (const uint32_t at : {next - 8, next + 4}) {
+        const uint32_t link = be32(at);
+        if (link >= 0x82000000u && link < 0x84000000u) {
+          g_jobscan_stack[depth++] = link;
+          break;
+        }
+      }
+      frame = next;
+    }
+  }
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_8290AFA0(ctx, base);
+  // The worker loop above this is "did you do any work? then go round again,
+  // otherwise sleep". A worker that never sleeps is being told it did work
+  // every time, so the answer it gives back is the thing to count.
+  if ((ctx.r3.u32 & 0xFF) != 0) {
+    g_jobscan_worked.fetch_add(1, std::memory_order_relaxed);
+    tl_jobscan_misses = 0;
+    return;
+  }
+  // Nothing to run. Every caller but the worker is about to ask again
+  // immediately, so this is the moment to let go of the core.
+  if (caller != kJobWorkerScanLr) {
+    JobScanBackOff();
+  }
+}
+
+// The wait the job worker is supposed to take when there is no work.
+//
+// It answers "no work" 99.9% of the time and still never sleeps, so the wait
+// itself is returning immediately. sub_82EDFEC0(handle, timeout) is the guest's
+// generic wait; the worker calls it from one place, so its return address
+// identifies the call and r4 is the timeout it asked for. A timeout of zero is
+// a poll, and a poll in that loop is the busy-wait eating the console.
+extern "C" REX_FUNC(sub_82EDFEC0) {
+  if (uint32_t(ctx.lr) == 0x8290B7B4u) {
+    g_jobwait_calls.fetch_add(1, std::memory_order_relaxed);
+    g_jobwait_timeout.store(ctx.r4.u32, std::memory_order_relaxed);
+    g_jobwait_handle.store(ctx.r3.u32, std::memory_order_relaxed);
+  }
+  __imp__sub_82EDFEC0(ctx, base);
+}
+
+// The subsystem update that was ticking counter A, and stopped.
+//
+// It is a virtual method, so the vtable that reaches it lives in the title's
+// data and nothing in the recompiled code names its caller. Walking the guest
+// back chain at the moment it runs is the only way to see who drives it, and
+// once is enough: the answer does not change between frames. The chain layout
+// is the crash reporter's, which explains both return-address slots.
+namespace {
+
+std::atomic<bool> g_ticker_walked{false};
+std::atomic<uint32_t> g_ticker_calls{0};
+uint32_t g_ticker_stack[7] = {0};
+
+}  // namespace
+
+// The predicate that decides whether the screen update runs at all.
+//
+// sub_826D7708(this, arg) reduces to: pass `arg` straight back unless a state
+// word at this+68 reads 18; at 18, answer yes if `arg` was already yes, else
+// defer to a sub-object's own query and a flag at +4908. The manager calls it
+// every iteration and skips the update - and therefore the counter the load is
+// waiting on - whenever it answers no. Recording its inputs and its answer says
+// which of those terms is the one that changed.
+namespace {
+
+struct GateSample {
+  uint32_t self, arg, state, sub, result;
+};
+std::atomic<uint32_t> g_gate_calls{0};
+std::atomic<uint32_t> g_gate_yes{0};
+GateSample g_gate_last{};
+
+}  // namespace
+
+// The ring drainer. sub_826D6098 is the manager's vt[28]: it walks the two
+// rings hanging off [mgr+128] and retires entries from each. Nothing calls it
+// directly - it is dispatched through the manager's vtable - so the question
+// is simply whether anything still calls it once the queue fills, and from
+// where. The back chain is captured once; the answer does not change.
+namespace {
+
+std::atomic<uint32_t> g_drain_calls{0};
+std::atomic<bool> g_drain_walked{false};
+uint32_t g_drain_stack[6] = {0};
+
+}  // namespace
+
+extern "C" REX_FUNC(sub_826D6098) {
+  g_drain_calls.fetch_add(1, std::memory_order_relaxed);
+  bool expected = false;
+  if (g_drain_walked.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    const auto be32 = [&](uint32_t addr) -> uint32_t {
+      uint32_t v = 0;
+      std::memcpy(&v, base + addr, sizeof(v));
+      return __builtin_bswap32(v);
+    };
+    size_t depth = 0;
+    g_drain_stack[depth++] = uint32_t(ctx.lr);
+    uint32_t frame = ctx.r1.u32;
+    while (depth < std::size(g_drain_stack)) {
+      if (frame == 0 || (frame & 3) != 0 || frame < 0x10000u) {
+        break;
+      }
+      const uint32_t next = be32(frame);
+      if (next <= frame || (next & 3) != 0) {
+        break;
+      }
+      for (const uint32_t at : {next - 8, next + 4}) {
+        const uint32_t link = be32(at);
+        if (link >= 0x82000000u && link < 0x84000000u) {
+          g_drain_stack[depth++] = link;
+          break;
+        }
+      }
+      frame = next;
+    }
+  }
+  __imp__sub_826D6098(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_826D7708) {
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t arg = uint32_t(ctx.r4.u32) & 0xFFu;
+  __imp__sub_826D7708(ctx, base);
+  const uint32_t result = ctx.r3.u32 & 0xFFu;
+  const auto be32 = [&](uint32_t addr) -> uint32_t {
+    uint32_t v = 0;
+    std::memcpy(&v, base + addr, sizeof(v));
+    return __builtin_bswap32(v);
+  };
+  g_gate_calls.fetch_add(1, std::memory_order_relaxed);
+  if (result != 0) {
+    g_gate_yes.fetch_add(1, std::memory_order_relaxed);
+  }
+  const uint32_t sub = (self >= 0x1000u && self < 0xC0000000u) ? be32(self + 4) : 0;
+  g_gate_last = GateSample{self, arg,
+                           (self >= 0x1000u && self < 0xC0000000u) ? be32(self + 68) : 0, sub,
+                           result};
+}
+
+extern "C" REX_FUNC(sub_826D78B0) {
+  g_ticker_calls.fetch_add(1, std::memory_order_relaxed);
+  bool expected = false;
+  if (g_ticker_walked.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    const auto be32 = [&](uint32_t addr) -> uint32_t {
+      uint32_t v = 0;
+      std::memcpy(&v, base + addr, sizeof(v));
+      return __builtin_bswap32(v);
+    };
+    size_t depth = 0;
+    g_ticker_stack[depth++] = uint32_t(ctx.lr);
+    uint32_t frame = ctx.r1.u32;
+    while (depth < std::size(g_ticker_stack)) {
+      if (frame == 0 || (frame & 3) != 0 || frame < 0x10000u) {
+        break;
+      }
+      const uint32_t next = be32(frame);
+      if (next <= frame || (next & 3) != 0) {
+        break;
+      }
+      for (const uint32_t at : {next - 8, next + 4}) {
+        const uint32_t link = be32(at);
+        if (link >= 0x82000000u && link < 0x84000000u) {
+          g_ticker_stack[depth++] = link;
+          break;
+        }
+      }
+      frame = next;
+    }
+  }
+  __imp__sub_826D78B0(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82481A98) {
+  const uint32_t watched = g_tick_watch_addr.load(std::memory_order_relaxed);
+  if (watched != 0 && ctx.r3.u32 + 48u == watched) {
+    g_tick_watch_calls.fetch_add(1, std::memory_order_relaxed);
+    g_tick_watch_lr.store(uint32_t(ctx.lr), std::memory_order_relaxed);
+  }
+  __imp__sub_82481A98(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82965C90) {
+  g_screen_mgr_base.store(base, std::memory_order_relaxed);
+  g_screen_mgr_obj.store(ctx.r3.u32, std::memory_order_release);
+  __imp__sub_82965C90(ctx, base);
+}
+
+namespace skate3::native_render {
+
+void LogJobScan() {
+  const uint64_t n = g_jobscan_calls.load(std::memory_order_relaxed);
+  if (n == 0) {
+    return;
+  }
+  static uint64_t last_n = 0;
+  const uint64_t worked = g_jobscan_worked.load(std::memory_order_relaxed);
+  REXLOG_WARN("[jobs] scans={} (+{}) said-did-work={} ({:.1f}%) list={} | from {:08X} {:08X}", n,
+              n - last_n, worked, 100.0 * double(worked) / double(n),
+              g_jobscan_entries.load(std::memory_order_relaxed) / n, g_jobscan_stack[0],
+              g_jobscan_stack[1]);
+  {
+    std::string callers;
+    for (size_t i = 0; i < kJobCallerSlots; ++i) {
+      const uint32_t lr = g_jobcaller_lr[i].load(std::memory_order_relaxed);
+      if (lr == 0) {
+        break;
+      }
+      callers += fmt::format("{:08X}={} ", lr, g_jobcaller_hits[i].load(std::memory_order_relaxed));
+    }
+    REXLOG_WARN("[jobs] scan callers: {}(other={})", callers,
+                g_jobcaller_other.load(std::memory_order_relaxed));
+  }
+  REXLOG_WARN("[jobs] backoff yields={} sleeps={} | {:.0f} scans/s over the interval",
+              g_jobscan_yields.load(std::memory_order_relaxed),
+              g_jobscan_sleeps.load(std::memory_order_relaxed), double(n - last_n) / 5.0);
+  REXLOG_WARN("[jobs] worker waits={} last timeout={} handle={:08X} | vt96={:08X} vt100={:08X}",
+              g_jobwait_calls.load(std::memory_order_relaxed),
+              int32_t(g_jobwait_timeout.load(std::memory_order_relaxed)),
+              g_jobwait_handle.load(std::memory_order_relaxed),
+              g_jobmgr_vt96.load(std::memory_order_relaxed),
+              g_jobmgr_vt100.load(std::memory_order_relaxed));
+  last_n = n;
+}
+
+void LogFrameBudget() {
+  const uint64_t n = g_frame_count.load(std::memory_order_relaxed);
+  if (n == 0) {
+    return;
+  }
+  // Averages hide a frame time that is climbing, which is the whole point
+  // here, so report the interval since the last line as well.
+  static uint64_t last_n = 0, last_inner = 0, last_hooks = 0, last_outside = 0;
+  const uint64_t inner = g_frame_inner_us.load(std::memory_order_relaxed);
+  const uint64_t hooks = g_frame_hooks_us.load(std::memory_order_relaxed);
+  const uint64_t outside = g_frame_outside_swap_us.load(std::memory_order_relaxed);
+  const uint64_t dn = n - last_n;
+  REXLOG_WARN("[frame] {} frames | since last: {} frames, swap {} us, hooks {} us, rest {} us",
+              n, dn, dn ? (inner - last_inner) / dn : 0, dn ? (hooks - last_hooks) / dn : 0,
+              dn ? (outside - last_outside) / dn : 0);
+  last_n = n;
+  last_inner = inner;
+  last_hooks = hooks;
+  last_outside = outside;
+}
+
+void LogScreenManagerState() {
+  const uint32_t obj = g_screen_mgr_obj.load(std::memory_order_acquire);
+  uint8_t* const guest_base = g_screen_mgr_base.load(std::memory_order_relaxed);
+  if (obj == 0 || guest_base == nullptr) {
+    return;
+  }
+  // Guest memory is never unmapped on this platform, so a plain read of a
+  // pointer the guest itself handed us cannot fault.
+  const auto read = [&](uint32_t offset) {
+    uint32_t be = 0;
+    std::memcpy(&be, guest_base + obj + offset, sizeof(be));
+    return __builtin_bswap32(be);
+  };
+
+  const uint32_t state = read(96);
+  const uint32_t current = read(8);
+  const uint32_t pending = read(12);
+  const uint32_t deferred = read(84);
+  const uint32_t callback = read(88);
+
+  // Report a change immediately and otherwise stay quiet for a while: a state
+  // that is advancing normally would bury the log, and a state that is stuck
+  // only needs saying often enough to show it is still stuck.
+  // The three counters the loader waits on before it will report the load
+  // finished. sub_826D8A28 snapshots each one, then sleeps in 1 ms steps until
+  // it has advanced - "let the render pipeline get a frame through". The main
+  // thread's state 3 is waiting for exactly that. Reading them says which of
+  // the three stopped ticking, which no thread dump can show: the loader is
+  // asleep in all three cases and looks identical.
+  //
+  // Addresses as the guest computes them, from two fixed globals in the image.
+  const auto read_at = [&](uint32_t addr) -> uint32_t {
+    // Only the loaded image and the guest heap are certain to be committed,
+    // and an uncommitted read is fatal on this platform rather than merely
+    // wrong. Anything outside those reads as zero.
+    if (addr < 0x1000u || addr >= 0xC0000000u) {
+      return 0;
+    }
+    uint32_t be = 0;
+    std::memcpy(&be, guest_base + addr, sizeof(be));
+    return __builtin_bswap32(be);
+  };
+  uint32_t tick[3] = {0, 0, 0};
+  if (const uint32_t root = read_at(0x83083BCCu); root != 0) {
+    if (const uint32_t a = read_at(root + 144); a != 0) {
+      tick[0] = read_at(a + 72);
+      g_tick_watch_addr.store(a + 72, std::memory_order_relaxed);
+    }
+    if (const uint32_t b = read_at(root + 148); b != 0) {
+      tick[1] = read_at(b + 136);
+    }
+  }
+  if (const uint32_t c = read_at(0x83083C38u); c != 0) {
+    tick[2] = read_at(c + 56);
+  }
+
+  static uint32_t last_tick[3] = {0, 0, 0};
+  const bool ticking = std::memcmp(last_tick, tick, sizeof(tick)) != 0;
+  std::memcpy(last_tick, tick, sizeof(tick));
+
+  static uint32_t last[5] = {0xFFFFFFFFu, 0, 0, 0, 0};
+  static int quiet = 0;
+  const uint32_t now[5] = {state, current, pending, deferred, callback};
+  const bool changed = std::memcmp(last, now, sizeof(now)) != 0;
+  if (!changed && !ticking && ++quiet < 6) {
+    return;
+  }
+  std::memcpy(last, now, sizeof(now));
+  quiet = 0;
+  REXLOG_WARN(
+      "[fe-mgr] state={} current={:08X} pending={:08X} deferred={:08X} callback={:08X}"
+      " load-ticks={}/{}/{} {} | A: calls={} last-lr={:08X} upd={}{}",
+      state, current, pending, deferred, callback, tick[0], tick[1], tick[2],
+      ticking ? "advancing" : "FROZEN",
+      g_tick_watch_calls.load(std::memory_order_relaxed),
+      g_tick_watch_lr.load(std::memory_order_relaxed),
+      g_ticker_calls.load(std::memory_order_relaxed), changed ? "" : "  (unchanged)");
+  // Name the two virtual functions this hinges on. The screen manager only
+  // runs the update that ticks A when screen->vt[24](x) says yes, and stops
+  // saying yes the moment the load begins; the loader's own vt[24] runs
+  // instead. Both live in vtables in the title's data, so nothing offline can
+  // name them - but the objects are right here, and their tables are readable.
+  {
+    // Re-read whenever the screen changes, not once: skipping the intro movie
+    // reaches the same stall through a different screen, and the whole point is
+    // to name the functions the manager is actually calling at the time.
+    static uint32_t named_for = 0;
+    if (current != 0 && current != named_for) {
+      named_for = current;
+      const uint32_t screen_vt = read_at(current);
+      const uint32_t loader = read_at(obj + 16);
+      const uint32_t loader_vt = loader ? read_at(loader) : 0;
+      REXLOG_WARN(
+          "[fe-mgr] screen {:08X} vtable {:08X}: +24={:08X} +28={:08X} +36={:08X}",
+          current, screen_vt, read_at(screen_vt + 24), read_at(screen_vt + 28),
+          read_at(screen_vt + 36));
+      REXLOG_WARN(
+          "[fe-mgr] loader {:08X} vtable {:08X}: +24={:08X} +28={:08X} +60={:08X} +64={:08X}",
+          loader, loader_vt, read_at(loader_vt + 24), read_at(loader_vt + 28),
+          read_at(loader_vt + 60), read_at(loader_vt + 64));
+      // The manager's own vt[24] is what actually decides each iteration: the
+      // screen's gate turns out to pass its answer straight through, because
+      // the screen's sub-object is null. Naming it is the last unknown.
+      const uint32_t mgr_vt = read_at(obj);
+      REXLOG_WARN("[fe-mgr] manager {:08X} vtable {:08X}: +24={:08X} +28={:08X}", obj, mgr_vt,
+                  read_at(mgr_vt + 24), read_at(mgr_vt + 28));
+      // The worker's own fields say whether it still holds the job: +56 is the
+      // function slot the worker clears when it finishes, which is exactly what
+      // "is it done" reports, and +4 is the event the main thread sleeps on.
+      REXLOG_WARN("[fe-mgr] worker: wake-event={:08X} quit={} fn={:08X} arg={:08X} main-waits-on={:08X}",
+                  read_at(loader + 48), read_at(loader + 52) & 0xFFu, read_at(loader + 56),
+                  read_at(loader + 60), read_at(loader + 4));
+    }
+  }
+
+  // The ring the manager allocates from, and whether anything is retiring it.
+  {
+    const uint32_t owner = read_at(obj + 128);
+    const uint32_t ring0 = owner ? read_at(owner + 24) : 0;
+    const uint32_t ring1 = owner ? read_at(owner + 28) : 0;
+    REXLOG_WARN(
+        "[fe-ring] drain-calls={} from {:08X} {:08X} {:08X} | ring0={:08X} head={} tail={} |"
+        " ring1={:08X} head={} tail={}",
+        g_drain_calls.load(std::memory_order_relaxed), g_drain_stack[0], g_drain_stack[1],
+        g_drain_stack[2], ring0, ring0 ? read_at(ring0 + 12004) : 0,
+        ring0 ? read_at(ring0 + 12008) : 0, ring1, ring1 ? read_at(ring1 + 12004) : 0,
+        ring1 ? read_at(ring1 + 12008) : 0);
+  }
+
+  REXLOG_WARN("[fe-gate] calls={} yes={} | this={:08X} arg={} state={} sub={:08X} -> {}",
+              g_gate_calls.load(std::memory_order_relaxed),
+              g_gate_yes.load(std::memory_order_relaxed), g_gate_last.self, g_gate_last.arg,
+              g_gate_last.state, g_gate_last.sub, g_gate_last.result);
+  if (g_ticker_walked.load(std::memory_order_acquire)) {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      REXLOG_WARN(
+          "[fe-mgr] gate calls={} yes={} | last: this={:08X} arg={} state={} sub={:08X} -> {}",
+          g_gate_calls.load(std::memory_order_relaxed),
+          g_gate_yes.load(std::memory_order_relaxed), g_gate_last.self, g_gate_last.arg,
+          g_gate_last.state, g_gate_last.sub, g_gate_last.result);
+      REXLOG_WARN("[fe-mgr] the update that ticks A is driven from: {:08X} {:08X} {:08X} {:08X}"
+                  " {:08X} {:08X} {:08X}",
+                  g_ticker_stack[0], g_ticker_stack[1], g_ticker_stack[2], g_ticker_stack[3],
+                  g_ticker_stack[4], g_ticker_stack[5], g_ticker_stack[6]);
+    }
+  }
+}
+
+}  // namespace skate3::native_render
+
 // rw::movie::MovieDecoder::Decode(int, VideoRenderable**,
 // SubtitleRenderable*): fires per decoded FMV frame while any movie plays
 // (boot intro logos and all other rw::movie playback). Heartbeat for the
@@ -1329,6 +1970,17 @@ extern "C" REX_FUNC(sub_82B76080) {
         __asm__ __volatile__("yield" ::: "memory");
 #endif
       }
+    } else if (mode == 4) {
+      // Horizon's yield-with-migration: hand the core over AND let the kernel
+      // pull the thread this one is waiting for across from another core. On
+      // three cores that is the only yield with anything to yield to; mode 3's
+      // 100 us sleep measured worse here, because this wait returns in a
+      // microsecond on this port rather than the 43 ms it takes on a phone.
+#if defined(__SWITCH__)
+      svcSleepThread(-1);
+#else
+      sched_yield();
+#endif
     } else if (mode == 2) {
       // Offer the core to anything else runnable on it. Note this does NOT
       // idle the core: with nothing else queued, sched_yield returns straight

@@ -546,6 +546,39 @@ if(SKATE3_ENABLE_GUEST_TRACE)
 endif()
 
 if(SKATE3_SWITCH)
+    # The recompiled code polls guest memory in plain busy-wait loops - a word
+    # written by another thread, read until it changes, no call and no fence in
+    # the loop body. SDK commit f27dfa8 made those loads non-volatile, and GCC
+    # (this is the only GCC target; the phones are Clang) hoists such a load out
+    # of the loop and emits an unconditional self-branch: 22 guest functions in
+    # the D3D and audio drivers became `b .`, which is the freeze after the intro
+    # movie. The generated header restores the qualifier when this is defined.
+    # scripts/scan_spin_loops.sh on skate3.debug.elf must report 0 afterwards.
+    option(SKATE3_GUEST_MEM_VOLATILE
+        "Volatile guest loads/stores in the recompiled code (GCC hoists polls out of loops otherwise)" ON)
+    if(SKATE3_GUEST_MEM_VOLATILE)
+        target_compile_definitions(skate3 PRIVATE REX_GUEST_MEM_VOLATILE=1)
+    endif()
+
+    # The narrow form of the same guarantee. Volatile everywhere stops a poll
+    # spinning on a stale register, and also stops the compiler keeping ANY
+    # guest value in a register at any of 964,158 sites - which measured as
+    # roughly a second of guest time per menu frame on this console. A barrier
+    # emitted only where a loop closes forces the re-read that a poll needs and
+    # leaves every straight-line path free to optimise.
+    option(SKATE3_GUEST_LOOP_BARRIER "Compiler barrier at guest loop back edges" ON)
+    if(SKATE3_GUEST_LOOP_BARRIER)
+        target_compile_definitions(skate3 PRIVATE REX_GUEST_LOOP_BARRIER=1)
+    endif()
+
+    # GCC in gnu++ mode defaults to -ffp-contract=fast and fuses a multiply and
+    # an add across statements. The recompiler emits one PowerPC instruction per
+    # statement and a real fmadd as std::fma, so Clang's default (contract only
+    # within an expression) never fuses anything; match that so float results
+    # agree with the phone builds. The SDK applies the same flag to its own
+    # sources, but that scope does not reach this target.
+    target_compile_options(skate3 PRIVATE $<$<CXX_COMPILER_ID:GNU>:-ffp-contract=off>)
+
     # NVK's two Rust archives each bundle their own copy of the Rust runtime
     # (rust_eh_personality and friends), which Mesa's own link absorbs
     # internally and a downstream consumer cannot. Scoped to this target rather
