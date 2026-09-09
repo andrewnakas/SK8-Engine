@@ -1,6 +1,7 @@
 // See the header for why this exists.
 
 #include "skate3_crash_report.h"
+#include "skate3_guest_trace.h"
 
 #include "skate3_native_scene.h"
 
@@ -697,6 +698,18 @@ void WatchdogMain() {
     // that is exactly where this one sits. Taken a minute apart so they can be
     // compared: identical stacks mean the guest is parked, different ones mean
     // it is working and waiting on something that never completes.
+    // The trace answers "which guest functions ran in this window". Armed
+    // once the title has settled into the freeze, dumped 30s later, so the
+    // recorded set is the code that keeps running while nothing advances.
+    if (uptime == 45) {
+      REXSYS_WARN("[trace] arming guest call trace");
+      skate3::guest_trace::Arm("switch-freeze");
+    }
+    if (uptime == 75) {
+      REXSYS_WARN("[trace] dumping guest call trace");
+      skate3::guest_trace::Dump("switch-freeze");
+    }
+
     if (uptime == 60 || uptime == 120 || uptime == 240) {
       REXSYS_WARN("[dump] periodic thread dump at {}s (not a hang report)", uptime);
       DumpAllThreads();

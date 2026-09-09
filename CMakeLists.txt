@@ -535,6 +535,16 @@ endif()
 
 rexglue_configure_target(skate3)
 
+# The guest call trace hooks every one of the 47,889 recompiled functions, so it
+# is a build-time choice rather than a cvar: --skate3_trace does nothing without
+# it. Off by default; worth the rebuild when the question is "which guest code is
+# running", which no other tool on this platform can answer - the sampling
+# profiler reads another thread's registers and Horizon does not allow that.
+option(SKATE3_ENABLE_GUEST_TRACE "Compile the guest call-trace hook into the recompiled code" OFF)
+if(SKATE3_ENABLE_GUEST_TRACE)
+    target_compile_definitions(skate3 PRIVATE SKATE3_GUEST_TRACE=1)
+endif()
+
 if(SKATE3_SWITCH)
     # NVK's two Rust archives each bundle their own copy of the Rust runtime
     # (rust_eh_personality and friends), which Mesa's own link absorbs
