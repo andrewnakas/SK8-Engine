@@ -709,6 +709,11 @@ extern "C" REX_FUNC(sub_82B82E08) {
     static std::atomic<int64_t> last_exit_ns{0};
     const int64_t now_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(swap_enter.time_since_epoch()).count();
+    // Swap ENTRY to swap ENTRY, so this is the whole frame period - including
+    // the time inside swap, which is reported separately below. It is not the
+    // time outside swap, whatever the name suggests, and reading it as a
+    // sibling of the swap figure rather than its parent will have you looking
+    // for a frame's worth of work that is not there.
     const int64_t last = last_exit_ns.exchange(now_ns, std::memory_order_relaxed);
     if (last != 0) {
       g_frame_outside_swap_us.fetch_add(uint64_t((now_ns - last) / 1000), std::memory_order_relaxed);
@@ -1520,7 +1525,8 @@ void LogFrameBudget() {
   const uint64_t hooks = g_frame_hooks_us.load(std::memory_order_relaxed);
   const uint64_t outside = g_frame_outside_swap_us.load(std::memory_order_relaxed);
   const uint64_t dn = n - last_n;
-  REXLOG_WARN("[frame] {} frames | since last: {} frames, swap {} us, hooks {} us, rest {} us",
+  // "frame" rather than "rest" for the last one: it is the whole frame period.
+  REXLOG_WARN("[frame] {} frames | since last: {} frames, swap {} us, hooks {} us, frame {} us",
               n, dn, dn ? (inner - last_inner) / dn : 0, dn ? (hooks - last_hooks) / dn : 0,
               dn ? (outside - last_outside) / dn : 0);
   last_n = n;
@@ -1994,8 +2000,14 @@ extern "C" REX_FUNC(sub_82B76080) {
       // 48 C - power budget it could otherwise spend on clocks. The wait is
       // ~43 ms, so sleeping at 100 us granularity cannot meaningfully delay
       // noticing that it ended.
+#if defined(__SWITCH__)
+      // Not nanosleep: devkitA64's returns in about half the time asked for on
+      // this console, so this would be a 50 us sleep wearing a 100 us label.
+      svcSleepThread(100000);
+#else
       struct timespec ts = {0, 100000};
       nanosleep(&ts, nullptr);
+#endif
     }
   }
   __imp__sub_82B76080(ctx, base);

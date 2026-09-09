@@ -713,10 +713,28 @@ void WatchdogMain() {
   int stalled_ticks = 0;
   uint64_t last_work = 0;
   int idle_ticks = 0;
+  // Uptime comes from the clock, not from counting how many times we meant to
+  // sleep for a second. devkitA64's nanosleep returns in about HALF the time it
+  // is asked for on this console - measured at 1.97x against both the log's
+  // wall clock and the audio device's own submission rate, which is hardware
+  // paced. Counting ticks therefore ran uptime at double speed, which silently
+  // doubled every rate derived from it (the job scan figures were reported at
+  // half their true value) and fired the trace window and the thread dumps at
+  // half the intended moment. steady_clock is right here - the frame budget
+  // measured with it reconciles with wall time - so ask it.
+  const auto started = std::chrono::steady_clock::now();
   for (;;) {
     struct timespec ts = {1, 0};
     nanosleep(&ts, nullptr);
-    const uint64_t uptime = g_uptime_seconds.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t uptime = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count());
+    // The short sleep means this loop now runs about twice a second, so skip
+    // the ticks where the second has not actually changed.
+    if (uptime == g_uptime_seconds.load(std::memory_order_relaxed)) {
+      continue;
+    }
+    g_uptime_seconds.store(uptime, std::memory_order_relaxed);
 
 #if defined(__SWITCH__)
     // A periodic sign of life. The watchdog only speaks up when it decides

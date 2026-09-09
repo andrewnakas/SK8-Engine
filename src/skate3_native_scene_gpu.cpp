@@ -7622,15 +7622,45 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
   {
     static uint64_t s_beat_frame = 0;
     static uint64_t s_beat_draws_all = 0;
-    if (frames - s_beat_frame >= 1800) {  // ~30 s at 60 fps
+    static std::chrono::steady_clock::time_point s_beat_at{};
+    // Every ten seconds of wall clock, not every 1800 frames. A frame count is
+    // the wrong unit for a heartbeat whose whole job is to describe a device
+    // that is running slowly: 1800 frames is thirty seconds at sixty and six
+    // MINUTES at five, so the one report from a thirteen minute Switch run
+    // landed before the world had even loaded and said, accurately and
+    // uselessly, that nothing was being drawn yet.
+    const auto beat_now = std::chrono::steady_clock::now();
+    if (s_beat_at.time_since_epoch().count() == 0) {
+      s_beat_at = beat_now;
+    }
+    if (beat_now - s_beat_at >= std::chrono::seconds(10)) {
+      s_beat_at = beat_now;
       s_beat_frame = frames;
       const uint64_t draws_all_now = g_draws_all.load(std::memory_order_relaxed);
+      // Why the scene is empty, not just that it is. items=0 has three quite
+      // different causes and they need different fixes: the game is genuinely
+      // in a menu, the guest capture published nothing, or it published plenty
+      // and the takeover gate has not opened. So report the presence context
+      // the menu decision is made from, whether this frame is being drawn as a
+      // native loading frame, and how many items the LAST publish carried -
+      // which is a different number from the one being drawn.
+      size_t published_items = 0;
+      uint64_t published_gen = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_scene_mutex);
+        if (g_scene) {
+          published_items = g_scene->items.size();
+          published_gen = g_scene->generation;
+        }
+      }
       REXLOG_WARN(
           "native-scene: alive frame={} items={} draws={} draws_2d={} "
-          "draws_since_last={}",
+          "draws_since_last={} | presence={} loading_native={} published_items={} gen={}",
           frames, scene.items.size(), drawn,
           g_draws_2d.load(std::memory_order_relaxed),
-          draws_all_now - s_beat_draws_all);
+          draws_all_now - s_beat_draws_all,
+          rex::kernel::guest_presence::GameplayContextValue(), g_loading_native_frame ? 1 : 0,
+          published_items, published_gen);
       s_beat_draws_all = draws_all_now;
       // Same cadence: does the static image still match what was loaded?
       skate3::image_watch::Tick(frames);
