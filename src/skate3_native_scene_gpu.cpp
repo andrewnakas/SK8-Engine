@@ -7675,7 +7675,12 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     // the command processor thread, decode inline on the render thread
     // (count = decodes this window; max = the worst single decode).
     const double guest_dt_ms = g_pw_guest_dt.AvgMs();
-    REXLOG_INFO(
+    // Warn, not info. This is the only breakdown of where the frame goes, and
+    // it is already behind a cvar that is off by default - so the log level is
+    // a second lock on a door that is locked. Worse, reading it meant raising
+    // the whole process to info, which on this port turns on the guest
+    // driver's own printing and changes the timing being measured.
+    REXLOG_WARN(
         "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
         "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms "
         "bld[2d={:.2f}/{:.2f} spl={:.2f}/{:.2f} pal={:.2f}/{:.2f}]ms "
@@ -7779,7 +7784,12 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
   if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     uint32_t lw_ctxs = 0, lw_ents = 0;
     skate3::native_lw::QueryLwStats(&lw_ctxs, &lw_ents);
-    REXLOG_INFO(
+    // Warn, not info. This is the only breakdown of where the frame goes, and
+    // it is already behind a cvar that is off by default - so the log level is
+    // a second lock on a door that is locked. Worse, reading it meant raising
+    // the whole process to info, which on this port turns on the guest
+    // driver's own printing and changes the timing being measured.
+    REXLOG_WARN(
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} askip={} astale={} pending={} badfmt={} stride={} notex={} textures={}] "
