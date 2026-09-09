@@ -714,14 +714,12 @@ void WatchdogMain() {
   uint64_t last_work = 0;
   int idle_ticks = 0;
   // Uptime comes from the clock, not from counting how many times we meant to
-  // sleep for a second. devkitA64's nanosleep returns in about HALF the time it
-  // is asked for on this console - measured at 1.97x against both the log's
-  // wall clock and the audio device's own submission rate, which is hardware
-  // paced. Counting ticks therefore ran uptime at double speed, which silently
-  // doubled every rate derived from it (the job scan figures were reported at
-  // half their true value) and fired the trace window and the thread dumps at
-  // half the intended moment. steady_clock is right here - the frame budget
-  // measured with it reconciles with wall time - so ask it.
+  // sleep for a second. The count was wrong because two watchdogs were running
+  // and both incremented it (see StartWatchdog); asking the clock is right
+  // regardless of how many threads ask, and does not drift if a sleep runs
+  // long. Every rate derived from uptime was reported at half its true value
+  // while this was broken, and the trace window and thread dumps fired at half
+  // the uptime they were aimed at.
   const auto started = std::chrono::steady_clock::now();
   for (;;) {
     struct timespec ts = {1, 0};
@@ -885,6 +883,18 @@ void WatchdogMain() {
 }
 
 void StartWatchdog() {
+  // Once, however many times it is asked for. There are two independent entry
+  // points - StartWatchdogEarly before the guest starts, and EnsureInstalled
+  // from the first guest swap - and each had its own std::once_flag, so each
+  // started a watchdog and BOTH ran for the whole session. Every periodic line
+  // was therefore printed twice (which is why [progress], [heap], [frame] and
+  // [jobs] all appeared in alternating pairs from two thread ids), every
+  // mallinfo() walk was done twice on a heap with 37,000 free chunks, and
+  // uptime - a counter each thread incremented once a second - advanced at two
+  // seconds per second. That last one was measured as a 1.97x clock error and
+  // very nearly blamed on nanosleep.
+  static std::once_flag once;
+  std::call_once(once, [] {
 #if defined(__linux__)
   struct sigaction sa = {};
   sa.sa_sigaction = ThreadDumpHandler;
@@ -894,7 +904,8 @@ void StartWatchdog() {
     return;
   }
 #endif
-  std::thread(WatchdogMain).detach();
+    std::thread(WatchdogMain).detach();
+  });
 }
 
 // REX_FATAL (a guest call through a null/unregistered function pointer, among

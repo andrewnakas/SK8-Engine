@@ -2001,8 +2001,8 @@ extern "C" REX_FUNC(sub_82B76080) {
       // ~43 ms, so sleeping at 100 us granularity cannot meaningfully delay
       // noticing that it ended.
 #if defined(__SWITCH__)
-      // Not nanosleep: devkitA64's returns in about half the time asked for on
-      // this console, so this would be a 50 us sleep wearing a 100 us label.
+      // The syscall directly rather than nanosleep: one less libc layer on the
+      // path, and this is the only sleep in the frame's critical path.
       svcSleepThread(100000);
 #else
       struct timespec ts = {0, 100000};
