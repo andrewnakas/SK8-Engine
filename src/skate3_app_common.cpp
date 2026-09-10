@@ -53,6 +53,7 @@ REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
 #include "skate3_warp.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -133,6 +134,9 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam_capture_input);
 // Defined by the two installers; read here to decide whether the interactive
 // wizard is needed at all.
 REXCVAR_DECLARE(std::string, skate3_install_iso);
+// Set when a custom map pack is staged; see ApplyContentPackWorkarounds.
+REXCVAR_DECLARE(uint32_t, license_mask);
+REXCVAR_DECLARE(std::string, vfs_path_alias);
 REXCVAR_DECLARE(std::string, skate3_install_tu);
 
 REXCVAR_DEFINE_STRING(skate3_dlc_root, "", "Skate 3",
@@ -1819,6 +1823,262 @@ bool CopyFileBytes(const std::filesystem::path& from, const std::filesystem::pat
   return ok;
 }
 
+// ---- Content-pack descriptor repair -------------------------------------
+//
+// A .header is one XCONTENT_AGGREGATE_DATA record. The engine's struct is the
+// 360's: XCONTENT_DATA occupies [0, 0x134), then `xuid` is an 8-byte field and
+// so lands 8-ALIGNED at 0x138, `title_id` at 0x140, and four bytes of tail
+// padding carry the record to 0x148.
+//
+// d2s3 - the tool everyone builds custom maps with - writes those two fields
+// PACKED instead, at 0x134 and 0x13C. Every byte before 0x134 agrees, so the
+// pack looks perfectly well formed right up until the two fields that decide
+// whether it is ours: read at the aligned offsets, DM Jumpline's descriptor
+// yields title_id = 0 and xuid = 0x454108E6, which is the title id sitting one
+// field to the left. The content manager then looks for a package belonging to
+// title 0 and finds nothing, and the map is silently absent.
+//
+// It also stops at 0x148, and LoadPackageLicenseMask ignores any descriptor
+// too short to carry the four trailing license bytes - so no pack d2s3 makes
+// can ever say it is licensed.
+//
+// Both were repaired by hand with a hex editor for the one pack this port was
+// developed against. That is not something a player can be asked to do, so
+// staging now rewrites the descriptor into the layout the engine reads.
+constexpr size_t kXContentDataSize = 0x134;       // XCONTENT_DATA
+constexpr size_t kXContentRecordSize = 0x148;     // XCONTENT_AGGREGATE_DATA
+constexpr size_t kXContentFileNameOffset = 0x108;  // file_name_raw
+constexpr size_t kXContentFileNameSize = 42;
+constexpr size_t kXContentTypeOffset = 0x4;
+constexpr size_t kXuidOffsetAligned = 0x138;
+constexpr size_t kXuidOffsetPacked = 0x134;
+constexpr size_t kTitleIdOffsetAligned = 0x140;
+constexpr size_t kTitleIdOffsetPacked = 0x13C;
+constexpr uint32_t kMarketplaceContentType = 2;
+
+uint32_t ReadBe32(const uint8_t* p) {
+  return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+uint64_t ReadBe64(const uint8_t* p) {
+  return (uint64_t(ReadBe32(p)) << 32) | uint64_t(ReadBe32(p + 4));
+}
+void WriteBe32(uint8_t* p, uint32_t v) {
+  p[0] = uint8_t(v >> 24);
+  p[1] = uint8_t(v >> 16);
+  p[2] = uint8_t(v >> 8);
+  p[3] = uint8_t(v);
+}
+void WriteBe64(uint8_t* p, uint64_t v) {
+  WriteBe32(p, uint32_t(v >> 32));
+  WriteBe32(p + 4, uint32_t(v));
+}
+
+// Reads a descriptor, zero-filling anything the file is too short to supply.
+// False means it could not be opened or is not even a whole XCONTENT_DATA.
+bool ReadContentPackHeader(const std::filesystem::path& path,
+                           std::array<uint8_t, kXContentRecordSize>& out, uint32_t& license_out) {
+  out.fill(0);
+  license_out = 0;
+  FILE* in = std::fopen(path.string().c_str(), "rb");
+  if (in == nullptr) {
+    return false;
+  }
+  const size_t got = std::fread(out.data(), 1, out.size(), in);
+  // The license mask, when the packer was generous enough to leave room.
+  if (got == out.size()) {
+    uint32_t mask = 0;
+    if (std::fread(&mask, 1, sizeof(mask), in) == sizeof(mask)) {
+      license_out = mask;
+    }
+  }
+  std::fclose(in);
+  return got >= kXContentDataSize;
+}
+
+// The name the content manager will look this package up BY, which is not
+// necessarily the folder it arrived in.
+//
+// ListContent enumerates the staged directories and resolves each one's
+// descriptor as <dir>.header; the descriptor's own file_name field is then
+// what ResolvePackagePath turns back into a directory. So the staged directory
+// has to be named by what is INSIDE the header. Naming it after the pack's
+// folder worked only for as long as the two agreed - rename the folder on the
+// way in, which is the first thing anyone does to a download, and the title
+// enumerates a package whose data directory does not exist.
+//
+// file_name_raw is 42 bytes and is not required to be terminated, hence the
+// bounded read. Empty means "unusable, fall back to the folder name".
+std::string ContentPackHeaderName(const std::filesystem::path& header) {
+  std::array<uint8_t, kXContentRecordSize> buf{};
+  uint32_t license = 0;
+  if (!ReadContentPackHeader(header, buf, license)) {
+    return {};
+  }
+  const char* raw = reinterpret_cast<const char*>(buf.data() + kXContentFileNameOffset);
+  std::string name(raw, ::strnlen(raw, kXContentFileNameSize));
+  // A descriptor is not a trusted input: it names a directory that is about to
+  // be created next to the player's saves.
+  if (name.empty() || name.size() > kXContentFileNameSize) {
+    return {};
+  }
+  for (const char c : name) {
+    const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    c == '_' || c == '-' || c == '.' || c == ' ';
+    if (!ok) {
+      return {};
+    }
+  }
+  if (name == "." || name == "..") {
+    return {};
+  }
+  return name;
+}
+
+// Writes `from`'s descriptor out in the layout the content manager reads, with
+// a license mask appended. See the block comment above for why this is not a
+// copy. Returns false and fills `ec` on failure.
+bool StageContentPackHeader(const std::filesystem::path& from, const std::filesystem::path& to,
+                            uint32_t title_id, const std::string& package, std::error_code& ec) {
+  ec.clear();
+  std::array<uint8_t, kXContentRecordSize> buf{};
+  uint32_t license = 0;
+  if (!ReadContentPackHeader(from, buf, license)) {
+    ec = std::error_code(errno ? errno : EINVAL, std::generic_category());
+    return false;
+  }
+
+  // Which layout is this? The title id is the discriminator: it is the one
+  // field whose correct value we already know, and the two candidate offsets
+  // cannot both hold it.
+  const uint32_t title_aligned = ReadBe32(buf.data() + kTitleIdOffsetAligned);
+  const uint32_t title_packed = ReadBe32(buf.data() + kTitleIdOffsetPacked);
+  bool packed = false;
+  if (title_aligned == title_id) {
+    packed = false;  // already what we want
+  } else if (title_packed == title_id) {
+    packed = true;
+  } else {
+    // Neither offset holds this title's id. The pack was built for another
+    // title, or by a packer doing something else again. Staging it under this
+    // title is what the player asked for by dropping it in, so go on - but say
+    // so, because "the map is not in the list" has no other explanation.
+    packed = (title_aligned == 0 && title_packed != 0);
+    REXLOG_WARN(
+        "Skate 3: content pack '{}' names title {:08X}/{:08X}, not {:08X} - staging it as this "
+        "title's content anyway",
+        package, title_aligned, title_packed, title_id);
+  }
+
+  const uint64_t xuid =
+      ReadBe64(buf.data() + (packed ? kXuidOffsetPacked : kXuidOffsetAligned));
+
+  // The tree this is being staged into is 00000002, marketplace content. A
+  // descriptor claiming anything else sends ResolvePackagePath looking in a
+  // different tree, so it would enumerate and then resolve to nothing.
+  const uint32_t content_type = ReadBe32(buf.data() + kXContentTypeOffset);
+  if (content_type != kMarketplaceContentType) {
+    REXLOG_WARN("Skate 3: content pack '{}' declares content type {:08X}; staging it as {:08X}",
+                package, content_type, kMarketplaceContentType);
+  }
+
+  std::array<uint8_t, kXContentRecordSize + sizeof(uint32_t)> out{};
+  // Everything below 0x134 is layout-identical in both, and is the only part
+  // of the descriptor that carries information we cannot reconstruct.
+  std::memcpy(out.data(), buf.data(), kXContentDataSize);
+  WriteBe32(out.data() + kXContentTypeOffset, kMarketplaceContentType);
+  WriteBe64(out.data() + kXuidOffsetAligned, xuid);
+  WriteBe32(out.data() + kTitleIdOffsetAligned, title_id);
+  // Host byte order: LoadPackageLicenseMask freads straight into a uint32_t.
+  // All bits - the title asks whether each is granted and there is no way to
+  // know from here which ones a given pack expects.
+  if (license == 0) {
+    license = 0xFFFFFFFFu;
+  }
+  std::memcpy(out.data() + kXContentRecordSize, &license, sizeof(license));
+
+  FILE* f = std::fopen(to.string().c_str(), "wb");
+  if (f == nullptr) {
+    ec = std::error_code(errno ? errno : EIO, std::generic_category());
+    return false;
+  }
+  const bool ok = std::fwrite(out.data(), 1, out.size(), f) == out.size() && std::fflush(f) == 0;
+  std::fclose(f);
+  if (!ok) {
+    ec = std::error_code(errno ? errno : EIO, std::generic_category());
+    std::error_code rm_ec;
+    std::filesystem::remove(to, rm_ec);
+    return false;
+  }
+  REXLOG_WARN(
+      "Skate 3: staged descriptor for '{}' ({} layout, title {:08X}, xuid {:016X}, license "
+      "{:08X}, {} bytes)",
+      package, packed ? "packed->aligned" : "aligned", title_id, xuid, license, out.size());
+  return true;
+}
+
+// The two halves of a pack, by extension. Both empty means it is not one.
+void FindContentPackFiles(const std::filesystem::path& dir, std::filesystem::path& big,
+                          std::filesystem::path& header) {
+  std::error_code ec;
+  for (const auto& file : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec || !file.is_regular_file()) {
+      continue;
+    }
+    const auto ext = file.path().extension();
+    if (ext == ".big") {
+      big = file.path();
+    } else if (ext == ".header") {
+      header = file.path();
+    }
+  }
+}
+
+// The descriptor's own name for the package, falling back to the folder when
+// the field is empty or holds something that has no business naming a
+// directory. See ContentPackHeaderName.
+std::string ContentPackName(const std::filesystem::path& header, const std::string& folder) {
+  std::string name = header.empty() ? std::string() : ContentPackHeaderName(header);
+  return name.empty() ? folder : name;
+}
+
+// Two defaults that a custom map cannot load without, applied only once a pack
+// is actually staged so a stock launch is untouched. Both are cvars, so an
+// explicit setting in switch_args.txt still wins.
+void ApplyContentPackWorkarounds(const std::string& package) {
+  // XamContentGetLicenseMask answers the "was this purchased" question from
+  // this one global, and 0 means nothing was: the title enumerates a perfectly
+  // good pack and then refuses it. The per-package mask in the descriptor is a
+  // different question with a different answer path, and staging writes that
+  // one - this is the other. All bits, because there is no way from here to
+  // know which a given pack expects.
+  if (REXCVAR_GET(license_mask) == 0) {
+    REXCVAR_SET(license_mask, 0xFFFFFFFFu);
+    REXLOG_WARN("Skate 3: content pack staged - granting all licenses (license_mask=FFFFFFFF)");
+  }
+
+  // The world-name defect, generically.
+  //
+  // Packs from the PS3->360 importer register their world with a "dlc" suffix
+  // the shipped files do not carry: DM Jumpline registers "dmjumplinedlc" and
+  // ships everything as "DMJumpline", so leaving the map opens
+  // d:\data\stream\dist_dmjumplinedlc_Sim.xml and there is no such file. That
+  // is fatal rather than cosmetic here, because this title uses a failed
+  // NtCreateFile return as a POINTER instead of checking it - the access
+  // violation on the way out of a custom map is deterministic.
+  //
+  // The suffix is the packer's, not this pack's, so it can be derived instead
+  // of hand-written per pack: the alias is tried only after a resolve has
+  // already failed, and a pack that does not have the defect never matches it.
+  if (REXCVAR_GET(vfs_path_alias).empty()) {
+    std::string lower = package;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    const std::string alias = lower + "dlc=" + lower;
+    REXCVAR_SET(vfs_path_alias, alias);
+    REXLOG_WARN("Skate 3: content pack staged - world-name alias '{}'", alias);
+  }
+}
+
 void Skate3BaseApp::StageContentPacks() {
   // Custom map packs ship as already-extracted marketplace content - a .big
   // beside its .header - rather than an STFS package the DLC installer could
@@ -1833,8 +2093,13 @@ void Skate3BaseApp::StageContentPacks() {
   // manager with content it has no descriptor for.
   //
   // On a phone a pack can only be dropped at the top of Documents, so this
-  // moves it into place at every start. The folder name is load-bearing: the
-  // id inside the header has to match it or the package is dropped silently.
+  // moves it into place at every start. <PKG> is read out of the descriptor
+  // rather than taken from the folder: the content manager enumerates the
+  // staged directories and then resolves each one BY THE file_name INSIDE its
+  // header, so the two have to agree, and only one of them is under our
+  // control. Naming the directory after the folder made renaming a download -
+  // the first thing anyone does to one - silently stage a package the title
+  // could enumerate but never open.
   if (!runtime() || !runtime()->kernel_state()) {
     return;
   }
@@ -1891,30 +2156,28 @@ void Skate3BaseApp::StageContentPacks() {
   }
 
   for (const auto& entry : candidates) {
-    const std::string package = entry.filename().string();
+    // The folder is what the player picks by - it is the name the chooser
+    // showed and the name skate3_content_pack matches.
+    const std::string folder = entry.filename().string();
     // A named pack wins; otherwise the first by name, so the choice is at
     // least stable between launches rather than filesystem order.
-    if (!wanted.empty() && package != wanted) {
+    if (!wanted.empty() && folder != wanted) {
       continue;
     }
 
     std::filesystem::path big, header;
-    std::error_code scan_ec;
-    for (const auto& file : std::filesystem::directory_iterator(entry, scan_ec)) {
-      if (scan_ec || !file.is_regular_file()) {
-        continue;
-      }
-      const auto ext = file.path().extension();
-      if (ext == ".big") {
-        big = file.path();
-      } else if (ext == ".header") {
-        header = file.path();
-      }
-    }
+    FindContentPackFiles(entry, big, header);
     // Both halves or nothing: content without its descriptor is what the
     // content manager silently drops, and a descriptor alone names nothing.
     if (big.empty() || header.empty()) {
       continue;
+    }
+    // What the content manager will call it, which is whatever the descriptor
+    // says and only incidentally the folder.
+    const std::string package = ContentPackName(header, folder);
+    if (package != folder) {
+      REXLOG_WARN("Skate 3: content pack folder '{}' holds package '{}'; staging it as '{}'",
+                  folder, package, package);
     }
 
     // Clear every other pack we know about first. Staging is additive, and a
@@ -1923,7 +2186,15 @@ void Skate3BaseApp::StageContentPacks() {
     // loading whichever it found first. Only the packs this scan found are
     // touched, so official content installed by other means is left alone.
     for (const auto& other : candidates) {
-      const std::string other_name = other.filename().string();
+      if (other == entry) {
+        continue;
+      }
+      std::filesystem::path other_big, other_header;
+      FindContentPackFiles(other, other_big, other_header);
+      // Named the same way it would have been staged, or the sweep misses it
+      // and leaves exactly the second installed pack this is here to prevent.
+      const std::string other_name =
+          ContentPackName(other_header, other.filename().string());
       if (other_name == package) {
         continue;
       }
@@ -1934,25 +2205,39 @@ void Skate3BaseApp::StageContentPacks() {
         REXLOG_INFO("Skate 3: removed previously staged pack '{}'", other_name);
       }
       std::filesystem::remove(headers_dir / (other_name + ".header"), rm_ec);
+      // Packs staged by a build that named the directory after the folder.
+      if (other.filename().string() != other_name) {
+        const auto legacy_dir = content_dir / other.filename();
+        if (std::filesystem::exists(legacy_dir, rm_ec)) {
+          std::filesystem::remove_all(legacy_dir, rm_ec);
+        }
+        std::filesystem::remove(headers_dir / (other.filename().string() + ".header"), rm_ec);
+      }
     }
 
     const auto target_dir = content_dir / package;
     const auto target_big = target_dir / big.filename();
     const auto target_header = headers_dir / (package + ".header");
-    if (std::filesystem::exists(target_big, ec) &&
-        std::filesystem::exists(target_header, ec)) {
+    // A descriptor of the wrong length is one an older build copied through
+    // verbatim, before staging repaired the layout - restage it rather than
+    // leave the player with a pack that will not open and no way to know why.
+    const bool header_current =
+        std::filesystem::exists(target_header, ec) &&
+        std::filesystem::file_size(target_header, ec) == kXContentRecordSize + sizeof(uint32_t);
+    if (std::filesystem::exists(target_big, ec) && header_current) {
       REXLOG_INFO("Skate 3 content pack '{}' already staged", package);
+      ApplyContentPackWorkarounds(package);
       break;  // one per launch; others were cleared above
     }
 
     std::filesystem::create_directories(target_dir, ec);
     std::filesystem::create_directories(headers_dir, ec);
     std::error_code copy_ec;
-    if (!CopyFileBytes(big, target_big, copy_ec)) {
+    if (!std::filesystem::exists(target_big, ec) && !CopyFileBytes(big, target_big, copy_ec)) {
       REXLOG_WARN("Could not stage '{}' content: {}", package, copy_ec.message());
       continue;
     }
-    if (!CopyFileBytes(header, target_header, copy_ec)) {
+    if (!StageContentPackHeader(header, target_header, title_id, package, copy_ec)) {
       REXLOG_WARN("Could not stage '{}' header: {}", package, copy_ec.message());
       continue;
     }
@@ -1964,6 +2249,7 @@ void Skate3BaseApp::StageContentPacks() {
                 uint64_t(std::filesystem::file_size(target_header, ec)));
     REXLOG_INFO("Staged Skate 3 content pack '{}' ({} + {})", package,
                 target_big.string(), target_header.string());
+    ApplyContentPackWorkarounds(package);
     break;  // one per launch
   }
 }
