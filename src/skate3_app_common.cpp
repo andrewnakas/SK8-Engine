@@ -1,4 +1,6 @@
 #include "skate3_app_common.h"
+#include <cstdio>
+#include <cerrno>
 
 #if defined(__ANDROID__)
 #include "skate3_android_bridge.h"
@@ -1762,6 +1764,61 @@ bool Skate3BaseApp::IsContentPackFolder(const std::filesystem::path& dir) {
   return false;
 }
 
+// std::filesystem::copy_file does not work on this platform: staging DM
+// Jumpline failed with ENOSYS ("Function not implemented") having already
+// created a ZERO-BYTE destination, so the pack shipped a 45 MB .big and the
+// game found an empty file and no header at all. libstdc++ reaches for
+// sendfile/fchmod-class calls that devkitPro's newlib does not provide over
+// sdmc. A plain read/write loop is all this ever needed.
+//
+// Returns false and fills `ec` on failure, and removes a partial destination
+// rather than leaving the truncated file that caused the original confusion.
+bool CopyFileBytes(const std::filesystem::path& from, const std::filesystem::path& to,
+                   std::error_code& ec) {
+  ec.clear();
+  FILE* in = std::fopen(from.string().c_str(), "rb");
+  if (in == nullptr) {
+    ec = std::error_code(errno, std::generic_category());
+    return false;
+  }
+  FILE* out = std::fopen(to.string().c_str(), "wb");
+  if (out == nullptr) {
+    ec = std::error_code(errno, std::generic_category());
+    std::fclose(in);
+    return false;
+  }
+  // 1 MB: the packs are tens of megabytes and this runs on the SD card.
+  constexpr size_t kChunk = 1u << 20;
+  std::vector<char> buf(kChunk);
+  bool ok = true;
+  for (;;) {
+    const size_t got = std::fread(buf.data(), 1, kChunk, in);
+    if (got == 0) {
+      if (std::ferror(in)) {
+        ec = std::error_code(errno ? errno : EIO, std::generic_category());
+        ok = false;
+      }
+      break;
+    }
+    if (std::fwrite(buf.data(), 1, got, out) != got) {
+      ec = std::error_code(errno ? errno : EIO, std::generic_category());
+      ok = false;
+      break;
+    }
+  }
+  if (ok && std::fflush(out) != 0) {
+    ec = std::error_code(errno ? errno : EIO, std::generic_category());
+    ok = false;
+  }
+  std::fclose(out);
+  std::fclose(in);
+  if (!ok) {
+    std::error_code rm_ec;
+    std::filesystem::remove(to, rm_ec);
+  }
+  return ok;
+}
+
 void Skate3BaseApp::StageContentPacks() {
   // Custom map packs ship as already-extracted marketplace content - a .big
   // beside its .header - rather than an STFS package the DLC installer could
@@ -1891,18 +1948,20 @@ void Skate3BaseApp::StageContentPacks() {
     std::filesystem::create_directories(target_dir, ec);
     std::filesystem::create_directories(headers_dir, ec);
     std::error_code copy_ec;
-    std::filesystem::copy_file(big, target_big,
-                               std::filesystem::copy_options::overwrite_existing, copy_ec);
-    if (copy_ec) {
+    if (!CopyFileBytes(big, target_big, copy_ec)) {
       REXLOG_WARN("Could not stage '{}' content: {}", package, copy_ec.message());
       continue;
     }
-    std::filesystem::copy_file(header, target_header,
-                               std::filesystem::copy_options::overwrite_existing, copy_ec);
-    if (copy_ec) {
+    if (!CopyFileBytes(header, target_header, copy_ec)) {
       REXLOG_WARN("Could not stage '{}' header: {}", package, copy_ec.message());
       continue;
     }
+    // Both halves or neither: a .big with no header beside it is what the
+    // failed copy left behind, and the title then reports its content device
+    // as removed rather than saying anything useful.
+    REXLOG_WARN("Skate 3: staged content pack '{}' ({} bytes + {} byte header)", package,
+                uint64_t(std::filesystem::file_size(target_big, ec)),
+                uint64_t(std::filesystem::file_size(target_header, ec)));
     REXLOG_INFO("Staged Skate 3 content pack '{}' ({} + {})", package,
                 target_big.string(), target_header.string());
     break;  // one per launch
