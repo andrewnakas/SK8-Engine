@@ -5850,11 +5850,28 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         for (int i = 0; i < 36; ++i) {
           d.consts[i] = LoadGuestF32(base, bank + i * 4);
         }
-        std::lock_guard<std::mutex> lock(g_2d_mutex);
-        if (g_frame_2d.size() < 4096) {
-          g_frame_2d.push_back(std::move(d));
+        // Copy the VERTICES here, not at frame end.
+        //
+        // d.addr is the guest's inline-ring write pointer and that ring is
+        // CIRCULAR: the game keeps writing into it for the rest of the frame.
+        // Reading the bytes back at frame end therefore read whatever had
+        // landed there since - a later draw's geometry - so HUD elements drew
+        // at each other's positions, doubled, with one quad stretched right
+        // across the screen. Capture is the only moment the pointer and the
+        // bytes agree.
+        //
+        // The gate above bounds this: count <= 65536, stride <= 256.
+        const size_t vbytes = size_t(r5) * size_t(r6);
+        d.verts.resize(vbytes);
+        if (!GuestTryCopy(d.verts.data(), base + r7, vbytes)) {
+          g_2d_copyfail.fetch_add(1, std::memory_order_relaxed);
         } else {
-          g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
+          std::lock_guard<std::mutex> lock(g_2d_mutex);
+          if (g_frame_2d.size() < 4096) {
+            g_frame_2d.push_back(std::move(d));
+          } else {
+            g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
+          }
         }
       }
     } else {
@@ -8354,12 +8371,14 @@ void Publish2dDraws(uint8_t* base) {
       g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
+    // The vertices were copied at CAPTURE (see the ring comment there); the
+    // guest ring they came from has long since been overwritten.
     const uint32_t bytes = d.count * d.stride;
-    scratch_2d.resize(bytes);
-    if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
+    if (d.verts.size() != bytes) {
       g_2d_copyfail.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
+    scratch_2d.assign(d.verts.begin(), d.verts.end());
     // Guest dwords are big-endian.
     for (size_t i = 0; i + 4 <= scratch_2d.size(); i += 4) {
       uint32_t v;
