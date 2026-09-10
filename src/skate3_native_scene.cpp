@@ -224,21 +224,16 @@ REXCVAR_DEFINE_INT32(
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(
-    skate3_native_render_scene_empty_hold_frames, -1, "Skate 3",
+    skate3_native_render_scene_empty_hold_frames, 30, "Skate 3",
     "How many consecutive frames the native renderer keeps drawing the last "
     "world scene the guest published, when the guest publishes nothing. A gap "
     "of a frame or two is normal - menus and transitions stop submitting the "
     "world - and yielding the frame to the emulated path for each of them is "
     "what makes the screen, and the HUD with it, flicker: the two renderers "
     "draw different pictures on alternate frames. Past the budget the frame "
-    "is yielded as before, so a real handover still happens. -1 (the "
-    "default) holds indefinitely, which is what the in-game menu needs: a "
-    "BOUNDED hold there is worse than either extreme, because the guest "
-    "stops publishing, the hold expires, the frame yields, one publish takes "
-    "it back, and the menu strobes at the budget's period instead of sitting "
-    "still. A load clears the held scene either way. 0 = old behaviour, "
-    "yield on the first empty frame.")
-    .range(-1, 600)
+    "is yielded as before, so a real handover still happens. 0 = old "
+    "behaviour, yield on the first empty frame.")
+    .range(0, 600)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr, true, "Skate 3",
                     "Render the 3D scene into a float (HDR) intermediate and apply the "

@@ -8635,25 +8635,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // screen flickers, HUD and all. That is the "menu flashes on and off"
       // report, and it is a gap of a frame or two, not a real handover.
       //
-      // Hold the last world scene across the gap instead.
-      //
-      // A BOUNDED hold was worse than either extreme, and the in-game menu
-      // showed it: the guest stops publishing there, so the hold expired
-      // after its budget, the frame yielded, the guest published once, the
-      // renderer took it back, and the whole cycle repeated - a menu that
-      // used to sit still (consistently emulated, because it yielded on
-      // every empty frame) now strobed at the budget's period. A partial
-      // hold turns a static picture into an oscillator.
-      //
-      // So hold indefinitely by default. Nothing is stranded: a load clears
-      // the held scene above, because it belongs to the previous map, and
-      // the 2D overlay still replays live on top - which is exactly what a
-      // pause menu wants, its own UI over the world it paused.
+      // Hold the last world scene across the gap instead. Bounded, so a
+      // genuine transition to the emulated path still happens: after the
+      // budget the frame is yielded exactly as before.
       const int32_t hold =
           REXCVAR_GET(skate3_native_render_scene_empty_hold_frames);
-      const bool unlimited = hold < 0;
-      if (s_last_world_scene == nullptr || hold == 0 ||
-          (!unlimited && ++s_empty_scene_frames > uint32_t(hold))) {
+      if (s_last_world_scene == nullptr || hold <= 0 ||
+          ++s_empty_scene_frames > uint32_t(hold)) {
         s_last_world_scene = nullptr;
         return false;
       }
