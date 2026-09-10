@@ -5618,13 +5618,13 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
       s_play_base = REXCVAR_GET(native_render_suppress_mode);
       if (s_play_base != play_mode) {
         REXCVAR_SET(native_render_suppress_mode, play_mode);
-        REXLOG_INFO("native-scene: gameplay - suppress mode {} -> {}", s_play_base, play_mode);
+        REXLOG_WARN("native-scene: gameplay - suppress mode {} -> {}", s_play_base, play_mode);
       }
       s_play_forced = true;
     } else if (!want_play && s_play_forced) {
       if (s_play_base != play_mode) {
         REXCVAR_SET(native_render_suppress_mode, s_play_base);
-        REXLOG_INFO("native-scene: left gameplay - suppress mode {} restored", s_play_base);
+        REXLOG_WARN("native-scene: left gameplay - suppress mode {} restored", s_play_base);
       }
       s_play_forced = false;
     }
