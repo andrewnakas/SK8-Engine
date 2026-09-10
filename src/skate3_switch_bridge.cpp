@@ -40,6 +40,28 @@ namespace {
 // Stock rates, which are what "off" restores. The GPU's stock rate differs
 // between handheld and docked; 768 MHz is the docked figure and the system
 // re-derives it on the next mode change anyway.
+// Explicit clock overrides, in MHz, 0 = use the built-in boost value below.
+// Exposed because "overclock the GPU" should not need a rebuild, and because
+// the right number is a property of the console's cooling and silicon rather
+// than of this program. Above 921 MHz on the GPU is beyond Nintendo's own
+// maximum: it is what the sys-clk tools call an overclock, it runs hot, and an
+// unstable one shows up as a hang or a graphical fault rather than damage.
+// Lower it if the console becomes unstable.
+REXCVAR_DEFINE_INT32(switch_cpu_clock_mhz, 0, "Switch",
+                     "CPU clock in MHz when switch_overclock is on (0 = 1785, the built-in "
+                     "boost). Stock is 1020.")
+    .range(0, 2400);
+REXCVAR_DEFINE_INT32(switch_gpu_clock_mhz, 0, "Switch",
+                     "GPU clock in MHz when switch_overclock raises the GPU (0 = 921, which is "
+                     "Nintendo's own docked maximum). Higher is a real overclock: 998, 1075 and "
+                     "1267 are the usual steps, they run hot, and instability shows as a hang or "
+                     "a graphical fault. Handheld will throttle before docked does.")
+    .range(0, 1600);
+REXCVAR_DEFINE_INT32(switch_emc_clock_mhz, 0, "Switch",
+                     "Memory clock in MHz when switch_overclock is 'max' (0 = 1600). Stock is "
+                     "1331.")
+    .range(0, 2133);
+
 constexpr uint32_t kCpuStockHz = 1020000000;
 constexpr uint32_t kCpuBoostHz = 1785000000;
 constexpr uint32_t kGpuStockHz = 768000000;
@@ -63,7 +85,7 @@ bool SetModuleRate(PcvModuleId module, uint32_t hz, const char* name) {
                 rc);
     return false;
   }
-  REXLOG_INFO("switch_overclock: {} set to {} MHz", name, hz / 1000000);
+  REXLOG_WARN("switch_overclock: {} set to {} MHz", name, hz / 1000000);
   return true;
 }
 
@@ -93,14 +115,21 @@ void ApplyClocks() {
       "noticeably less battery in handheld mode.",
       mode);
 
-  bool any = SetModuleRate(PcvModuleId_CpuBus, kCpuBoostHz, "CPU");
+  // A cvar in MHz wins over the compiled-in boost rate.
+  const auto pick = [](int32_t mhz, uint32_t fallback_hz) -> uint32_t {
+    return mhz > 0 ? uint32_t(mhz) * 1000000u : fallback_hz;
+  };
+  bool any = SetModuleRate(PcvModuleId_CpuBus,
+                           pick(REXCVAR_GET(switch_cpu_clock_mhz), kCpuBoostHz), "CPU");
   if (mode == "cpu+gpu" || mode == "max") {
-    any |= SetModuleRate(PcvModuleId_GPU, kGpuBoostHz, "GPU");
+    any |= SetModuleRate(PcvModuleId_GPU, pick(REXCVAR_GET(switch_gpu_clock_mhz), kGpuBoostHz),
+                         "GPU");
   }
   if (mode == "max") {
     // Memory bandwidth is shared with the display controller, and this is the
     // one of the three most likely to be refused outright.
-    any |= SetModuleRate(PcvModuleId_EMC, kEmcBoostHz, "memory");
+    any |= SetModuleRate(PcvModuleId_EMC, pick(REXCVAR_GET(switch_emc_clock_mhz), kEmcBoostHz),
+                         "memory");
   }
   clocks_raised_ = any;
 }
