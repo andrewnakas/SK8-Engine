@@ -8035,7 +8035,11 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     // once per item), so av= is the per-item unit cost in microseconds.
     if (REXCVAR_GET(skate3_native_render_scene_perf_items)) {
       const auto avg_us = [](const PerfWindow& w) { return w.AvgMs() * 1000.0; };
-      REXLOG_INFO(
+      // Warn, like the perf line it hangs off: this is already behind a cvar
+      // that defaults OFF, so the log level was a second lock on a locked
+      // door - and it kept this attribution out of every Switch log, which
+      // runs at warn because info changes the timing it reports.
+      REXLOG_WARN(
           "native-scene perf-items: draw[vis n={} av={:.2f}us mx={:.2f}ms | "
           "occ n={} av={:.2f}us mx={:.2f}ms | out n={} av={:.2f}us "
           "mx={:.2f}ms ret_out={}] idx_k[vis={} occ={} out={}] "

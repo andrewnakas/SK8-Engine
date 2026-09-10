@@ -519,7 +519,12 @@ void ReportPacing() {
     return sorted[i];
   };
   const double secs = std::chrono::duration<double>(elapsed).count();
-  REXLOG_INFO("[pace] {:.0f}s: frames={} fps={:.1f} p50={:.1f}ms p95={:.1f}ms max={:.1f}ms",
+  // Warn: one line per thirty seconds, and the only measure of SMOOTHNESS
+  // this port has - p50 against p95 against max is the difference between
+  // "slow" and "juddering". At info it has never once reached a Switch log,
+  // because raising that console to info turns on the guest driver's own
+  // printing and changes the pacing being measured.
+  REXLOG_WARN("[pace] {:.0f}s: frames={} fps={:.1f} p50={:.1f}ms p95={:.1f}ms max={:.1f}ms",
               secs, sorted.size(), double(sorted.size()) / secs, pct(0.50), pct(0.95),
               sorted.back());
   s_intervals_ms.clear();

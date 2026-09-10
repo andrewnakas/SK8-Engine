@@ -9,6 +9,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <new>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace skate3::native_scene {
@@ -18,6 +23,113 @@ struct DrawEntry {
   uint32_t base_vertex;
   uint32_t start_index;
   uint32_t index_count;
+};
+
+// A vector with a small inline buffer, for DrawItem::draws.
+//
+// Why this exists: the world walk builds ~750 DrawItems every frame and each
+// one filled its draw list through std::vector, so a frame was ~750 mallocs
+// and ~750 frees. That is ordinarily cheap and here it is not - this port
+// runs a 2.7 GB arena with 16-22 MB free spread over ~20,000 chunks, and an
+// allocator searching a free list that shape costs microseconds a call. The
+// measured draw count per item is about 1.5 (items=772 draws=1161), so an
+// inline capacity of 4 keeps essentially every item off the heap entirely
+// while costing 64 bytes in a struct that already carries 288 bytes of
+// char_rows.
+//
+// Deliberately minimal: exactly the operations DrawItem::draws needs, and
+// only for trivially-copyable T (DrawEntry is four uint32_t).
+template <typename T, uint32_t N>
+class InlineVector {
+  static_assert(std::is_trivially_copyable<T>::value,
+                "InlineVector stores T by memcpy");
+
+ public:
+  InlineVector() = default;
+  ~InlineVector() { reset(); }
+
+  InlineVector(const InlineVector& o) { assign(o.begin(), o.end()); }
+  InlineVector(InlineVector&& o) noexcept {
+    if (o.heap_ != nullptr) {
+      // Steal the spill buffer; the inline case is a plain copy.
+      heap_ = o.heap_;
+      cap_ = o.cap_;
+      size_ = o.size_;
+      o.heap_ = nullptr;
+      o.cap_ = N;
+      o.size_ = 0;
+    } else {
+      std::memcpy(inline_, o.inline_, size_t(o.size_) * sizeof(T));
+      size_ = o.size_;
+      o.size_ = 0;
+    }
+  }
+  InlineVector& operator=(const InlineVector& o) {
+    if (this != &o) assign(o.begin(), o.end());
+    return *this;
+  }
+  InlineVector& operator=(InlineVector&& o) noexcept {
+    if (this != &o) {
+      reset();
+      new (this) InlineVector(std::move(o));
+    }
+    return *this;
+  }
+
+  T* begin() { return data(); }
+  T* end() { return data() + size_; }
+  const T* begin() const { return data(); }
+  const T* end() const { return data() + size_; }
+  T* data() { return heap_ ? heap_ : inline_; }
+  const T* data() const { return heap_ ? heap_ : inline_; }
+  T& operator[](size_t i) { return data()[i]; }
+  const T& operator[](size_t i) const { return data()[i]; }
+  const T& back() const { return data()[size_ - 1]; }
+  uint32_t size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+  void clear() { size_ = 0; }  // keeps the buffer, like std::vector::clear
+
+  void reserve(size_t n) {
+    if (n > cap_) grow(uint32_t(n));
+  }
+  void push_back(const T& v) {
+    if (size_ == cap_) grow(cap_ * 2);
+    data()[size_++] = v;
+  }
+  template <typename It>
+  void assign(It first, It last) {
+    const size_t n = size_t(last - first);
+    if (n > cap_) grow(uint32_t(n));
+    if (n != 0) std::memcpy(data(), &*first, n * sizeof(T));
+    size_ = uint32_t(n);
+  }
+
+ private:
+  void reset() {
+    if (heap_ != nullptr) {
+      std::free(heap_);
+      heap_ = nullptr;
+    }
+    cap_ = N;
+    size_ = 0;
+  }
+  void grow(uint32_t want) {
+    // Spill to the heap once and keep growing there. The inline buffer is
+    // never returned to, which keeps data() a single branch.
+    uint32_t next = cap_ < N ? N : cap_;
+    while (next < want) next *= 2;
+    T* mem = static_cast<T*>(std::malloc(size_t(next) * sizeof(T)));
+    if (mem == nullptr) return;  // caller's push_back/assign is dropped
+    std::memcpy(mem, data(), size_t(size_) * sizeof(T));
+    if (heap_ != nullptr) std::free(heap_);
+    heap_ = mem;
+    cap_ = next;
+  }
+
+  T* heap_ = nullptr;
+  uint32_t size_ = 0;
+  uint32_t cap_ = N;
+  T inline_[N];
 };
 
 struct DrawItem {
@@ -296,7 +408,7 @@ struct DrawItem {
   float world[16];    // row-vector convention, translation in row 3
   float bbox_min[3];  // mesh-local bounds, for decode validation
   float bbox_max[3];
-  std::vector<DrawEntry> draws;
+  InlineVector<DrawEntry, 4> draws;
 };
 
 struct FrameScene {
