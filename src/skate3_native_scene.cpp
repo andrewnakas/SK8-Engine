@@ -4,6 +4,7 @@
 // skate3_native_scene_gpu.cpp; state shared between the two is in
 // skate3_native_scene_state.h.
 
+#include "skate3_alloc_counter.h"
 #include "skate3_native_scene.h"
 
 #include "generated/skate3_init.h"
@@ -1340,6 +1341,14 @@ REXCVAR_DEFINE_INT32(
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    skate3_map_erase_probe, false, "Skate 3",
+    "Log the key and map whenever the hash erase at sub_82C95E18+0xB4 looks up "
+    "a key that is NOT present. That erase dereferences the find's end "
+    "sentinel unchecked and then walks the bucket array 4 bytes at a time "
+    "until it leaves mapped memory, which is the deterministic fault returning "
+    "from a DLC map. This does not fix it; it names what is being erased.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_guest_spin_measure, false, "Skate 3",
     "Time the guest's wait loop (sub_82B755C0) and report how many milliseconds "
@@ -8925,6 +8934,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
   }
+  // Attribute this thread's allocations to the scene build for as long as we
+  // are inside it (see skate3_alloc_counter.h).
+  const skate3::alloc_counter::ScopedPhase alloc_phase(
+      skate3::alloc_counter::Phase::kSceneBuild);
   // The frame-end walks below chase captured pointers whose ranges world
   // streaming may have revoked during the frame; recover raw-load read
   // faults for the whole build (POSIX; no-op on Windows).

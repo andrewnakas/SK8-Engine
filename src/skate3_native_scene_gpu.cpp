@@ -8003,6 +8003,16 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         alloc_now.allocs - s_alloc_prev.allocs, alloc_now.frees - s_alloc_prev.frees,
         alloc_now.bytes - s_alloc_prev.bytes};
     s_alloc_prev = alloc_now;
+    // Per-phase, same window. A big number in "other" means the allocations
+    // are on a thread nothing has scoped yet, which is itself the answer.
+    static uint64_t s_ph_prev[size_t(skate3::alloc_counter::Phase::kCount)] = {};
+    uint64_t ph_delta[size_t(skate3::alloc_counter::Phase::kCount)] = {};
+    for (size_t i = 0; i < size_t(skate3::alloc_counter::Phase::kCount); ++i) {
+      const uint64_t now_i =
+          skate3::alloc_counter::PhaseAllocs(skate3::alloc_counter::Phase(i));
+      ph_delta[i] = now_i - s_ph_prev[i];
+      s_ph_prev[i] = now_i;
+    }
     REXLOG_WARN(
         "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
         "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms "
@@ -8013,7 +8023,7 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "tail={:.2f}/{:.2f}ms twod={:.2f}/{:.2f}ms "
         "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
         "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}] "
-        "alloc[{}/frame {}KB/frame live={}]",
+        "alloc[{}/frame {}KB/frame live={} | build={} render={} decode={} 2d={} other={}]",
         guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
         g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
         g_pw_build.MaxMs(), g_pw_b2d.AvgMs(), g_pw_b2d.MaxMs(), g_pw_bspl.AvgMs(),
@@ -8042,7 +8052,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
         g_cam_max_streak.exchange(0, std::memory_order_relaxed),
         alloc_delta.allocs / interval, alloc_delta.bytes / interval / 1024,
-        int64_t(alloc_now.allocs) - int64_t(alloc_now.frees));
+        int64_t(alloc_now.allocs) - int64_t(alloc_now.frees),
+        ph_delta[1] / interval, ph_delta[2] / interval, ph_delta[3] / interval,
+        ph_delta[4] / interval, ph_delta[0] / interval);
     // Deep per-item attribution (see the perf-items cvar): visibility-class
     // draw costs, completed-draw stage split, build-walk decomposition, and
     // the off-screen retention pass. Averages are per item (the windows Add
@@ -8506,6 +8518,8 @@ void AddGuestOcclSkipped(uint32_t n) {
 namespace {
 
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
+  const skate3::alloc_counter::ScopedPhase alloc_phase(
+      skate3::alloc_counter::Phase::kRenderScene);
   if (!SceneEnabled() ||
       (context.backend != NativeGuestOutputBackend::kD3D12 &&
        context.backend != NativeGuestOutputBackend::kVulkan)) {

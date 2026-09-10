@@ -57,6 +57,7 @@ REXCVAR_DECLARE(int32_t, skate3_job_scan_backoff_yields);
 REXCVAR_DECLARE(int32_t, skate3_job_scan_backoff_sleep_us);
 REXCVAR_DECLARE(bool, skate3_job_scan_stats);
 REXCVAR_DECLARE(bool, skate3_guest_spin_measure);
+REXCVAR_DECLARE(bool, skate3_map_erase_probe);
 REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
                     "Diagnostic: watch the guest D3D command-ring write pointer at every "
                     "deferred render-state flush (D3D::SetPending_RenderStates). The pointer at "
@@ -2075,3 +2076,57 @@ extern "C" REX_FUNC(sub_827C1D38) {
   }
 }
 
+
+// ---- map-erase miss probe (the crash returning to the stock world) ---------
+//
+// Returning from a DLC map faults writing guest 0xFFFFFFFF on the LOAD thread,
+// deterministically, with guest lr = 0x82C95ECC - the return address of the
+// call to sub_82C9E4F8 inside sub_82C95E18. Reading the recompiled code says
+// what the pair is doing:
+//
+//   sub_82C9E4F8(out=&r1[80], map=r28+24880, key=&r1[152])   // hash find
+//   r10 = out[0]; r8 = out[1];                                // node, bucket
+//   r9 = *(r10 + 168)                                         // node->next
+//   if (r9 == 0) do { r9 = *(r11 += 4); } while (r9 == 0);    // scan buckets
+//
+// It is an ERASE. On a MISS, sub_82C9E4F8 returns the end sentinel
+// (buckets + bucket_count*4) rather than a node, the caller dereferences it
+// unchecked, and that bucket scan then walks 4 bytes at a time off the end of
+// the array until it hits unmapped memory. So the fault is the symptom; the
+// bug is an erase of a key that is not in the map.
+//
+// This does not fix it - it says WHICH key, on which map, so the erase can be
+// matched to what the title is tearing down. Rate-limited hard: the find is
+// hot and only the misses are interesting.
+extern "C" REX_FUNC(sub_82C9E4F8) {
+  const uint32_t out = ctx.r3.u32;
+  const uint32_t map = ctx.r4.u32;
+  const uint32_t key_ptr = ctx.r5.u32;
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_82C9E4F8(ctx, base);
+  if (!REXCVAR_GET(skate3_map_erase_probe)) {
+    return;
+  }
+  // Only the erase call site; every other caller of this find is uninteresting.
+  if (caller != 0x82C95ECC) {
+    return;
+  }
+  const uint32_t buckets = REX_LOAD_U32(map + 4);
+  const uint32_t count = REX_LOAD_U32(map + 8);
+  const uint32_t node = REX_LOAD_U32(out + 0);
+  const uint32_t end_slot = buckets + count * 4u;
+  if (node != end_slot && REX_LOAD_U32(out + 4) != end_slot) {
+    return;  // found: the erase is well formed
+  }
+  static std::atomic<uint32_t> s_hits{0};
+  const uint32_t n = s_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n > 8 && (n % 512) != 0) {
+    return;
+  }
+  REXLOG_WARN(
+      "[map-erase] MISS #{}: key={:08X}{:08X} map={:08X} buckets={:08X} "
+      "count={} node={:08X} end={:08X} - the caller will now walk off the "
+      "bucket array",
+      n, REX_LOAD_U32(key_ptr), REX_LOAD_U32(key_ptr + 4), map,
+      buckets, count, node, end_slot);
+}

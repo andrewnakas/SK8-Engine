@@ -26,6 +26,18 @@
 
 namespace skate3::alloc_counter {
 
+// Per-thread current phase. Thread-local so the command processor and the
+// guest render thread attribute independently with no synchronisation.
+thread_local uint8_t g_phase = 0;
+std::atomic<uint64_t> g_phase_allocs[size_t(Phase::kCount)] = {};
+
+ScopedPhase::ScopedPhase(Phase p) : prev_(g_phase) { g_phase = uint8_t(p); }
+ScopedPhase::~ScopedPhase() { g_phase = prev_; }
+
+uint64_t PhaseAllocs(Phase p) {
+  return g_phase_allocs[size_t(p)].load(std::memory_order_relaxed);
+}
+
 std::atomic<uint64_t> g_allocs{0};
 std::atomic<uint64_t> g_frees{0};
 std::atomic<uint64_t> g_bytes{0};
@@ -42,6 +54,8 @@ namespace {
 inline void* CountedAlloc(std::size_t n) {
   skate3::alloc_counter::g_allocs.fetch_add(1, std::memory_order_relaxed);
   skate3::alloc_counter::g_bytes.fetch_add(n, std::memory_order_relaxed);
+  skate3::alloc_counter::g_phase_allocs[skate3::alloc_counter::g_phase].fetch_add(
+      1, std::memory_order_relaxed);
   // A zero-size new must still return a distinct pointer.
   return std::malloc(n != 0 ? n : 1);
 }
