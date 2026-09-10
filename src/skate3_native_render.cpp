@@ -35,6 +35,7 @@ extern "C" void svcSleepThread(int64_t nano);
 #include <windows.h>
 #endif
 
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/window.h>
@@ -488,6 +489,9 @@ void ReportPacing() {
   static Clock::time_point s_prev{};
   static Clock::time_point s_window_start{};
   static std::vector<double> s_intervals_ms;
+  // Guest ticks at the top of the window, so the line can also say how fast
+  // the GUEST's clock is running. See where it is printed.
+  static uint64_t s_window_start_guest_ticks = 0;
 
   // This used to run unconditionally, which was defensible while the line it
   // produces was always printed. It is not defensible now that the shipped log
@@ -516,6 +520,7 @@ void ReportPacing() {
   if (s_prev.time_since_epoch().count() == 0) {
     s_prev = now;
     s_window_start = now;
+    s_window_start_guest_ticks = rex::chrono::Clock::QueryGuestTickCount();
     s_intervals_ms.reserve(4096);
     return;
   }
@@ -534,16 +539,30 @@ void ReportPacing() {
     return sorted[i];
   };
   const double secs = std::chrono::duration<double>(elapsed).count();
+  // How fast the GUEST's clock ran over the same window, as a multiple of real
+  // time. The guest timebase is mftb, which is QueryGuestTickCount at a fixed
+  // 50 MHz, and it is what the title's own frame delta is computed from - so
+  // this is the difference between "the game is slow" and "the game thinks
+  // less time passed than did". 1.00 means the clock is honest and a
+  // half-speed game is the title's own timestep, not ours; anything else is
+  // a clock bug and is the whole answer. Free: two reads per thirty seconds.
+  const uint64_t guest_ticks_now = rex::chrono::Clock::QueryGuestTickCount();
+  const double guest_secs =
+      double(guest_ticks_now - s_window_start_guest_ticks) /
+      double(rex::chrono::Clock::guest_tick_frequency());
   // Warn: one line per thirty seconds, and the only measure of SMOOTHNESS
   // this port has - p50 against p95 against max is the difference between
   // "slow" and "juddering". At info it has never once reached a Switch log,
   // because raising that console to info turns on the guest driver's own
   // printing and changes the pacing being measured.
-  REXLOG_WARN("[pace] {:.0f}s: frames={} fps={:.1f} p50={:.1f}ms p95={:.1f}ms max={:.1f}ms",
-              secs, sorted.size(), double(sorted.size()) / secs, pct(0.50), pct(0.95),
-              sorted.back());
+  REXLOG_WARN(
+      "[pace] {:.0f}s: frames={} fps={:.1f} p50={:.1f}ms p95={:.1f}ms max={:.1f}ms "
+      "guest_clock={:.3f}x",
+      secs, sorted.size(), double(sorted.size()) / secs, pct(0.50), pct(0.95), sorted.back(),
+      secs > 0.0 ? guest_secs / secs : 0.0);
   s_intervals_ms.clear();
   s_window_start = now;
+  s_window_start_guest_ticks = guest_ticks_now;
 }
 
 void OnFrameEnd(uint8_t* base) {
