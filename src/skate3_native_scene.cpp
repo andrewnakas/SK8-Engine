@@ -5850,28 +5850,11 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         for (int i = 0; i < 36; ++i) {
           d.consts[i] = LoadGuestF32(base, bank + i * 4);
         }
-        // Copy the VERTICES here, not at frame end.
-        //
-        // d.addr is the guest's inline-ring write pointer and that ring is
-        // CIRCULAR: the game keeps writing into it for the rest of the frame.
-        // Reading the bytes back at frame end therefore read whatever had
-        // landed there since - a later draw's geometry - so HUD elements drew
-        // at each other's positions, doubled, with one quad stretched right
-        // across the screen. Capture is the only moment the pointer and the
-        // bytes agree.
-        //
-        // The gate above bounds this: count <= 65536, stride <= 256.
-        const size_t vbytes = size_t(r5) * size_t(r6);
-        d.verts.resize(vbytes);
-        if (!GuestTryCopy(d.verts.data(), base + r7, vbytes)) {
-          g_2d_copyfail.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(g_2d_mutex);
+        if (g_frame_2d.size() < 4096) {
+          g_frame_2d.push_back(std::move(d));
         } else {
-          std::lock_guard<std::mutex> lock(g_2d_mutex);
-          if (g_frame_2d.size() < 4096) {
-            g_frame_2d.push_back(std::move(d));
-          } else {
-            g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
-          }
+          g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
         }
       }
     } else {
@@ -8371,14 +8354,47 @@ void Publish2dDraws(uint8_t* base) {
       g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
-    // The vertices were copied at CAPTURE (see the ring comment there); the
-    // guest ring they came from has long since been overwritten.
+    // RING REUSE DETECTOR.
+    //
+    // d.addr is the pointer D3DDevice_BeginVertices handed the CPU to write
+    // into, and the bytes are only read back here, at frame end - which is
+    // correct, because the guest writes them AFTER that call returns. But the
+    // ring is circular. If it wraps inside one frame, an early draw's window
+    // has been handed out again to a later draw, and the replay draws element
+    // A with element B's geometry: the HUD doubled at each other's positions
+    // with one quad stretched across the screen.
+    //
+    // Overlapping [addr, addr+bytes) ranges within a single frame is exactly
+    // that condition, and nothing currently looks. This is a probe, not a
+    // fix; the fix is to copy at EndVertices, which needs a hook that does
+    // not exist yet.
     const uint32_t bytes = d.count * d.stride;
-    if (d.verts.size() != bytes) {
+    {
+      static thread_local std::vector<std::pair<uint32_t, uint32_t>> seen_ranges;
+      if (&d == &frame_2d.front()) {
+        seen_ranges.clear();
+      }
+      for (const auto& r : seen_ranges) {
+        if (d.addr < r.second && r.first < d.addr + bytes) {
+          static std::atomic<uint32_t> s_overlaps{0};
+          const uint32_t n = s_overlaps.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (n <= 4 || (n % 256) == 0) {
+            REXLOG_WARN(
+                "[2d-ring] REUSE #{}: this draw [{:08X}+{}] overlaps an earlier "
+                "one [{:08X}+{}] in the same frame - its vertices have been "
+                "overwritten and it will draw the wrong geometry",
+                n, d.addr, bytes, r.first, r.second - r.first);
+          }
+          break;
+        }
+      }
+      seen_ranges.emplace_back(d.addr, d.addr + bytes);
+    }
+    scratch_2d.resize(bytes);
+    if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
       g_2d_copyfail.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
-    scratch_2d.assign(d.verts.begin(), d.verts.end());
     // Guest dwords are big-endian.
     for (size_t i = 0; i + 4 <= scratch_2d.size(); i += 4) {
       uint32_t v;
