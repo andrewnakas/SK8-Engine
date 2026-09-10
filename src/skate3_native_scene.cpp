@@ -253,6 +253,41 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_intensity, 0.025, "Skate 
                       "so small values are already visible around bright lights).")
     .range(0.0, 2.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// --- Scene render resolution -------------------------------------------------
+// The 3D scene is rendered into its own raster and a single bilinear
+// fullscreen pass stretches it into the full-size guest output. Everything
+// composited AFTER that pass - the selection outline, the photo chain, the
+// popup blur, the 2D/HUD overlay replay and the settings-menu backdrop -
+// still runs at the output resolution, so the HUD and menu text stay sharp
+// while only the shaded pixels get cheaper. Half in each axis is a quarter of
+// the fill.
+//
+// This is NOT native_render_output_scale, which shrinks the guest output
+// itself: that surface is shared with the emulated path, whose swap gamma
+// pass is a compute shader dispatched by pixel index, and shrinking it wrote
+// out of bounds and lost the graphics device at boot. That cvar must stay 1.0.
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_scale, 1.0, "Skate 3",
+                      "Render the native 3D scene at this fraction of the guest output "
+                      "in each axis and upscale it bilinearly into the full-size "
+                      "output (1.0 = native; 0.5 is a quarter of the pixels). The HUD, "
+                      "2D overlay and menu backdrops still draw at full resolution. "
+                      "This is the lever that matters when the frame is fill-bound; it "
+                      "costs sharpness in the 3D image and nothing else. Unrelated to "
+                      "native_render_output_scale, which shrinks the shared guest "
+                      "output and must stay 1.0.")
+    .range(0.25, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_scale_sweep_s, 0, "Skate 3",
+                     "Auto-sweep the scene scale for measurement: hold each of 1.00, "
+                     "0.75, 0.60, 0.50, 0.40 for this many seconds of GAMEPLAY and log "
+                     "a [scene-scale] line with the raster and the measured frame rate "
+                     "for each, then stop on the last step. The clock only advances on "
+                     "frames the native renderer actually drew a scene for, so time in "
+                     "menus and loads does not burn a step, and the first second after "
+                     "each change is discarded while the targets rebuild. 0 = off, use "
+                     "skate3_native_render_scene_scale.")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr_packed, true, "Skate 3",
                     "Use the packed R11G11B10 float format for the HDR scene targets "
                     "instead of RGBA16F: halves the scene-pass color bandwidth (most "

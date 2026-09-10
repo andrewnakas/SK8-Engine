@@ -351,19 +351,24 @@ bool ApplySsaoPass(const NativeGuestOutputRenderContext& context,
     return false;
   }
   // The luma pass samples the scene through this view; the composite writes
-  // the same plane (HDR: the float scene plane pre-tonemap, classic: the
-  // guest output).
+  // the same plane (HDR: the float scene plane pre-tonemap; classic: the
+  // scene-resolution gamma plane, which IS the guest output at scale 1.0).
   const bool hdr = g_r.hdr_active && g_r.hdr_resolved != nullptr;
+  const bool scaled = g_r.scene_ldr != nullptr && g_r.scene_ldr_srv != nullptr;
   nrhi::Texture* const scene_plane =
-      hdr ? g_r.hdr_resolved : context.guest_output;
+      hdr ? g_r.hdr_resolved
+          : (scaled ? g_r.scene_ldr : context.guest_output);
   nrhi::TextureView* const scene_srv =
-      hdr ? g_r.hdr_srv : g_r.output_srv_slot;
+      hdr ? g_r.hdr_srv : (scaled ? g_r.scene_ldr_srv : g_r.output_srv_slot);
   if (scene_srv == nullptr) {
     return false;
   }
   nrhi::Device* device = context.device;
-  const uint32_t width = context.guest_output_width;
-  const uint32_t height = context.guest_output_height;
+  // The SCENE raster, not the output: the AO march reads the scene depth
+  // buffer and composites back onto the scene plane, both of which are
+  // sized by skate3_native_render_scene_scale.
+  const uint32_t width = g_r.scene_width;
+  const uint32_t height = g_r.scene_height;
   // AO raster: half the output resolution by default: for a low-frequency
   // term the depth-aware blur + bilinear upsample hide it, at 1/4 the march
   // cost (full-res GTAO at 4K x 300+ uncapped fps pegged the GPU). The
@@ -602,8 +607,10 @@ bool ApplyOcclusionGridPass(const NativeGuestOutputRenderContext& context,
     return false;
   }
   nrhi::Device* device = context.device;
-  const uint32_t width = context.guest_output_width;
-  const uint32_t height = context.guest_output_height;
+  // Scene raster: the linear-depth plane this reduces is built from the
+  // scene depth buffer.
+  const uint32_t width = g_r.scene_width;
+  const uint32_t height = g_r.scene_height;
 
   // Only the full-res linear-depth target, not the AO raster set.
   if (g_r.ao_lin_width != width || g_r.ao_lin_height != height ||
@@ -854,8 +861,8 @@ bool EnsureSsrPipeline(const NativeGuestOutputRenderContext& context) {
 // Half-res SSR intermediates (reflection G-buffer + march output), steady
 // state RENDER_TARGET, rebuilt on resize.
 bool EnsureSsrTargets(const NativeGuestOutputRenderContext& context) {
-  const uint32_t sw = std::max(1u, (context.guest_output_width + 1) / 2);
-  const uint32_t sh = std::max(1u, (context.guest_output_height + 1) / 2);
+  const uint32_t sw = std::max(1u, (g_r.scene_width + 1) / 2);
+  const uint32_t sh = std::max(1u, (g_r.scene_height + 1) / 2);
   if (g_r.ssr_width == sw && g_r.ssr_height == sh && g_r.ssr_gbuf != nullptr &&
       g_r.ssr_tex != nullptr) {
     return true;
@@ -932,8 +939,10 @@ bool ApplySsrPass(const NativeGuestOutputRenderContext& context,
   // back in its RENDER_TARGET steady state.
   g_r.ssr_gbuf_ready = false;
   nrhi::Device* device = context.device;
-  const uint32_t width = context.guest_output_width;
-  const uint32_t height = context.guest_output_height;
+  // Scene raster: the march reads scene depth and blends onto the scene
+  // plane.
+  const uint32_t width = g_r.scene_width;
+  const uint32_t height = g_r.scene_height;
   const auto bail = [&] {
     cmd->Barrier(g_r.ssr_gbuf, nrhi::ResourceState::kPixelShaderResource,
                  nrhi::ResourceState::kRenderTarget);
@@ -1273,8 +1282,10 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
     return false;
   }
   nrhi::Device* device = context.device;
-  const uint32_t width = context.guest_output_width;
-  const uint32_t height = context.guest_output_height;
+  // Scene raster: the shaft march reads scene depth and its result is
+  // consumed by ps_tonemap, which also runs at the scene raster.
+  const uint32_t width = g_r.scene_width;
+  const uint32_t height = g_r.scene_height;
 
   // ---- Full-res linear view-Z: the SSAO plane when AO linearized this
   // frame (it idles back in RENDER_TARGET after the AO pass), else the own
@@ -1698,17 +1709,24 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
-// Bloom pyramid + tonemap over the float scene plane into the guest output.
-// Runs after the AO composite (bloom sees the occluded scene). Transitions
-// the guest output kGuestOutput -> kRenderTarget (the state every later
-// consumer expects); the caller restores the main binding layout after.
+// Bloom pyramid + tonemap over the float scene plane into `dest` - the guest
+// output when the scene raster matches it, else the scene-resolution plane
+// the caller then stretches. Runs after the AO composite (bloom sees the
+// occluded scene). Transitions the guest output kGuestOutput -> kRenderTarget
+// (the state every later consumer expects) when it is the destination; the
+// caller restores the main binding layout after.
 void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
-                  nrhi::Cmd* cmd, const nrhi::Viewport& viewport,
+                  nrhi::Cmd* cmd, nrhi::Texture* dest,
+                  const nrhi::Viewport& viewport,
                   const nrhi::Rect& scissor, bool loading_native,
                   uint64_t frame_number) {
   nrhi::Device* device = context.device;
-  const uint32_t width = context.guest_output_width;
-  const uint32_t height = context.guest_output_height;
+  // Scene raster. The bloom pyramid hangs off the scene plane and the
+  // tonemap reads it 1:1 - which is what keeps the point-sampled scene
+  // fetch in ps_tonemap correct. `dest` is where the result lands, and
+  // that IS the guest output only when the two rasters match.
+  const uint32_t width = g_r.scene_width;
+  const uint32_t height = g_r.scene_height;
   // Bloom chain intermediates: QUARTER res halving down to the level cap or
   // an 8-px floor, RGBA16F, steady state RENDER_TARGET. Quarter start =
   // 1/4 the pyramid cost of a half-res chain; the extraction pass widens
@@ -1863,10 +1881,18 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
     }
   }
 
-  // Tonemap into the guest output (the single application of the game's
-  // shared tone chain; bloom energy joins pre-tonemap).
-  cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
-               nrhi::ResourceState::kRenderTarget);
+  // Tonemap into `dest` (the single application of the game's shared tone
+  // chain; bloom energy joins pre-tonemap). `dest` is the guest output when
+  // the scene raster matches it - and then this is also where the output
+  // leaves kGuestOutput for the rest of the frame, which every later
+  // consumer relies on. When the scene is rendered smaller, `dest` is the
+  // scene-resolution plane instead and the caller's upscale does that
+  // transition. Source and dest sizes stay equal either way, so the
+  // point-sampled scene fetch in ps_tonemap is never asked to filter.
+  if (dest == context.guest_output) {
+    cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
+                 nrhi::ResourceState::kRenderTarget);
+  }
   cmd->FlushBarriers();
   set_consts(width, height, width, height,
              bloom ? float(REXCVAR_GET(
@@ -1875,7 +1901,7 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
              1.0f);
   cmd->SetViewport(viewport);
   cmd->SetScissor(scissor);
-  cmd->SetRenderTargets(context.guest_output, nullptr);
+  cmd->SetRenderTargets(dest, nullptr);
   cmd->SetPipeline(g_r.pso_tonemap);
   cmd->SetTexture(1, g_r.hdr_srv);
   cmd->SetTexture(2, bloom ? g_r.bloom_srv[0] : g_r.white.srv);

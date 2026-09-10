@@ -560,6 +560,30 @@ struct RendererState {
   nrhi::Texture* depth = nullptr;
   uint32_t depth_width = 0;
   uint32_t depth_height = 0;
+  // Scene render resolution (see skate3_native_render_scene_scale). The 3D
+  // scene, its depth buffer, the MSAA target, the HDR plane and every
+  // screen-space post pass that consumes them run at THIS raster; a single
+  // bilinear fullscreen pass (pso_blur_blit) then stretches the finished
+  // gamma-space image into the full-size guest output, and everything
+  // composited after that - outline, photo chain, popup blur, the 2D/HUD
+  // replay, the menu backdrop - stays at the output resolution. Equal to the
+  // guest output size when the scale is 1.0, which is the whole of today's
+  // behaviour.
+  uint32_t scene_width = 0;
+  uint32_t scene_height = 0;
+  // The scene's finished gamma-space image at scene resolution, in the guest
+  // output's format (so the scene/resolve/tonemap PSOs, which are built
+  // against that format, need no variant). Allocated only while the scene
+  // raster differs from the output; idles in RENDER_TARGET state.
+  nrhi::Texture* scene_ldr = nullptr;
+  nrhi::TextureView* scene_ldr_srv = nullptr;
+  // Format scene_ldr was built with; a guest-output format change rebuilds
+  // it (constant in practice, checked rather than assumed - the same
+  // treatment the photo-fx family gets).
+  nrhi::Format scene_ldr_fmt = nrhi::Format::kUnknown;
+  // Sticky: the scene plane could not be allocated, so the scale is pinned
+  // to 1.0 for the rest of the session rather than retried every frame.
+  bool scene_scale_failed = false;
   // Cached guest-output texture identity (context.guest_output) for change
   // detection: the presenter recreates the output image on resize.
   nrhi::Texture* rtv_resource = nullptr;
@@ -656,6 +680,10 @@ struct RendererState {
   nrhi::TextureView* pfx_srv[8] = {};
   bool pfx_srv_allocated = false;
   uint32_t pfx_width = 0, pfx_height = 0;
+  // The packed-depth plane tracks the SCENE raster, not the output: its
+  // pass Loads the native depth buffer by pixel index. Separate dims so a
+  // render-scale change rebuilds only it.
+  uint32_t pfx_depth_width = 0, pfx_depth_height = 0;
   bool pfx_ready = false;
   bool pfx_failed = false;
   // How many of the nine photo-fx PSOs are built. The family is compiled a
@@ -1129,6 +1157,19 @@ nrhi::ShaderDesc MakeShaderDesc(nrhi::ShaderStage stage, const char* file,
                                 const nrhi::ShaderMacro* macros,
                                 const char* variant);
 
+// The scene raster for this frame: the guest output size scaled by
+// skate3_native_render_scene_scale (or by the sweep, when it is running),
+// rounded to EVEN dimensions and floored at 64 so no derived half/quarter
+// target can reach zero. Defined in skate3_native_scene_gpu.cpp; both TUs
+// call it so they can never disagree about the raster.
+void ComputeSceneExtent(const NativeGuestOutputRenderContext& context,
+                        uint32_t& out_width, uint32_t& out_height);
+// Advances the measurement sweep and latches the scale ComputeSceneExtent
+// will report for this frame. Called once per frame from RenderScene, before
+// EnsurePipeline. `gameplay_frame` gates the sweep clock so menus and loads
+// do not consume a step.
+void TickScaleSweep(bool gameplay_frame);
+
 // Post passes (skate3_native_scene_post.cpp).
 bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context);
 bool EnsureSsrPipeline(const NativeGuestOutputRenderContext& context);
@@ -1154,8 +1195,15 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
                          const nrhi::Viewport& viewport,
                          const nrhi::Rect& scissor, bool ssao_ran,
                          uint64_t frame_number);
+// `dest` is the tonemap's render target and `viewport`/`scissor` its rect:
+// the guest output at full size when the scene raster matches it, else the
+// scene-resolution plane (g_r.scene_ldr) with the scene rect, which the
+// caller's upscale then stretches. The bloom pyramid and the tonemap's own
+// source/dest constants follow g_r.scene_width/height either way, so the
+// point-sampled scene fetch in ps_tonemap always stays 1:1.
 void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
-                  nrhi::Cmd* cmd, const nrhi::Viewport& viewport,
+                  nrhi::Cmd* cmd, nrhi::Texture* dest,
+                  const nrhi::Viewport& viewport,
                   const nrhi::Rect& scissor, bool loading_native,
                   uint64_t frame_number);
 bool ApplyMenuBlurPass(const NativeGuestOutputRenderContext& context, nrhi::Cmd* cmd,
