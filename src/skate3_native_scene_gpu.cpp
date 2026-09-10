@@ -4490,8 +4490,9 @@ constexpr double kScaleSweepSteps[] = {1.0, 0.75, 0.6, 0.5, 0.4};
 constexpr size_t kScaleSweepStepCount =
     sizeof(kScaleSweepSteps) / sizeof(kScaleSweepSteps[0]);
 // Discarded after each change while the targets are recreated and the
-// pipelines warm; the measured window is what is left of the step.
-constexpr auto kScaleSweepSettle = std::chrono::seconds(1);
+// pipelines warm; the measured window is what is left of the step. In
+// seconds of gameplay, like the step itself.
+constexpr double kScaleSweepSettleSecs = 1.0;
 
 struct ScaleSweepState {
   bool active = false;
@@ -4499,8 +4500,13 @@ struct ScaleSweepState {
   size_t step = 0;
   bool measuring = false;
   uint64_t frames = 0;
-  PerfClock::time_point step_start{};
-  PerfClock::time_point measure_start{};
+  // Seconds of GAMEPLAY accumulated in this step, and in its measured
+  // window. Wall time is the wrong clock: the first run spent the whole
+  // 1.00 step loading into the world and the step expired anyway, with one
+  // frame measured and a meaningless 8.1 fps for the baseline rung.
+  double step_secs = 0.0;
+  double measured_secs = 0.0;
+  PerfClock::time_point last_tick{};
 };
 ScaleSweepState g_scale_sweep;
 // The scale in force for the current frame. Written only by TickScaleSweep.
@@ -4532,33 +4538,41 @@ void TickScaleSweep(bool gameplay_frame) {
   if (!g_scale_sweep.active) {
     g_scale_sweep.active = true;
     g_scale_sweep.step = 0;
-    g_scale_sweep.step_start = now;
+    g_scale_sweep.last_tick = now;
     REXLOG_WARN(
         "[scene-scale] sweep armed: {} steps of {}s of gameplay each, "
         "first second of each discarded",
         kScaleSweepStepCount, period_s);
   }
   g_scene_scale_latched = kScaleSweepSteps[g_scale_sweep.step];
+  // The step's clock only advances on frames that actually drew a scene, so
+  // a load or a spell in the menus costs the sweep nothing. The gap across
+  // such a spell is clamped rather than added: the frame either side of it
+  // is real, the hour between them is not.
+  const double dt =
+      std::chrono::duration<double>(now - g_scale_sweep.last_tick).count();
+  g_scale_sweep.last_tick = now;
   if (!gameplay_frame) {
-    return;  // the clock only runs while a scene is actually being drawn
+    return;
   }
+  g_scale_sweep.step_secs += std::min(dt, 0.5);
   if (!g_scale_sweep.measuring) {
-    if (now - g_scale_sweep.step_start >= kScaleSweepSettle) {
+    if (g_scale_sweep.step_secs >= kScaleSweepSettleSecs) {
       g_scale_sweep.measuring = true;
-      g_scale_sweep.measure_start = now;
+      g_scale_sweep.measured_secs = 0.0;
       g_scale_sweep.frames = 0;
     }
     return;
   }
   ++g_scale_sweep.frames;
-  if (now - g_scale_sweep.step_start < std::chrono::seconds(period_s)) {
+  g_scale_sweep.measured_secs += std::min(dt, 0.5);
+  if (g_scale_sweep.step_secs < double(period_s)) {
     return;
   }
-  const double secs =
-      std::chrono::duration<double>(now - g_scale_sweep.measure_start).count();
-  REXLOG_WARN("[scene-scale] {:.2f}  {}x{}  frames={}  fps={:.1f}",
+  const double secs = g_scale_sweep.measured_secs;
+  REXLOG_WARN("[scene-scale] {:.2f}  {}x{}  frames={}  gameplay={:.1f}s  fps={:.1f}",
               kScaleSweepSteps[g_scale_sweep.step], g_r.scene_width,
-              g_r.scene_height, g_scale_sweep.frames,
+              g_r.scene_height, g_scale_sweep.frames, secs,
               secs > 0.0 ? double(g_scale_sweep.frames) / secs : 0.0);
   if (++g_scale_sweep.step >= kScaleSweepStepCount) {
     g_scale_sweep.done = true;
@@ -4569,7 +4583,7 @@ void TickScaleSweep(bool gameplay_frame) {
         kScaleSweepSteps[kScaleSweepStepCount - 1]);
     return;
   }
-  g_scale_sweep.step_start = now;
+  g_scale_sweep.step_secs = 0.0;
   g_scale_sweep.measuring = false;
   g_scale_sweep.frames = 0;
 }
@@ -5845,22 +5859,43 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   // the same cvar: that one only engages while in_menus and this one only while
   // not, so the value it saves is always the configured base rather than
   // something this left behind.
+  // ONE source of truth for the suppression mode. Two overrides want to move
+  // it - the gameplay one just below and the portrait-window one further down
+  // - and they each used to SAVE the live cvar and restore it later. That
+  // clobbers: entering gameplay saved the 3 the portrait block had written,
+  // leaving gameplay restored that 3 as if it were configured, and after one
+  // menu -> gameplay -> menu cycle the configured base was gone for the rest
+  // of the session. The log said "suppress mode 3 -> 1" on a card configured
+  // for 2, every single time.
+  //
+  // So neither override saves or restores any more. The base is latched
+  // before anything writes it, each override only states what it WANTS, and
+  // the value is derived and applied once at the end. A write we did not make
+  // (a hot cvar reload) re-latches the base.
+  static int32_t s_suppress_base = -1;
+  static int32_t s_suppress_written = -1;
+  const int32_t suppress_now = REXCVAR_GET(native_render_suppress_mode);
+  if (s_suppress_base < 0 || suppress_now != s_suppress_written) {
+    s_suppress_base = suppress_now;
+  }
+  int32_t suppress_want = s_suppress_base;
   {
     const int32_t play_mode = REXCVAR_GET(skate3_native_render_scene_suppress_gameplay);
     static bool s_play_forced = false;
-    static int32_t s_play_base = 2;
     const bool want_play = play_mode >= 0 && !in_menus;
+    if (want_play) {
+      suppress_want = play_mode;
+    }
     if (want_play && !s_play_forced) {
-      s_play_base = REXCVAR_GET(native_render_suppress_mode);
-      if (s_play_base != play_mode) {
-        REXCVAR_SET(native_render_suppress_mode, play_mode);
-        REXLOG_WARN("native-scene: gameplay - suppress mode {} -> {}", s_play_base, play_mode);
+      if (s_suppress_base != play_mode) {
+        REXLOG_WARN("native-scene: gameplay - suppress mode {} -> {}",
+                    s_suppress_base, play_mode);
       }
       s_play_forced = true;
     } else if (!want_play && s_play_forced) {
-      if (s_play_base != play_mode) {
-        REXCVAR_SET(native_render_suppress_mode, s_play_base);
-        REXLOG_WARN("native-scene: left gameplay - suppress mode {} restored", s_play_base);
+      if (s_suppress_base != play_mode) {
+        REXLOG_WARN("native-scene: left gameplay - suppress mode {} restored",
+                    s_suppress_base);
       }
       s_play_forced = false;
     }
@@ -5974,7 +6009,6 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   // active in menus the boxes stayed empty).
   {
     static bool s_mode_forced = false;
-    static int32_t s_mode_saved = 0;
     // menu_rtt_scope 1: only hold mode 0 inside the portrait window
     // (screen-transition grace / not-known-steady screens / CAS); outside
     // it, menus keep the gameplay-proven mode-2 suppression instead of
@@ -5984,32 +6018,39 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
         in_menus && REXCVAR_GET(skate3_native_render_scene_menu_rtt_passes) &&
         (REXCVAR_GET(skate3_native_render_scene_menu_rtt_scope) == 0 ||
          PortraitRttWindowActive());
+    // Mode 3, not 0: the portrait-class RTTs (census 560-1200 during the
+    // window) execute, but the 1152-wide main scene + postfx band stays
+    // suppressed; mode 0 ran the game's whole pipeline at scaled
+    // resolution for the window's duration, dropping the pause menu to
+    // ~60 fps whenever a screen push (or its 3 s transition grace)
+    // opened the window.
+    if (want) {
+      suppress_want = 3;
+    }
     if (want && !s_mode_forced) {
-      s_mode_saved = REXCVAR_GET(native_render_suppress_mode);
-      // Mode 3, not 0: the portrait-class RTTs (census 560-1200 during the
-      // window) execute, but the 1152-wide main scene + postfx band stays
-      // suppressed; mode 0 ran the game's whole pipeline at scaled
-      // resolution for the window's duration, dropping the pause menu to
-      // ~60 fps whenever a screen push (or its 3 s transition grace)
-      // opened the window.
-      if (s_mode_saved != 3) {
-        REXCVAR_SET(native_render_suppress_mode, 3);
+      if (s_suppress_base != 3) {
         REXLOG_INFO(
             "native-scene: portrait window - suppress mode {} -> 3 (portrait "
             "RTT passes execute, scene/postfx band stays suppressed; "
             "restored when the window closes)",
-            s_mode_saved);
+            s_suppress_base);
       }
       s_mode_forced = true;
     } else if (!want && s_mode_forced) {
-      if (s_mode_saved != 3) {
-        REXCVAR_SET(native_render_suppress_mode, s_mode_saved);
+      if (s_suppress_base != 3) {
         REXLOG_INFO(
             "native-scene: portrait window closed - suppress mode {} restored",
-            s_mode_saved);
+            s_suppress_base);
       }
       s_mode_forced = false;
     }
+    // The single write. Both overrides above have had their say; gameplay
+    // wins over the portrait window, which is moot in practice because one
+    // needs in_menus and the other needs !in_menus.
+    if (suppress_now != suppress_want) {
+      REXCVAR_SET(native_render_suppress_mode, suppress_want);
+    }
+    s_suppress_written = suppress_want;
     // Same menu window: shader compilation goes SYNCHRONOUS. With
     // async_shader_compilation on, the d3d12 command processor SKIPS any
     // draw whose pipeline is still compiling (command_processor.cpp
