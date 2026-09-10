@@ -85,6 +85,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_char_shadow_exact);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_decals);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynamic_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynobj_v2);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_empty_hold_frames);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_entity_fade);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_yield);
@@ -8587,6 +8588,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     loading_native = !ready;
   }
   g_loading_hold = loading_native;
+  // Last scene the guest actually published, and how many consecutive frames
+  // it has published nothing since. See the hold below.
+  static std::shared_ptr<const FrameScene> s_last_world_scene;
+  static uint32_t s_empty_scene_frames = 0;
+  if (loading_native) {
+    // A load discards the held scene: it belongs to the previous map.
+    s_last_world_scene = nullptr;
+    s_empty_scene_frames = 0;
+  }
   std::shared_ptr<const FrameScene> scene_ptr;
   if (loading_native) {
     // Native loading screen: there is no current world scene (g_scene holds
@@ -8599,10 +8609,30 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     scene_ptr = s_loading_scene;
   } else {
     std::lock_guard<std::mutex> lock(g_scene_mutex);
-    if (!g_scene || g_scene->items.empty()) {
-      return false;
+    if (g_scene && !g_scene->items.empty()) {
+      scene_ptr = g_scene;
+      s_last_world_scene = g_scene;
+      s_empty_scene_frames = 0;
+    } else {
+      // The guest published nothing this frame. Returning false here hands
+      // the WHOLE frame to the emulated path, and because that path draws a
+      // different picture - in menus, with the 1152 band suppressed, barely
+      // any picture - the two renderers alternate frame by frame and the
+      // screen flickers, HUD and all. That is the "menu flashes on and off"
+      // report, and it is a gap of a frame or two, not a real handover.
+      //
+      // Hold the last world scene across the gap instead. Bounded, so a
+      // genuine transition to the emulated path still happens: after the
+      // budget the frame is yielded exactly as before.
+      const int32_t hold =
+          REXCVAR_GET(skate3_native_render_scene_empty_hold_frames);
+      if (s_last_world_scene == nullptr || hold <= 0 ||
+          ++s_empty_scene_frames > uint32_t(hold)) {
+        s_last_world_scene = nullptr;
+        return false;
+      }
+      scene_ptr = s_last_world_scene;
     }
-    scene_ptr = g_scene;
   }
   const FrameScene& scene = *scene_ptr;
 
