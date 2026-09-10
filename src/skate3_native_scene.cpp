@@ -5850,34 +5850,6 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         for (int i = 0; i < 36; ++i) {
           d.consts[i] = LoadGuestF32(base, bank + i * 4);
         }
-        // VIEWPORT PROBE (read-only).
-        //
-        // The replay draws every 2D quad into the FULL guest output viewport
-        // and takes its transform entirely from d.consts. That is only right
-        // if the guest issued the draw against the full framebuffer. The port
-        // already records the guest's current viewport per draw
-        // (OnSetViewport) and the 2D path has never read it - so if the HUD
-        // is composed into a smaller render target, every quad replays
-        // against the wrong rect and lands at a consistently wrong position.
-        // That is exactly the reported "wrong spot, but they stay in the same
-        // place".
-        //
-        // One line per distinct rect. If they are all the full output, this
-        // theory is dead and the transform is wrong for some other reason.
-        {
-          const uint32_t vx = g_cur_viewport[0].load(std::memory_order_relaxed);
-          const uint32_t vy = g_cur_viewport[1].load(std::memory_order_relaxed);
-          const uint32_t vw = g_cur_viewport[2].load(std::memory_order_relaxed);
-          const uint32_t vh = g_cur_viewport[3].load(std::memory_order_relaxed);
-          static std::atomic<uint64_t> s_last_vp{~0ull};
-          const uint64_t key = (uint64_t(vw) << 32) | vh;
-          if (s_last_vp.exchange(key, std::memory_order_relaxed) != key) {
-            REXLOG_WARN(
-                "[2d-vp] 2D draws now issued under guest viewport {}x{} at "
-                "({},{})  flags={:02x}",
-                vw, vh, vx, vy, flags2d);
-          }
-        }
         std::lock_guard<std::mutex> lock(g_2d_mutex);
         if (g_frame_2d.size() < 4096) {
           g_frame_2d.push_back(std::move(d));
