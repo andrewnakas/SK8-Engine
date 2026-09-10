@@ -2448,6 +2448,14 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             } else if (is("dynamicobject", 13)) {
               item.dynobj = 1;
             }
+            // Diagnostic: family 0 means the material name matched none of the
+            // tests above. On a converted map a large family-0 population is
+            // the thing to explain -- those items also skip the world shading
+            // path -- and a count alone cannot say which materials they are.
+            // Collect the DISTINCT names; the render loop logs them.
+            if (item.env_family == 0 && REXCVAR_GET(skate3_native_render_scene_tex_log)) {
+              RecordUnclassifiedMaterial(mat_name);
+            }
           }
           continue;
         }

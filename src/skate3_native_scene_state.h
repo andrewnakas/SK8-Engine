@@ -8,6 +8,8 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <cstddef>
 #include <condition_variable>
@@ -866,6 +868,77 @@ inline std::atomic<uint64_t> g_rr_no_bones{0};
 // frames late instead of hitching the render thread).
 inline std::atomic<uint64_t> g_rr_mesh_deferred{0};
 inline std::atomic<uint64_t> g_rr_tex_deferred{0};
+
+// ---- White-fallback attribution (resolve_texture_raw) ----
+// An item whose texture will not resolve is served the 1x1 white fallback.
+// On screen that is indistinguishable from an untextured surface, and until
+// these counters existed it left NO trace in the log: the only texture line
+// we had was the near-black rule, which reads a completely different
+// condition. Three sessions of white-patch work were spent reading that
+// wrong instrument.
+// Indexed [slot][reason]. slot: 0 diffuse, 1 lightmap, 2 macro,
+// 3 normal/ripple, 4 decal art, 5 hair, 6 spec, 7 detail.
+inline constexpr int kTexWhiteSlots = 8;
+enum TexWhiteReason {
+  kTexWhiteNone = 0,
+  kTexWhiteNullPtr,      // item bound no texture at all (tex_ptr == 0)
+  kTexWhiteNoRoute,      // object unreadable/unstable, no prior route
+  kTexWhiteHeld,         // store miss on a retained or demote-held route
+  kTexWhiteDecoding,     // store miss, decode enqueued (transient by design)
+  kTexWhiteInvalid,      // route resolved to a failed decode
+  kTexWhiteNearBlack,    // near-black on a white-neutral slot (the old rule)
+  kTexWhiteReasonCount,
+};
+inline std::atomic<uint64_t> g_tex_white[kTexWhiteSlots][kTexWhiteReasonCount]{};
+
+// Attribution for the slot-0 (diffuse) nullptr case specifically: a count alone
+// cannot tell "the white ground" from a fixed set of props that legitimately
+// bind no diffuse. env_family (skate3_native_scene.cpp ~2405) says which:
+// 1 = environment.default, which is what every converted map's world geometry
+// gets; 0 = unclassified (characters, sky, water, props).
+// Distinct material names seen with env_family == 0 (see
+// RecordUnclassifiedMaterial). "" would mean the material carries no attributor
+// stream at all, which is what an empty texture build produces.
+inline constexpr int kUnclassifiedSlots = 24;
+inline constexpr int kUnclassifiedNameLen = 40;
+inline char g_unclassified[kUnclassifiedSlots][kUnclassifiedNameLen]{};
+inline int g_unclassified_count = 0;
+inline std::atomic_flag g_unclassified_lock = ATOMIC_FLAG_INIT;
+
+/// Records a distinct env_family==0 material name. Inline (not a .cpp
+/// definition) so it links from every TU that classifies items. Bounded,
+/// de-duplicated, and only called when the tex-log cvar is on: this runs per
+/// item per frame. The spin is over a handful of strcmp's and is never
+/// contended in practice -- classification happens on one thread.
+inline void RecordUnclassifiedMaterial(const char* name) {
+  if (name == nullptr || name[0] == '\0') return;
+  while (g_unclassified_lock.test_and_set(std::memory_order_acquire)) {
+  }
+  for (int i = 0; i < g_unclassified_count; ++i) {
+    if (std::strncmp(g_unclassified[i], name, kUnclassifiedNameLen - 1) == 0) {
+      g_unclassified_lock.clear(std::memory_order_release);
+      return;
+    }
+  }
+  if (g_unclassified_count < kUnclassifiedSlots) {
+    std::snprintf(g_unclassified[g_unclassified_count], kUnclassifiedNameLen,
+                  "%s", name);
+    ++g_unclassified_count;
+  }
+  g_unclassified_lock.clear(std::memory_order_release);
+}
+
+inline constexpr int kTexWhiteFamilies = 16;
+// Full attribution: [slot][reason][env_family]. A slot/reason count alone cannot
+// tell our world geometry (fam 1 = environment.default) from the fixed set of
+// props, sky and characters (fam 0) that legitimately bind nothing -- the first
+// cut of this counter reported 10 null diffuses per frame and every one of them
+// turned out to be fam 0.
+inline std::atomic<uint64_t> g_tex_white_fam[kTexWhiteSlots][kTexWhiteReasonCount]
+                                            [kTexWhiteFamilies]{};
+// A few distinct guest mesh addresses, to hand to the trace-mesh cvar.
+inline constexpr int kTexWhiteMeshSamples = 6;
+inline std::atomic<uint32_t> g_tex_white_mesh[kTexWhiteMeshSamples]{};
 inline std::atomic<uint64_t> g_rej_chain{0};
 inline std::atomic<uint64_t> g_rej_geom{0};
 inline std::atomic<uint64_t> g_rej_draws{0};

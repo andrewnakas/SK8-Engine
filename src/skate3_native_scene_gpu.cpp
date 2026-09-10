@@ -7089,6 +7089,93 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
       s_recov_frame = frames;
     }
   }
+  // White-fallback attribution. An item served the 1x1 white fallback draws as
+  // a flat white surface, which is exactly what a converted map's white ground
+  // patches look like -- and no other log line reports it. Windowed (counters
+  // are exchanged to 0), so a steady rate here means a SUSTAINED failure while
+  // a one-off burst is just streaming settling.
+  //
+  // Do NOT gate this on "log the first N": the stock world loads first and
+  // burns any such budget long before a custom map streams in.
+  if (REXCVAR_GET(skate3_native_render_scene_tex_log) && frames % 300 == 0) {
+    static const char* const kSlotName[kTexWhiteSlots] = {
+        "diffuse", "lightmap", "macro", "normal",
+        "decal",   "hair",     "spec",  "detail"};
+    static const char* const kReasonName[kTexWhiteReasonCount] = {
+        "-", "nullptr", "noroute", "held", "decoding", "invalid", "nearblack"};
+    // snprintf into a fixed buffer rather than std::string/fmt: this file
+    // pulls in neither, and the line is bounded by 8 slots x 6 reasons.
+    char line[512] = {0};
+    int used = 0;
+    for (int slot = 0; slot < kTexWhiteSlots; ++slot) {
+      char per[128] = {0};
+      int pused = 0;
+      uint64_t total = 0;
+      for (int r = 1; r < kTexWhiteReasonCount; ++r) {
+        const uint64_t n =
+            g_tex_white[slot][r].exchange(0, std::memory_order_relaxed);
+        if (n == 0) continue;
+        total += n;
+        const int w = std::snprintf(per + pused, sizeof(per) - size_t(pused),
+                                    "%s%s=%llu", pused ? " " : "",
+                                    kReasonName[r], (unsigned long long)n);
+        if (w > 0 && size_t(pused + w) < sizeof(per)) pused += w;
+      }
+      if (total == 0) continue;
+      const int w = std::snprintf(line + used, sizeof(line) - size_t(used),
+                                  " %s[%s]", kSlotName[slot], per);
+      if (w > 0 && size_t(used + w) < sizeof(line)) used += w;
+    }
+    if (used > 0) {
+      // fam 1 (environment.default) is the only family a converted map's world
+      // geometry lands in, so a line with no fam1= term means every white serve
+      // this window was a prop, not the ground.
+      char fam[512] = {0};
+      int fused = 0;
+      for (int slot = 0; slot < kTexWhiteSlots; ++slot) {
+        for (int r = 1; r < kTexWhiteReasonCount; ++r) {
+          for (int f = 0; f < kTexWhiteFamilies; ++f) {
+            const uint64_t n =
+                g_tex_white_fam[slot][r][f].exchange(0, std::memory_order_relaxed);
+            if (n == 0) continue;
+            const int w = std::snprintf(
+                fam + fused, sizeof(fam) - size_t(fused), "%s%s/%s/fam%d=%llu",
+                fused ? " " : "", kSlotName[slot], kReasonName[r], f,
+                (unsigned long long)n);
+            if (w > 0 && size_t(fused + w) < sizeof(fam)) fused += w;
+          }
+        }
+      }
+      char mesh[128] = {0};
+      int mused = 0;
+      for (int i = 0; i < kTexWhiteMeshSamples; ++i) {
+        const uint32_t a = g_tex_white_mesh[i].load(std::memory_order_relaxed);
+        if (a == 0) continue;
+        const int w = std::snprintf(mesh + mused, sizeof(mesh) - size_t(mused),
+                                    "%s%08X", mused ? "," : "", a);
+        if (w > 0 && size_t(mused + w) < sizeof(mesh)) mused += w;
+      }
+      REXLOG_INFO(
+          "native-scene: white-fallback over 300 frames (drawn={}/frame):{} | {}",
+          drawn, line, fam);
+      if (mused > 0)
+        REXLOG_INFO("native-scene: white-fallback fam1 meshes: {}", mesh);
+      // What the family-0 items actually are. An empty name means the material
+      // carries no attributor stream, which is what ArenaBuilder's empty
+      // texture build produces -- and such an item also has no diffuse.
+      char un[1024] = {0};
+      int uused = 0;
+      for (int i = 0; i < g_unclassified_count && i < kUnclassifiedSlots; ++i) {
+        const char* n = g_unclassified[i];
+        const int w = std::snprintf(un + uused, sizeof(un) - size_t(uused),
+                                    "%s'%s'", uused ? " " : "", n);
+        if (w > 0 && size_t(uused + w) < sizeof(un)) uused += w;
+      }
+      if (uused > 0)
+        REXLOG_INFO("native-scene: env_family=0 material names ({}): {}",
+                    g_unclassified_count, un);
+    }
+  }
   const uint64_t interval = uint64_t(
       std::max(60, REXCVAR_GET(skate3_native_render_scene_perf_interval)));
   if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
@@ -8492,8 +8579,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // decode is in flight (first-sight miss or a still-failing heal); the
     // sticky wrapper below then serves the item's last-good texture instead.
     bool tex_pending = false;
+    // Why the last resolve fell back to white, for the wrapper to attribute
+    // per slot. Every `return &g_r.white` below sets one.
+    int tex_white_reason = kTexWhiteNone;
     const auto resolve_texture_raw = [&](uint32_t tex_ptr) -> const GuestTexture* {
       if (tex_ptr == 0) {
+        tex_white_reason = kTexWhiteNullPtr;
         return &g_r.white;
       }
       const bool trm = g_trace_mesh_addr != 0 && item.mesh == g_trace_mesh_addr;
@@ -8557,6 +8648,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // Unreadable/unstable object with no prior route: nothing safe to
         // serve or decode yet; next frame's read settles it.
         tex_pending = true;
+        tex_white_reason = kTexWhiteNoRoute;
         return &g_r.white;
       }
       const RendererState::TexRoute& route = rit->second;
@@ -8568,6 +8660,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           // would commit foreign bytes under a good key. White/sticky until
           // a re-promote publishes live words.
           tex_pending = true;
+          tex_white_reason = kTexWhiteHeld;
           return &g_r.white;
         }
         // Decode on the workers; white/sticky for the 1-3 frames that takes
@@ -8580,6 +8673,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         EnqueueWordsMiss(route.key, route.words);
         g_rr_tex_deferred.fetch_add(1, std::memory_order_relaxed);
         tex_pending = true;
+        tex_white_reason = kTexWhiteDecoding;
         return &g_r.white;
       }
       GuestTexture& e = sit->second;
@@ -8599,6 +8693,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                       frame_number, tex_ptr, route.key, e.retry_after_frame);
         }
         tex_pending = true;
+        tex_white_reason = kTexWhiteInvalid;
         return &g_r.white;
       }
       // Payload revalidation, the one irreducible heuristic: the game
@@ -8677,7 +8772,29 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const auto resolve_texture = [&](uint32_t tex_ptr,
                                      uint32_t slot) -> const GuestTexture* {
       tex_pending = false;
+      tex_white_reason = kTexWhiteNone;
       const GuestTexture* t = resolve_texture_raw(tex_ptr);
+      if (tex_white_reason != kTexWhiteNone && slot < uint32_t(kTexWhiteSlots)) {
+        g_tex_white[slot][tex_white_reason].fetch_add(1,
+                                                      std::memory_order_relaxed);
+        const uint32_t fam =
+            item.env_family < kTexWhiteFamilies ? item.env_family : 0u;
+        g_tex_white_fam[slot][tex_white_reason][fam].fetch_add(
+            1, std::memory_order_relaxed);
+        // Sample meshes only for world geometry -- fam 0's addresses are the
+        // props we already know about and would crowd out anything useful.
+        if (fam == 1) {
+          for (int i = 0; i < kTexWhiteMeshSamples; ++i) {
+            uint32_t cur = g_tex_white_mesh[i].load(std::memory_order_relaxed);
+            if (cur == item.mesh) break;
+            if (cur == 0 &&
+                g_tex_white_mesh[i].compare_exchange_strong(
+                    cur, item.mesh, std::memory_order_relaxed)) {
+              break;
+            }
+          }
+        }
+      }
       // Near-uniform-black decodes on the WHITE-NEUTRAL slots (1 lightmap,
       // 2 macro) serve the white fallback until a heal lands real content.
       // Lightmap: a real-but-black page binds with tint.r > 0 and the CSM
@@ -8703,6 +8820,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
               "native-scene: near-black decode obj={:08X} slot={} served as "
               "white fallback (mid-compose/stream content)",
               tex_ptr, slot);
+        }
+        if (slot < uint32_t(kTexWhiteSlots)) {
+          g_tex_white[slot][kTexWhiteNearBlack].fetch_add(
+              1, std::memory_order_relaxed);
+          g_tex_white_fam[slot][kTexWhiteNearBlack]
+                         [item.env_family < kTexWhiteFamilies ? item.env_family
+                                                              : 0u]
+              .fetch_add(1, std::memory_order_relaxed);
         }
         return &g_r.white;
       }
