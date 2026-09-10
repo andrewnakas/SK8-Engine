@@ -151,6 +151,18 @@ CullThresholdSlot g_cull_slots[16];
 size_t g_cull_slot_count = 0;
 
 uint32_t ScaledThresholdBits(uint32_t base_bits) {
+  // Only while actually skating.
+  //
+  // The front end and the location menus render through the same cull object,
+  // and the scale divides by its own square - so 0.25 makes the contribution
+  // threshold SIXTEEN times harsher and culls a menu's view to nothing. The
+  // menu still takes input and still scrolls, because only its drawing went
+  // away, which is exactly how it was reported. Returning the base here does
+  // not merely skip the scaling: the caller writes back whatever this returns,
+  // so the game's own threshold is restored on the first menu frame.
+  if (rex::kernel::guest_presence::GameplayContextValue() != 1) {
+    return base_bits;
+  }
   const double scale = REXCVAR_GET(skate3_draw_distance_scale);
   if (std::abs(scale - 1.0) <= kScaleEpsilon || scale <= 0.0) {
     return base_bits;
@@ -735,8 +747,14 @@ extern "C" REX_FUNC(sub_827E1AD8) {
   if (!PlausibleGuestAddr(view)) {
     return;
   }
+  // Same gameplay gate as the cull threshold, and for a second reason: unlike
+  // the threshold above, this multiplies the guest's value IN PLACE with no
+  // record of the original. It is safe only because the game rewrites these
+  // six distances every frame from the view attribute - and it is exactly the
+  // screens where that may not hold, the menus, that reported drawing nothing.
   const double lod_scale = REXCVAR_GET(skate3_lod_distance_scale);
-  if (std::abs(lod_scale - 1.0) > kScaleEpsilon) {
+  if (std::abs(lod_scale - 1.0) > kScaleEpsilon &&
+      rex::kernel::guest_presence::GameplayContextValue() == 1) {
     const double squared = lod_scale * lod_scale;
     for (uint32_t offset = 23760; offset <= 23780; offset += 4) {
       const uint32_t addr = view + offset;
