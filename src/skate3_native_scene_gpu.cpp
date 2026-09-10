@@ -69,6 +69,7 @@
 #include "skate3_native_scene_state.h"
 #include "skate3_crash_report.h"
 #include "skate3_image_watch.h"
+#include "skate3_alloc_counter.h"
 #include "skate3_native_scene_gpu_internal.h"
 
 // Cvars defined in skate3_native_scene.cpp (and SDK cvars re-declared there).
@@ -7992,6 +7993,15 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     // a second lock on a door that is locked. Worse, reading it meant raising
     // the whole process to info, which on this port turns on the guest
     // driver's own printing and changes the timing being measured.
+    // Allocations per frame. Every one of these costs ~6.7 us on this arena
+    // (measured: removing ~750 a frame bought ~5 ms), so this number is a
+    // direct budget, not a curiosity.
+    static skate3::alloc_counter::AllocSnapshot s_alloc_prev{};
+    const auto alloc_now = skate3::alloc_counter::Read();
+    const skate3::alloc_counter::AllocSnapshot alloc_delta{
+        alloc_now.allocs - s_alloc_prev.allocs, alloc_now.frees - s_alloc_prev.frees,
+        alloc_now.bytes - s_alloc_prev.bytes};
+    s_alloc_prev = alloc_now;
     REXLOG_WARN(
         "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
         "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms "
@@ -8001,7 +8011,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "pre={:.2f}/{:.2f}ms settle[{:.2f}/{:.2f}ms n={} dec={} def={}] "
         "tail={:.2f}/{:.2f}ms twod={:.2f}/{:.2f}ms "
         "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
-        "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}]",
+        "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}] "
+        "alloc[{}/frame {}KB/frame live={}]",
         guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
         g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
         g_pw_build.MaxMs(), g_pw_b2d.AvgMs(), g_pw_b2d.MaxMs(), g_pw_bspl.AvgMs(),
@@ -8028,7 +8039,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_item_cache_builds.exchange(0, std::memory_order_relaxed),
         g_cam_changes.exchange(0, std::memory_order_relaxed),
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
-        g_cam_max_streak.exchange(0, std::memory_order_relaxed));
+        g_cam_max_streak.exchange(0, std::memory_order_relaxed),
+        alloc_delta.allocs / interval, alloc_delta.bytes / interval / 1024,
+        int64_t(alloc_now.allocs) - int64_t(alloc_now.frees));
     // Deep per-item attribution (see the perf-items cvar): visibility-class
     // draw costs, completed-draw stage split, build-walk decomposition, and
     // the off-screen retention pass. Averages are per item (the windows Add

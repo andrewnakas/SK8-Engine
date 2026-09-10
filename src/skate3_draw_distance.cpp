@@ -68,14 +68,19 @@ REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 2.0, "Skate 3",
                       "Scale the distance at which small world meshes "
                       "(foliage, props, street furniture) stop being drawn. "
                       "1 = original console behavior. Larger values draw more "
-                      "of the world and cost proportionally more GPU/CPU.")
-    .range(0.25, 16.0)
+                      "of the world and cost proportionally more GPU/CPU. The "
+                      "floor is below the old 0.25 because on this port the "
+                      "static world is ~750 of the ~765 items in a frame - "
+                      "pedestrians, cars and other skaters together are about "
+                      "a dozen - so thinning props is the only content lever "
+                      "with any mass behind it.")
+    .range(0.05, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 2.0, "Skate 3",
                       "Scale the distances at which skaters, pedestrians and "
                       "vehicles switch to lower-detail models. 1 = original "
                       "console behavior.")
-    .range(0.25, 16.0)
+    .range(0.05, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_stream_probe, 0.0, "Skate 3",
                       "Pre-stream world detail cells this many metres ahead "
