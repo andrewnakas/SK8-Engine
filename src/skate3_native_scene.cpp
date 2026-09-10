@@ -1342,6 +1342,17 @@ REXCVAR_DEFINE_INT32(
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(
+    skate3_map_erase_fix, true, "Skate 3",
+    "Neutralise the hash erase at sub_82C95E18+0xB4 when the key is not in "
+    "the map. Erasing an absent key is a no-op by definition, but this caller "
+    "does not check the find's result: it takes the -1 marker as a node and "
+    "dereferences it, which is the deterministic fault returning from a DLC "
+    "map. The fix hands back the map's own end sentinel plus a scratch pair "
+    "below the guest stack, so the unlink writes only to scratch and the "
+    "free-list push is skipped; the erase hook then restores the size the "
+    "tail decremented. Requires skate3_map_erase_probe to see the miss.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
     skate3_map_erase_probe, false, "Skate 3",
     "Log the key and map whenever the hash erase at sub_82C95E18+0xB4 looks up "
     "a key that is NOT present. That erase dereferences the find's end "

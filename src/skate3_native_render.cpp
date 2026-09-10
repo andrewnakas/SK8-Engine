@@ -58,6 +58,14 @@ REXCVAR_DECLARE(int32_t, skate3_job_scan_backoff_sleep_us);
 REXCVAR_DECLARE(bool, skate3_job_scan_stats);
 REXCVAR_DECLARE(bool, skate3_guest_spin_measure);
 REXCVAR_DECLARE(bool, skate3_map_erase_probe);
+REXCVAR_DECLARE(bool, skate3_map_erase_fix);
+
+namespace skate3::native_render {
+// Set by the find hook when it neutralised a miss, read by the erase hook to
+// undo the size decrement. Thread-local: the erase runs on the load thread and
+// the find is called from nowhere else in that window.
+thread_local bool g_map_erase_missed = false;
+}  // namespace skate3::native_render
 REXCVAR_DEFINE_BOOL(skate3_d3d_ring_check, false, "Skate 3",
                     "Diagnostic: watch the guest D3D command-ring write pointer at every "
                     "deferred render-state flush (D3D::SetPending_RenderStates). The pointer at "
@@ -2120,13 +2128,77 @@ extern "C" REX_FUNC(sub_82C9E4F8) {
   }
   static std::atomic<uint32_t> s_hits{0};
   const uint32_t n = s_hits.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (n > 8 && (n % 512) != 0) {
+
+  // ---- Make the erase a no-op instead of a fault -------------------------
+  //
+  // Erasing a key that is not in the map is a no-op by definition, but this
+  // caller does not check: it takes the find's "not found" marker (-1) as a
+  // node and dereferences it at +168. What the caller then does, read out of
+  // the recompiled source at sub_82C95E18+0xB4:
+  //
+  //   r10 = out[0]; r8 = out[1];
+  //   r9 = *(r10+168);  if (r9 == 0) do { r9 = *(r11 += 4); } while (!r9);
+  //   r11 = *(r8);  if (r11 == r10) *(r8) = *(r10+168);   // unlink
+  //   if (r10 != *(map+40)) { *(map+32) -= 1; *(r10+0) = *(map+28);
+  //                           *(map+28) = r10; }          // FREE-LIST PUSH
+  //   *(map+12) -= 1;                                     // size--
+  //
+  // So hand it a result that walks that path harmlessly:
+  //   out[0] = *(map+40), the map's own end sentinel. The `r10 != *(map+40)`
+  //     test then SKIPS the free-list push - which is the dangerous half,
+  //     because pushing a node we invented onto the game's free list would
+  //     corrupt it later, far from here.
+  //   out[1] = a scratch pair below the guest stack pointer, holding that
+  //     same sentinel. The unlink's one store therefore lands in scratch and
+  //     the real bucket array is never touched. There are no calls between
+  //     the return and that store, so stack below r1 is safe for it.
+  //   scratch[1] = 1, so if *(sentinel+168) happens to be zero the bucket
+  //     scan terminates on the very next word instead of running away.
+  //
+  // That leaves exactly one side effect: `size--` at the end, which the
+  // sub_82C95E18 hook below puts back.
+  if (!REXCVAR_GET(skate3_map_erase_fix)) {
+    if (n <= 8 || (n % 512) == 0) {
+      REXLOG_WARN(
+          "[map-erase] MISS #{} (fix OFF): key={:08X}{:08X} map={:08X} "
+          "node={:08X} end={:08X} - the caller will now walk off the array",
+          n, REX_LOAD_U32(key_ptr), REX_LOAD_U32(key_ptr + 4), map, node,
+          end_slot);
+    }
     return;
   }
-  REXLOG_WARN(
-      "[map-erase] MISS #{}: key={:08X}{:08X} map={:08X} buckets={:08X} "
-      "count={} node={:08X} end={:08X} - the caller will now walk off the "
-      "bucket array",
-      n, REX_LOAD_U32(key_ptr), REX_LOAD_U32(key_ptr + 4), map,
-      buckets, count, node, end_slot);
+  const uint32_t sentinel = REX_LOAD_U32(map + 40);
+  const uint32_t scratch = ctx.r1.u32 - 256;
+  if (sentinel == 0 || scratch < 0x1000) {
+    return;  // nothing safe to hand back; leave the original behaviour
+  }
+  REX_STORE_U32(scratch + 0, sentinel);
+  REX_STORE_U32(scratch + 4, 1);
+  REX_STORE_U32(out + 0, sentinel);
+  REX_STORE_U32(out + 4, scratch);
+  skate3::native_render::g_map_erase_missed = true;
+  if (n <= 8 || (n % 512) == 0) {
+    REXLOG_WARN(
+        "[map-erase] MISS #{} neutralised: key={:08X}{:08X} map={:08X} "
+        "sentinel={:08X} scratch={:08X}",
+        n, REX_LOAD_U32(key_ptr), REX_LOAD_U32(key_ptr + 4), map, sentinel,
+        scratch);
+  }
+}
+
+// The erase itself. Its tail decrements the map's size unconditionally, so a
+// miss that the find hook above neutralised would still leave the count one
+// too low. Put it back.
+extern "C" REX_FUNC(sub_82C95E18) {
+  const uint32_t map = ctx.r3.u32 + 24880;
+  const bool guard = REXCVAR_GET(skate3_map_erase_fix);
+  const uint32_t size_before = guard ? REX_LOAD_U32(map + 12) : 0;
+  if (guard) {
+    skate3::native_render::g_map_erase_missed = false;
+  }
+  __imp__sub_82C95E18(ctx, base);
+  if (guard && skate3::native_render::g_map_erase_missed) {
+    skate3::native_render::g_map_erase_missed = false;
+    REX_STORE_U32(map + 12, size_before);
+  }
 }
