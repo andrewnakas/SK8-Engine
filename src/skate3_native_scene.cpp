@@ -8860,6 +8860,55 @@ void CensusReport(uint32_t records, uint32_t views, uint32_t cam_ok, uint32_t pe
       records, views, cam_ok, persp, aux, persp_w, m00, m11);
 }
 
+// Open-addressed uint32 set over a buffer that is allocated once and reused.
+//
+// Same reason as DrawItem::draws: std::unordered_set allocates a node per
+// element, this one is filled with ~750 guest addresses every frame, and on
+// this port a malloc costs microseconds because the arena carries tens of
+// thousands of free chunks. Replacing the draw-list vector alone took the
+// hook cost from ~10 ms a frame to ~5.
+//
+// Guest addresses are 4-aligned and cluster, so the key is mixed before
+// probing. 0 is the empty sentinel; it is never a valid item address here,
+// and Insert rejects it rather than pretend.
+class FlatU32Set {
+ public:
+  void Reset(size_t expected) {
+    size_t want = 16;
+    while (want < expected * 2) want *= 2;
+    if (slots_.size() < want) {
+      slots_.assign(want, 0u);
+    } else {
+      std::fill(slots_.begin(), slots_.end(), 0u);
+    }
+    mask_ = uint32_t(slots_.size() - 1);
+  }
+  // True when `key` was not already present.
+  bool Insert(uint32_t key) {
+    if (key == 0 || slots_.empty()) return true;
+    uint32_t i = Mix(key) & mask_;
+    for (;;) {
+      const uint32_t slot = slots_[i];
+      if (slot == 0) {
+        slots_[i] = key;
+        return true;
+      }
+      if (slot == key) return false;
+      i = (i + 1) & mask_;
+    }
+  }
+
+ private:
+  static uint32_t Mix(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    return x;
+  }
+  std::vector<uint32_t> slots_;
+  uint32_t mask_ = 0;
+};
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
@@ -9084,10 +9133,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
 
   FrameScene scene;
   scene.items.reserve(count);
-  std::unordered_set<uint32_t> seen;
+  // Reused across frames: the buffer is allocated once and refilled, so the
+  // per-item node allocations std::unordered_set would make never happen.
+  // BuildFrameScene runs only on the guest render thread.
+  static FlatU32Set seen;
   // Pre-size the per-frame bookkeeping: these fill with thousands of
   // entries every frame, and growing from empty rehashes repeatedly.
-  seen.reserve(count);
+  seen.Reset(count);
   // Dynamic contexts are submitted several times per frame (once per pass);
   // each submission carries that pass's culled island list. Keep the fullest
   // one; a shadow-pass list can be missing body parts the main view needs.
@@ -9144,13 +9196,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     if (r.kind == 2 && r.b != view) {
       // World-path capture from another view (shadow cascade): rendering it
       // duplicates the entity as a ghost.
-      seen.insert(r.a);
+      seen.Insert(r.a);
       continue;
     }
     if (r.kind == 0 || r.kind == 2 || r.kind == 3) {
       // Dynamic entity (kind 0), main-view world-path capture (kind 2) or
       // quad-list capture (kind 3): the complete item was built at hook time.
-      seen.insert(r.a);
+      seen.Insert(r.a);
       if (r.c == 0) {
         g_rej_no_dynstate.fetch_add(1, std::memory_order_relaxed);
         continue;
@@ -9239,7 +9291,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
       continue;
     }
-    if (!seen.insert(r.a).second) {
+    if (!seen.Insert(r.a)) {
       continue;
     }
     if (!s_build_culled.empty() &&

@@ -485,7 +485,13 @@ void ReportPacing() {
   // level is warn and [pace] writes at info: without this gate every player
   // would time every frame, grow a 1800-entry vector, and sort a copy of it
   // every thirty seconds, to format a string that is then dropped.
-  if (!REXCVAR_GET(skate3_diagnostics)) {
+  // The perf log is enough to ask for pacing: this line is the only measure
+  // of SMOOTHNESS the port has, and skate3_diagnostics also raises the whole
+  // process to info - which on this console turns on the guest driver's own
+  // printing and changes the very intervals being sampled. The sampling here
+  // is a double per frame and one sort per thirty seconds.
+  if (!REXCVAR_GET(skate3_diagnostics) &&
+      !REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     if (s_prev.time_since_epoch().count() != 0) {
       // Drop the window rather than keep it: the next sample after the switch
       // is flipped back on would otherwise be an interval spanning however long
