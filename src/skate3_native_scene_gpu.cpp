@@ -158,6 +158,7 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_ssr_thickness);
 REXCVAR_DECLARE(double, skate3_native_render_scene_world_v2_tan_sign);
 REXCVAR_DECLARE(int32_t, native_render_force_resolve_readback_max_length);
 REXCVAR_DECLARE(int32_t, native_render_suppress_mode);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_suppress_gameplay);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_2d_async_px);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_detail_hold);
@@ -5594,6 +5595,40 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   static bool s_seen_gameplay = false;
   static bool s_pause_native = false;
   const bool in_menus = rex::kernel::guest_presence::GameplayContextValue() == 0;
+
+  // Suppress harder while actually skating than while loading.
+  //
+  // Mode 1 suppresses every emulated draw and resolve, which on this port is
+  // worth about fourteen frames a second - but the passes it stops include the
+  // memory composition a map LOAD waits to finish, so holding it across a load
+  // leaves the title waiting for something that will never happen. Leaving it
+  // at the safe mode for loading and menus and switching to the aggressive one
+  // once the guest reports gameplay gets both.
+  //
+  // This runs BEFORE the portrait-window block below, which saves and restores
+  // the same cvar: that one only engages while in_menus and this one only while
+  // not, so the value it saves is always the configured base rather than
+  // something this left behind.
+  {
+    const int32_t play_mode = REXCVAR_GET(skate3_native_render_scene_suppress_gameplay);
+    static bool s_play_forced = false;
+    static int32_t s_play_base = 2;
+    const bool want_play = play_mode >= 0 && !in_menus;
+    if (want_play && !s_play_forced) {
+      s_play_base = REXCVAR_GET(native_render_suppress_mode);
+      if (s_play_base != play_mode) {
+        REXCVAR_SET(native_render_suppress_mode, play_mode);
+        REXLOG_INFO("native-scene: gameplay - suppress mode {} -> {}", s_play_base, play_mode);
+      }
+      s_play_forced = true;
+    } else if (!want_play && s_play_forced) {
+      if (s_play_base != play_mode) {
+        REXCVAR_SET(native_render_suppress_mode, s_play_base);
+        REXLOG_INFO("native-scene: left gameplay - suppress mode {} restored", s_play_base);
+      }
+      s_play_forced = false;
+    }
+  }
   // Render-thread mirror for the 2D texture resolver: menu screens shorten
   // the content-liveness recheck cadence (see resolve_2d_texture) so
   // in-place rewrites of UI textures (the one-shot skater-portrait resolves)

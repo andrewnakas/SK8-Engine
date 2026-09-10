@@ -209,6 +209,19 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_ssr_debug, 0, "Skate 3",
                      "too-thick crossings, white = hit x confidence).")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_suppress_gameplay, -1, "Skate 3",
+    "Emulated-draw suppression mode to use WHILE SKATING, with "
+    "native_render_suppress_mode applying everywhere else. -1 leaves the one "
+    "mode in force throughout. This exists because the two situations want "
+    "different answers: mode 1 suppresses everything the emulated path would "
+    "draw and resolve, which is worth a lot of frames in gameplay, but it also "
+    "suppresses the memory-composition passes a map LOAD waits on - so held "
+    "across a load the title simply never finishes one. Set the base mode to 2 "
+    "and this to 1 to get both.")
+    .range(-1, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr, true, "Skate 3",
                     "Render the 3D scene into a float (HDR) intermediate and apply the "
                     "game's shared tone chain once in a host post pass, the basis for "
