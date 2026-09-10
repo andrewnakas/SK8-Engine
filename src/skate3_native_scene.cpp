@@ -8897,11 +8897,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         g_slow_frame_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
       const double ours_ms =
           double(s_prev_build_ns + s_prev_cap_ns) * 1e-6;
-      // INFO, not DEBUG: iOS never raises log_level, so at DEBUG this line -
-      // the only per-frame attribution of a dip - has never once reached a
-      // device log. g_slow_frame_log_budget already bounds it to 3 per perf
-      // window, so the volume is a few lines a minute, not a flood.
-      REXLOG_INFO(
+      // WARN, not INFO, for the same reason the perf line above is warn: this
+      // is the only per-frame attribution of a dip, g_slow_frame_log_budget
+      // already bounds it to 3 per perf window, and every level below warn is
+      // a second lock on a door that is already locked. It was moved DEBUG ->
+      // INFO because iOS never raises the level; the Switch runs at warn and
+      // raising it there turns on the guest driver's own printing, which
+      // changes the very timing this line reports. So: warn.
+      REXLOG_WARN(
           "native-scene: slow guest frame dt={:.2f}ms prev[cap={:.2f} build={:.2f} "
           "(2d={:.2f} spl={:.2f} pal={:.2f} ptail={:.2f} walk={:.2f}) rest={:.2f}]ms",
           dt_ms, double(s_prev_cap_ns) * 1e-6, double(s_prev_build_ns) * 1e-6,
