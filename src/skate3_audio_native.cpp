@@ -166,7 +166,13 @@ extern "C" REX_FUNC(sub_82B28C18) {
       packet = REX_LOAD_U32(packet + kPacketNext);
     }
     if (REX_LOAD_U32(player + kPlayerDecoder) != 0 || packet != 0) {
-      g_event_stop_unverifiable.fetch_add(1, std::memory_order_relaxed);
+      // Reported, not just counted: a divergence figure with an invisible skip count reads
+      // as "verified" when most calls were never compared.
+      const uint64_t skipped = g_event_stop_unverifiable.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (skipped == 1 || skipped == 16 || skipped == 256 || (skipped % 1024) == 0) {
+        REXLOG_INFO("skate3-audio-shadow: EVENT_STOP not comparable on {} calls so far "
+                    "(live decoder or a FIFO longer than the window list)", skipped);
+      }
       __imp__sub_82B28C18(ctx, base);
       return;
     }
