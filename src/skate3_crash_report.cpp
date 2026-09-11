@@ -2,6 +2,12 @@
 
 #include "skate3_crash_report.h"
 
+#include "skate3_guest_trace.h"
+
+#include <rex/cvar.h>
+
+REXCVAR_DECLARE(bool, skate3_trace_dump_on_crash);
+
 #if !defined(_WIN32)
 
 #include <dirent.h>
@@ -463,6 +469,26 @@ void StartWatchdog() {
 // that loaded it.
 struct sigaction g_prev_sigabrt;
 
+// Flush the guest trace on the way down, so a run that dies mid-trace still leaves its
+// buffer on disk. The tracer's own dump triggers fire on milestones (gameplay reached, a
+// macro finishing), which is no use for a fault that lands seconds before any of them.
+//
+// This is NOT async-signal-safe: Dump() opens a file and formats text, which is exactly
+// what the rest of this file avoids by pre-opening a fd. In a handler that is already
+// letting the process die that trade is usually worth making, but a fault inside malloc or
+// stdio can deadlock here instead of dying cleanly - so it is opt-in, and off by default.
+void FlushGuestTraceOnCrash(const char* reason) {
+  if (!REXCVAR_GET(skate3_trace_dump_on_crash)) {
+    return;
+  }
+  static std::atomic<int> flushing{0};
+  int expected = 0;
+  if (!flushing.compare_exchange_strong(expected, 1)) {
+    return;
+  }
+  skate3::guest_trace::Dump(reason);
+}
+
 void AbortHandler(int sig, siginfo_t* info, void* uctx) {
   static std::atomic<int> reporting{0};
   int expected = 0;
@@ -471,6 +497,7 @@ void AbortHandler(int sig, siginfo_t* info, void* uctx) {
     r.Str("\n=== skate3: guest abort (REX_FATAL / assert) ===\n");
     WriteGuestState(r);
   }
+  FlushGuestTraceOnCrash("guest abort");
   // Chain, then let abort() finish the job: returning from here re-raises with
   // the default disposition.
   if ((g_prev_sigabrt.sa_flags & SA_SIGINFO) && g_prev_sigabrt.sa_sigaction) {
@@ -531,6 +558,7 @@ bool CrashReportHandler(rex::arch::Exception* ex, void* /*data*/) {
   r.Str("\n");
 
   WriteGuestState(r);
+  FlushGuestTraceOnCrash("guest fault");
   return false;  // decline: the process must still die
 }
 

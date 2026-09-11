@@ -103,6 +103,12 @@ REXCVAR_DEFINE_STRING(skate3_trace_arm, "macro-final", "Skate 3",
                       "last input, dump after the sequence completes; 'boot' = arm at "
                       "startup, dump once gameplay is reached; 'gameplay' = arm when "
                       "gameplay is reached; 'manual' = arm at startup, never auto-dump.");
+REXCVAR_DEFINE_BOOL(skate3_trace_dump_on_crash, false, "Skate 3",
+                    "Write the trace from the crash handler when the game faults or aborts, "
+                    "so a run that dies before any dump trigger still leaves its buffer. Off "
+                    "by default: the dump is not async-signal-safe, and a fault inside malloc "
+                    "or stdio can hang there instead of dying. Pairs with "
+                    "--skate3_trace_mode=ring, which keeps the last N calls before the fault.");
 REXCVAR_DEFINE_INT32(skate3_trace_dump_delay_ms, 6000, "Skate 3",
                      "Keep recording this long after the dump trigger before writing the "
                      "trace out (the world starts streaming seconds after the confirm).")
@@ -190,11 +196,19 @@ std::string ThreadName(uint32_t index) {
 // Guest regions worth dereferencing. Deliberately NOT the whole 4 GiB view:
 // the runtime arms fault recovery over parts of it, and a speculative read of
 // an arbitrary address is how a diagnostic turns into the crash it was meant
-// to explain. These three cover the heap, the low heap and the XEX image,
-// which is where every string lives (same regions as scripts/memfind.py).
+// to explain.
+//
+// Which is what happened, 2026-09-11: a ring-mode session faulted 217 ms after
+// arming, reading the address that was sitting in r5 (guest 0x70656400). The
+// old upper range ran to 0x80000000 and so admitted the guest STACK band -
+// stack pointers in this build are 0x70030000..0x707BFB20 - and stacks are 1 MB
+// allocations in a sparsely committed view where reserved pages are PROT_NONE
+// (core/memory_posix.cpp AllocFixed). One page past a live stack reads as a
+// fault. Strings live on the heap and in the image, not on stacks, so the
+// upper bound stops below the stack band.
 bool ReadableGuest(uint32_t address) {
   return (address >= 0x00010000 && address < 0x40000000) ||
-         (address >= 0x40000000 && address < 0x80000000) ||
+         (address >= 0x40000000 && address < 0x60000000) ||
          (address >= 0x82000000 && address < 0x84000000);
 }
 
@@ -548,9 +562,21 @@ void skate3_trace_enter(const char* fn, const PPCContext& ctx, uint8_t* base) {
   e.stamp = Stamp();
   e.thread = uint32_t(ThreadIndex());
   // Resolved here rather than at dump time: by then the pointer is stale.
-  ReadGuestString(base, e.r3, e.text[0], kStringPreview);
-  ReadGuestString(base, e.r4, e.text[1], kStringPreview);
-  ReadGuestString(base, e.r5, e.text[2], kStringPreview);
+  //
+  // Ring mode does this for EVERY call rather than once per function, which is
+  // three orders of magnitude more speculative reads, for names that ring mode
+  // is not asking about - it wants order and repeat counts. Skip them there:
+  // the exposure is not worth a diagnostic that can kill the run it is
+  // diagnosing.
+  if (!g_ring) {
+    ReadGuestString(base, e.r3, e.text[0], kStringPreview);
+    ReadGuestString(base, e.r4, e.text[1], kStringPreview);
+    ReadGuestString(base, e.r5, e.text[2], kStringPreview);
+  } else {
+    e.text[0][0] = 0;
+    e.text[1][0] = 0;
+    e.text[2][0] = 0;
+  }
 }
 
 }  // extern "C"
