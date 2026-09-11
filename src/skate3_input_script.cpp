@@ -104,6 +104,36 @@ std::atomic<uint64_t> g_wipeout_true_polls{0};
 std::atomic<uint64_t> g_wipeout_events{0};
 std::atomic<int64_t> g_last_wipeout_true_ms{-1000000};
 
+// Which player each wipeout belonged to. The function is polled per physical player and
+// these worlds are populated, so an unfiltered count means "someone fell" - a pedestrian
+// going down next to the skater already got a bail attributed to an input that did not
+// cause one. The object arrives in r3 on entry; the local skater's is learned by matching
+// a wipeout against its frame, and is not derivable from here.
+constexpr size_t kMaxWipeoutPlayers = 8;
+std::atomic<uint32_t> g_wipeout_player[kMaxWipeoutPlayers]{};
+std::atomic<uint64_t> g_wipeout_player_events[kMaxWipeoutPlayers]{};
+std::atomic<uint32_t> g_last_wipeout_object{0};
+
+void RecordWipeoutPlayer(uint32_t object) {
+  g_last_wipeout_object.store(object, std::memory_order_relaxed);
+  for (size_t i = 0; i < kMaxWipeoutPlayers; i++) {
+    uint32_t slot = g_wipeout_player[i].load(std::memory_order_relaxed);
+    if (slot == 0) {
+      uint32_t expected = 0;
+      if (!g_wipeout_player[i].compare_exchange_strong(expected, object,
+                                                       std::memory_order_relaxed)) {
+        slot = expected;
+      } else {
+        slot = object;
+      }
+    }
+    if (slot == object) {
+      g_wipeout_player_events[i].fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
 int64_t NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -300,8 +330,9 @@ void ControllerMain() {
     const uint64_t wipeouts = g_wipeout_events.load(std::memory_order_relaxed);
     if (wipeouts != logged_wipeouts) {
       logged_wipeouts = wipeouts;
-      REXLOG_INFO("input script: t={} ms WIPEOUT #{} - {} ms after '{}'", t, wipeouts,
-                  t - last_mark_ms, last_mark);
+      REXLOG_INFO("input script: t={} ms WIPEOUT #{} - {} ms after '{}' (player {:08X})", t,
+                  wipeouts, t - last_mark_ms, last_mark,
+                  g_last_wipeout_object.load(std::memory_order_relaxed));
       CaptureFrame(capture_dir, "wipeout" + std::to_string(wipeouts), t);
     }
     if (every > 0 && t >= next_periodic) {
@@ -317,6 +348,12 @@ void ControllerMain() {
                   g_total_ms, g_wipeout_events.load(std::memory_order_relaxed),
                   g_wipeout_true_polls.load(std::memory_order_relaxed),
                   g_wipeout_polls.load(std::memory_order_relaxed));
+      for (size_t i = 0; i < kMaxWipeoutPlayers; i++) {
+        const uint32_t object = g_wipeout_player[i].load(std::memory_order_relaxed);
+        if (object == 0) break;
+        REXLOG_INFO("input script:   player {:08X}: {} wipeouts", object,
+                    g_wipeout_player_events[i].load(std::memory_order_relaxed));
+      }
       CaptureFrame(capture_dir, "end", t);
       return;
     }
@@ -395,6 +432,7 @@ extern "C" REX_FUNC(__imp__XamInputGetState) {
 // frame, and true on many consecutive frames for one fall, so true polls closer than
 // kWipeoutGapMs to the previous true poll belong to the same bail.
 extern "C" REX_FUNC(sub_82DB9100) {
+  const uint32_t player = ctx.r3.u32;  // the object, before the call overwrites r3
   __imp__sub_82DB9100(ctx, base);
   g_wipeout_polls.fetch_add(1, std::memory_order_relaxed);
   if ((ctx.r3.u32 & 0xFFu) == 0) {
@@ -404,6 +442,7 @@ extern "C" REX_FUNC(sub_82DB9100) {
   const int64_t now = NowMs();
   const int64_t previous = g_last_wipeout_true_ms.exchange(now, std::memory_order_relaxed);
   if (now - previous >= kWipeoutGapMs) {
+    RecordWipeoutPlayer(player);
     g_wipeout_events.fetch_add(1, std::memory_order_relaxed);
   }
 }
