@@ -58,6 +58,12 @@ REXCVAR_DEFINE_BOOL(skate3_intro_movie_skip_early, false, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_intro_movie_skip, true, "Skate 3",
                     "Skip the frontend intro movie when A or Start is pressed "
                     "(the default keyboard bindings make that Space and Enter)");
+REXCVAR_DEFINE_BOOL(skate3_demo_path_play_movies, false, "Skate 3",
+                    "Demo path: let frontend movies play to the end instead of completing "
+                    "them on their first update. Off by default, because boot automation "
+                    "exists to reach gameplay fast. Audio verification wants it on: the "
+                    "movie player is the first caller of the rw::audio PacketPlayer "
+                    "command queue, so a session that skips movies may never exercise it.");
 REXCVAR_DEFINE_BOOL(skate3_demo_path_confirm_pause, true, "Skate 3",
                     "Retry the boot macro's opening 'start' press until the frontend's "
                     "push-state stack actually shows the pause root, instead of trusting a "
@@ -819,6 +825,11 @@ bool ShouldSkipIntroMovieEarly() {
 }
 
 bool ShouldForceIntroMovieComplete() {
+  // Checked before the user-skip path too: under automation a synthetic A or Start
+  // pulse could otherwise read as a fresh press and skip the movie anyway.
+  if (AutomationEnabled() && REXCVAR_GET(skate3_demo_path_play_movies)) {
+    return false;
+  }
   // Agent boot mode never needs a frontend movie. Complete every movie as
   // soon as FEMoviePlayer::Update first sees it, including logos that occur
   // before the language state enables the ordinary demo-path skip.
