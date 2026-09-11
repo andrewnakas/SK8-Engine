@@ -294,6 +294,7 @@ include(cmake/CodegenTargets.cmake)
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
+    src/skate3_frame_advance.cpp
     src/skate3_audio_fixes.cpp
     src/skate3_crash_report.cpp
     src/skate3_demo_path.cpp
@@ -570,6 +571,18 @@ if(SKATE3_SWITCH)
     option(SKATE3_GUEST_LOOP_BARRIER "Compiler barrier at guest loop back edges" ON)
     if(SKATE3_GUEST_LOOP_BARRIER)
         target_compile_definitions(skate3 PRIVATE REX_GUEST_LOOP_BARRIER=1)
+    endif()
+
+    # Let the title advance more than one refresh period of simulation in a
+    # frame. It measures real elapsed time and then clamps it at one period,
+    # which is why the game runs at period/frame_time speed - half speed at
+    # 33 ms a frame. The generated tree is shared with the phone builds and
+    # compiles a plain 100u unless this is defined; the guest-side edit is
+    # scripts/patch_frame_advance_cap.py and the cap itself is the cvar
+    # skate3_frame_advance_cap. See src/skate3_frame_advance.cpp.
+    option(SKATE3_GUEST_FRAME_ADVANCE_CAP "Let the guest advance past one refresh period per frame" ON)
+    if(SKATE3_GUEST_FRAME_ADVANCE_CAP)
+        target_compile_definitions(skate3 PRIVATE REX_GUEST_FRAME_ADVANCE_CAP_HOOK=1)
     endif()
 
     # GCC in gnu++ mode defaults to -ffp-contract=fast and fuses a multiply and
