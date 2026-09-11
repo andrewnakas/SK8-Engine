@@ -267,6 +267,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_fov.cpp
     src/skate3_guest_trace.cpp
     src/skate3_heap_check.cpp
+    src/skate3_input_script.cpp
     src/skate3_iso_installer.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_entity.cpp
