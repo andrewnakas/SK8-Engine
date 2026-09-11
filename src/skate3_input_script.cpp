@@ -271,6 +271,10 @@ void ControllerMain() {
   int64_t next_periodic = 0;
   int periodic = 0;
   uint64_t logged_wipeouts = g_wipeout_events.load(std::memory_order_relaxed);
+  // The last marker passed, so a bail names what it followed instead of leaving the
+  // timestamps to be matched by hand.
+  std::string last_mark = "start";
+  int64_t last_mark_ms = 0;
   const uint64_t polls_at_start = g_input_polls.load(std::memory_order_relaxed);
   bool rate_logged = false;
   for (;;) {
@@ -282,6 +286,8 @@ void ControllerMain() {
     while (next_event < g_events.size() && g_events[next_event].at_ms <= t) {
       const Event& ev = g_events[next_event++];
       REXLOG_INFO("input script: t={} ms {} {}", t, ev.capture ? "capture" : "mark", ev.name);
+      last_mark = ev.name;
+      last_mark_ms = ev.at_ms;
       if (ev.capture) {
         CaptureFrame(capture_dir, ev.name, t);
       }
@@ -294,7 +300,8 @@ void ControllerMain() {
     const uint64_t wipeouts = g_wipeout_events.load(std::memory_order_relaxed);
     if (wipeouts != logged_wipeouts) {
       logged_wipeouts = wipeouts;
-      REXLOG_INFO("input script: t={} ms WIPEOUT #{} (IsWipeoutRequested true)", t, wipeouts);
+      REXLOG_INFO("input script: t={} ms WIPEOUT #{} - {} ms after '{}'", t, wipeouts,
+                  t - last_mark_ms, last_mark);
       CaptureFrame(capture_dir, "wipeout" + std::to_string(wipeouts), t);
     }
     if (every > 0 && t >= next_periodic) {
