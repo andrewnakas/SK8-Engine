@@ -60,6 +60,13 @@ REXCVAR_DEFINE_INT32(skate3_input_script_settle_ms, 3000, "Skate 3",
                      "Wait this long after gameplay is first reached before starting "
                      "skate3_input_script.")
     .range(0, 120000);
+REXCVAR_DEFINE_BOOL(skate3_wipeout_log, false, "Skate 3",
+                    "Log the game's own wipeout decisions (PhysicalPlayerHiLOD::"
+                    "IsWipeoutRequested) as they happen: each one with the player object it\n"
+                    "belongs to and the interval since the previous, plus a heartbeat every 10 s\n"
+                    "so silence is distinguishable from the hook not running. Independent of\n"
+                    "skate3_input_script. NOT filtered to the local skater: the function is polled\n"
+                    "per physical player, so a pedestrian going down counts too.");
 REXCVAR_DEFINE_STRING(skate3_input_capture_dir, "", "Skate 3",
                       "Write @capture frames from skate3_input_script here, as PPM. Empty "
                       "disables capture.");
@@ -274,6 +281,40 @@ void CaptureFrame(const std::string& dir, const std::string& name, int64_t t) {
   REXLOG_INFO("input script: captured {} ({}x{})", file, image.width, image.height);
 }
 
+// Reports wipeouts on their own, for runs with no input script. The question it answers is
+// "does the game keep deciding to put this skater down, and on what beat" - so it prints the
+// interval between events, and a heartbeat when there are none, because an empty log would
+// otherwise read the same as a hook that never ran.
+void WipeoutLogMain() {
+  const int64_t start = NowMs();
+  REXLOG_INFO("wipeout log: armed (IsWipeoutRequested, all physical players)");
+  uint64_t logged = 0;
+  int64_t previous_ms = -1;
+  int64_t next_heartbeat = 10000;
+  for (;;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const int64_t now = NowMs() - start;
+    const uint64_t events = g_wipeout_events.load(std::memory_order_relaxed);
+    if (events != logged) {
+      logged = events;
+      const uint32_t player = g_last_wipeout_object.load(std::memory_order_relaxed);
+      if (previous_ms < 0) {
+        REXLOG_INFO("wipeout log: #{} at {} ms, player {:08X} (first)", events, now, player);
+      } else {
+        REXLOG_INFO("wipeout log: #{} at {} ms, player {:08X}, +{} ms since the previous",
+                    events, now, player, now - previous_ms);
+      }
+      previous_ms = now;
+    }
+    if (now >= next_heartbeat) {
+      next_heartbeat += 10000;
+      REXLOG_INFO("wipeout log: {} wipeouts so far, {} true of {} polls, {} s in", logged,
+                  g_wipeout_true_polls.load(std::memory_order_relaxed),
+                  g_wipeout_polls.load(std::memory_order_relaxed), now / 1000);
+    }
+  }
+}
+
 void ControllerMain() {
   const std::string path = REXCVAR_GET(skate3_input_script);
   if (path.empty()) {
@@ -381,7 +422,12 @@ void StoreU16(uint8_t* base, uint32_t addr, uint16_t v) {
 extern "C" REX_FUNC(__imp__XamInputGetState) {
   static PPCFunc* const original = ResolveOriginal();
   static std::once_flag started;
-  std::call_once(started, [] { std::thread(ControllerMain).detach(); });
+  std::call_once(started, [] {
+    std::thread(ControllerMain).detach();  // returns at once unless a script is set
+    if (REXCVAR_GET(skate3_wipeout_log)) {
+      std::thread(WipeoutLogMain).detach();
+    }
+  });
 
   const uint32_t user = ctx.r3.u32;
   const uint32_t flags = ctx.r4.u32;
