@@ -9104,8 +9104,22 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // Take this frame's hook-time dynamic items regardless of how we exit,
   // leaving them in place across an early return (no perspective view, empty
   // frame) would desynchronize the indices stored in the records.
-  std::vector<DrawItem> dynitems;
-  std::unordered_set<uint32_t> ortho_ctx;
+  // Static, and cleared here rather than destroyed at the end of the frame:
+  // these are swapped with the globals the capture hook fills, so a fresh
+  // local handed its empty buffer to the global and the hook then regrew it
+  // from nothing every single frame. Clearing first and swapping second
+  // hands the global back a buffer that still has its capacity, so the
+  // steady state stops allocating - which also stops it fragmenting an arena
+  // that is already down to its last few megabytes. Guest render thread
+  // only, like s_build_culled below, and BuildFrameScene is not reentrant.
+  // The early returns further down are why this is cleared on ENTRY: the
+  // globals are still emptied on every exit path, exactly as before.
+  static std::vector<DrawItem> s_dynitems;
+  static std::unordered_set<uint32_t> s_ortho_ctx;
+  s_dynitems.clear();
+  s_ortho_ctx.clear();
+  std::vector<DrawItem>& dynitems = s_dynitems;
+  std::unordered_set<uint32_t>& ortho_ctx = s_ortho_ctx;
   {
     std::lock_guard<std::mutex> lock(g_palette_mutex);
     dynitems.swap(g_frame_dynitems);
@@ -9115,7 +9129,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
   // Take this frame's selection re-draw captures and re-arm the post-sky
   // window (must happen on every exit path, like the dynitems swap).
-  std::vector<SelectedDrawKey> frame_selected;
+  static std::vector<SelectedDrawKey> s_frame_selected;
+  s_frame_selected.clear();
+  std::vector<SelectedDrawKey>& frame_selected = s_frame_selected;
   frame_selected.swap(g_frame_selected);
   g_sky_seen_this_frame = false;
   const bool outline_edge_seen = g_outline_edge_seen;
@@ -10535,9 +10551,16 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       g_dyn_retained.clear();
     }
     const uint64_t now = g_guest_frame;
-    std::unordered_set<uint64_t> submitted;
+    // "Was this key submitted this frame" is already recorded: every
+    // submitted key that is in the map below gets last_seen = now, and a
+    // submitted key that is NOT in the map is one the sweep never iterates.
+    // So the set that used to answer it was pure duplication - and an
+    // expensive one, because it was built and thrown away every frame with
+    // one node allocation per published static item. At the measured ~6.7 us
+    // a malloc/free pair on this arena, the ~700 items a frame carries were
+    // most of the scene build's entire allocation count and very nearly all
+    // of this block's 3.5 ms.
     const size_t published = scene.items.size();
-    submitted.reserve(published);
     for (size_t i = 0; i < published; ++i) {
       const DrawItem& it = scene.items[i];
       if (it.skinned || it.cloth_quads || it.ropa || it.pending ||
@@ -10545,7 +10568,6 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;
       }
       const uint64_t key = SynPanItemKey(it);
-      submitted.insert(key);
       if (g_retained_items.size() >= 20000 &&
           g_retained_items.find(key) == g_retained_items.end()) {
         continue;  // growth backstop
@@ -10568,7 +10590,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // far beyond the smoothing lag it needs to cover.
     constexpr uint64_t kRetainTtlFrames = 90;
     for (auto rit = g_retained_items.begin(); rit != g_retained_items.end();) {
-      if (submitted.find(rit->first) != submitted.end()) {
+      // Submitted this frame (see above): leave it alone.
+      if (rit->second.last_seen == now) {
         ++rit;
         continue;
       }
