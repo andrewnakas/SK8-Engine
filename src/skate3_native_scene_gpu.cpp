@@ -123,6 +123,7 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias_vk);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size_max);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
@@ -4049,6 +4050,97 @@ bool EnsurePhotoFxPipeline(const NativeGuestOutputRenderContext& context,
   return true;
 }
 
+// The largest per-tile size a three-tile-wide map can be built at here.
+//
+// Both shadow maps pack their cascades side by side in ONE texture, so the
+// image is three times the per-tile setting wide and the device's 2D limit
+// bites at a third of what it looks like it should. That was only ever
+// checked against D3D12's fixed 16384, and only when the backend WAS D3D12 -
+// so on Vulkan the top Enhanced Shadow Resolution setting asked for a
+// 24576x8192 image against the 16384 an Adreno 740 allows. Vulkan does not
+// refuse an over-limit image, it leaves the result undefined: the reported
+// symptom was the shadow map disappearing entirely and every surface coming
+// out uniformly lit, with nothing logged. Asking the device is the fix.
+uint32_t MaxShadowTileSize(nrhi::Device* device) {
+  const uint32_t limit = device->MaxTextureDimension2D();
+  // Floor at 1024 rather than returning something unusable: a device that
+  // cannot take a 3072-wide image cannot run this renderer at all, and the
+  // allocation failure below is a better place to find that out.
+  return std::max(1024u, limit / 3u);
+}
+
+bool ShadowFormatIsWide(nrhi::Device* device);
+
+// Clamps a per-tile size to that, halving so the result stays a power of two
+// (the cascade maths assumes it). Says so once per change rather than per
+// frame - this runs from the per-frame ensure path.
+uint32_t ClampShadowTileSize(nrhi::Device* device, uint32_t want, const char* what) {
+  uint32_t max_tile = MaxShadowTileSize(device);
+  // The 32-bit fallback format is twice the bytes per texel, so halve the
+  // ceiling to keep the map the size it was budgeted at.
+  if (ShadowFormatIsWide(device)) {
+    max_tile = std::max(1024u, max_tile / 2u);
+  }
+  // Publish the EFFECTIVE ceiling - after the format adjustment, since that is
+  // what a request will actually be held to - so the settings menu can stop
+  // offering a resolution this device cannot build. This is the only place
+  // that knows the answer. Idempotent and cheap.
+  REXCVAR_SET(skate3_native_render_scene_shadow_static_size_max,
+              int32_t(std::min(max_tile, 8192u)));
+  const uint32_t original = want;
+  while (want > 1024u && want > max_tile) {
+    want /= 2;
+  }
+  if (want != original) {
+    static std::unordered_set<uint64_t> reported;
+    const uint64_t key = (uint64_t(original) << 32) | want;
+    if (reported.insert(key).second) {
+      REXLOG_WARN(
+          "native-scene: {} asked for {} per tile ({} wide), but this device allows "
+          "{} in one image; using {} ({} wide)",
+          what, original, original * 3, device->MaxTextureDimension2D(), want, want * 3);
+    }
+  }
+  return want;
+}
+
+// R16G16_UNORM if the device can draw into it, R32G32_FLOAT if it cannot.
+//
+// Vulkan guarantees colour-attachment support for a short list of formats and
+// R16G16_UNORM is NOT on it, yet both shadow maps asked for it unconditionally
+// and nothing ever checked. A device without it gets a shadow pass that writes
+// nothing, which is invisible: no error, no validation message unless the
+// layers are on, just surfaces that come out wrong.
+//
+// The fixed-point format is the one that is wanted - the game's own atlas is
+// 16_16 fixed point, and a half-float ulp at the typical ~0.85 depth is ~6 mm
+// of world height, too coarse for casters sitting 1-2 cm off the ground - so
+// it is kept wherever it works. The fallback goes UP to 32-bit float rather
+// than down to 16: R32G32_SFLOAT is on Vulkan's mandatory list, and losing
+// precision to work around a missing format would trade one wrong-looking
+// shadow for another. It costs twice the memory, which ClampShadowTileSize
+// pays for by halving the tile.
+nrhi::Format ShadowMapFormat(nrhi::Device* device) {
+  static nrhi::Format chosen = nrhi::Format::kUnknown;
+  if (chosen != nrhi::Format::kUnknown) {
+    return chosen;
+  }
+  if (device->SupportsRenderTargetFormat(nrhi::Format::kR16G16_UNORM)) {
+    chosen = nrhi::Format::kR16G16_UNORM;
+  } else {
+    chosen = nrhi::Format::kR32G32_FLOAT;
+    REXLOG_WARN(
+        "native-scene: this device cannot render to R16G16_UNORM; shadow maps use "
+        "R32G32_FLOAT instead, at half the tile size for the same memory");
+  }
+  return chosen;
+}
+
+// True once the fat fallback format is in play, so the tile clamp can halve.
+bool ShadowFormatIsWide(nrhi::Device* device) {
+  return ShadowMapFormat(device) != nrhi::Format::kR16G16_UNORM;
+}
+
 // Shadow atlas targets + the always-bound b1 receiver constant buffer.
 bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
@@ -4059,12 +4151,14 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
   // any device-limit clamping the texture cache applied, and gives the same
   // effective shadow raster the emulated GPU renders at that scale.
   const int32_t tile_cfg = REXCVAR_GET(skate3_native_render_scene_shadow_tile);
-  const uint32_t want_tile =
+  const uint32_t want_tile = ClampShadowTileSize(
+      device,
       tile_cfg > 0
           ? uint32_t(tile_cfg)
           : std::min(512u * std::max(1u, (context.guest_output_height + 719u) /
                                              720u),
-                     4096u);
+                     4096u),
+      "the dynamic shadow atlas");
   if (g_r.shadow_raw != nullptr && g_r.shadow_tile != want_tile) {
     // Hot tile-size change: retire the atlas chain; recreated below. The
     // new atlas starts in RENDER_TARGET state and is re-rendered by this
@@ -4095,7 +4189,7 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     nrhi::TextureDesc desc;
     desc.width = g_r.shadow_tile * 3;
     desc.height = g_r.shadow_tile;
-    desc.format = nrhi::Format::kR16G16_UNORM;
+    desc.format = ShadowMapFormat(device);
     desc.usage = nrhi::kTextureUsageRenderTarget;
     desc.initial_state = nrhi::ResourceState::kRenderTarget;
     desc.clear_color[0] = 1.0f;  // depth: far
@@ -4127,9 +4221,11 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
       }
     }
     g_r.shadow_in_srv_state = false;
-    REXLOG_INFO("native-scene: shadow atlas created ({}x{} tiles{})",
-                g_r.shadow_tile, g_r.shadow_tile,
-                tile_cfg > 0 ? "" : ", auto");
+    REXLOG_WARN("native-scene: dynamic shadow atlas {}x{} (3 tiles of {}{}), format {}",
+                g_r.shadow_tile * 3, g_r.shadow_tile, g_r.shadow_tile,
+                tile_cfg > 0 ? "" : ", auto",
+                ShadowMapFormat(device) == nrhi::Format::kR16G16_UNORM ? "R16G16_UNORM"
+                                                                       : "R32G32_FLOAT");
   }
   if (!g_r.world_shadow && g_r.shadow_raw != nullptr) {
     // dynamicobject static world-shadow map (see RendererState). Fixed at
@@ -4138,7 +4234,7 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     nrhi::TextureDesc desc;
     desc.width = RendererState::kWorldShadowSize;
     desc.height = RendererState::kWorldShadowSize;
-    desc.format = nrhi::Format::kR16G16_UNORM;
+    desc.format = ShadowMapFormat(device);
     desc.usage = nrhi::kTextureUsageRenderTarget;
     desc.initial_state = nrhi::ResourceState::kRenderTarget;
     desc.clear_color[0] = 1.0f;  // depth: far = lit
@@ -4157,16 +4253,14 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     g_r.world_shadow_in_srv = false;
     g_r.world_shadow_primed = false;
   }
-  uint32_t want_static_size = uint32_t(std::clamp(
-      REXCVAR_GET(skate3_native_render_scene_shadow_static_size), 1024, 8192));
-  if (device->backend() == nrhi::Backend::kD3D12) {
-    // The 3-tile cascade row must fit D3D12's 16384 2D-texture width cap:
-    // per-tile sizes above 5461 cannot allocate there (the 8192 setting
-    // asks for 24576x8192), while desktop Vulkan allows 32768-wide.
-    while (want_static_size * 3 > 16384) {
-      want_static_size /= 2;
-    }
-  }
+  // Against the device's own limit, on every backend. This used to ask D3D12
+  // only, so the Vulkan path shipped an image three times wider than the
+  // driver allows and the shadows vanished with nothing logged (issue #4).
+  const uint32_t want_static_size = ClampShadowTileSize(
+      device,
+      uint32_t(std::clamp(REXCVAR_GET(skate3_native_render_scene_shadow_static_size),
+                          1024, 8192)),
+      "the static sun-shadow map");
   if (g_r.static_sun != nullptr && g_r.static_sun_requested != want_static_size) {
     // Hot size change: retire the map; recreated below. The recreated map
     // is uninitialized, so force the cross-frame cache to re-render it
@@ -4185,12 +4279,11 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     // tiles side by side: inner (r/6, centimeter contact detail with
     // useful reach), mid (r/2) and far (full radius, large-caster
     // coverage); size is per tile.
-    g_r.static_sun_requested = want_static_size;
     g_r.static_sun_size = want_static_size;
     nrhi::TextureDesc desc;
     desc.width = g_r.static_sun_size * 3;
     desc.height = g_r.static_sun_size;
-    desc.format = nrhi::Format::kR16G16_UNORM;
+    desc.format = ShadowMapFormat(device);
     desc.usage = nrhi::kTextureUsageRenderTarget;
     desc.initial_state = nrhi::ResourceState::kRenderTarget;
     desc.clear_color[0] = 1.0f;  // depth: far = lit
@@ -4219,10 +4312,32 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
       g_r.failed = true;
       return false;
     }
+    // What was GRANTED, not what was asked for. These two used to be set from
+    // the request before the fallback loop ran, so a map that came back
+    // smaller left the recreate test above permanently unsatisfied: every
+    // frame decided the size was wrong, retired the map and built it again.
+    g_r.static_sun_requested = want_static_size;
     g_r.static_sun_in_srv = false;
-    REXLOG_INFO(
-        "native-scene: static sun-shadow map created ({}x{}, 3 cascades)",
-        g_r.static_sun_size * 3, g_r.static_sun_size);
+    // The line a bug report is read for. Sizes both asked and granted, the
+    // format actually chosen, the device's own ceiling, and what one texel is
+    // worth on the ground in each cascade - because "the shadows look wrong"
+    // and "the shadow map is 40x smaller than you think" are indistinguishable
+    // from a screenshot, and that ambiguity has now cost two rounds of
+    // guessing.
+    {
+      const double radius = REXCVAR_GET(skate3_native_render_scene_shadow_static_radius);
+      const double far_texel = (2.0 * radius) / double(g_r.static_sun_size);
+      REXLOG_WARN(
+          "native-scene: static sun-shadow map {}x{} (3 cascades of {}; asked {}), "
+          "format {}, device max 2D {}, radius {:.0f}m, texels inner {:.1f}cm "
+          "mid {:.1f}cm far {:.1f}cm",
+          g_r.static_sun_size * 3, g_r.static_sun_size, g_r.static_sun_size,
+          REXCVAR_GET(skate3_native_render_scene_shadow_static_size),
+          ShadowMapFormat(device) == nrhi::Format::kR16G16_UNORM ? "R16G16_UNORM"
+                                                                 : "R32G32_FLOAT",
+          device->MaxTextureDimension2D(), radius, far_texel * 100.0 / 6.0,
+          far_texel * 100.0 / 2.0, far_texel * 100.0);
+    }
   }
   if (!g_r.shadow_cb) {
     // Always created (even with shadows off): the scene PS declares b1 and

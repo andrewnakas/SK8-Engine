@@ -509,6 +509,17 @@ void LevelSelectDialog::Choose(int entry, const std::string& name) {
     // alive across the switch and re-stages before relaunching.
     const std::string request_path = REXCVAR_GET(skate3_loader_request_path);
     if (request_path.empty()) {
+      // No launcher listening. On a phone there never is one, which is why
+      // choosing a map here used to do nothing at all but write this warning.
+      // The app can restart itself, so name the pack and let it.
+      if (restart_with_pack_) {
+        REXLOG_INFO("Skate 3 level select: restarting on pack '{}' for '{}'", pack, name);
+        if (close_menus_) {
+          close_menus_();
+        }
+        restart_with_pack_(pack);
+        return;
+      }
       REXLOG_WARN("Skate 3 level select: '{}' is in pack '{}' but no launcher is listening",
                   name, pack);
       return;

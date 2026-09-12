@@ -104,6 +104,16 @@ class LevelSelectDialog final : public rex::ui::ImGuiDialog {
   void SetCloseMenusCallback(std::function<void()> callback) {
     close_menus_ = std::move(callback);
   }
+  // How to relaunch when there is no launcher process listening.
+  //
+  // The desktop route writes a request file and lets the launcher re-stage and
+  // restart; a phone has no launcher, so it had nowhere to send the request and
+  // simply logged that nobody was listening. The app knows how to restart
+  // itself (the same path Apply & Restart uses), so it supplies that here and
+  // the picker stops being inert.
+  void SetRestartCallback(std::function<void(const std::string&)> callback) {
+    restart_with_pack_ = std::move(callback);
+  }
   // Open the picker as soon as the game reaches gameplay, so a session can
   // start at "choose a map" instead of booting into one.
   void RequestOpenOnGameplay() { open_on_gameplay_ = true; }
@@ -119,6 +129,7 @@ class LevelSelectDialog final : public rex::ui::ImGuiDialog {
   // Called when a map is chosen, so the Escape settings screen closes with the
   // picker rather than being left open over the new load.
   std::function<void()> close_menus_;
+  std::function<void(const std::string&)> restart_with_pack_;
 
   LoaderOverlay* overlay_ = nullptr;
   bool visible_ = false;

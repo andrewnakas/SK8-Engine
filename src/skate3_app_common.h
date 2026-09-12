@@ -44,6 +44,12 @@ class Skate3BaseApp : public rex::ReXApp {
   // True if the folder holds a usable content package: a .big and a .header
   // of a plausible size.
   static bool IsContentPackFolder(const std::filesystem::path& dir);
+  // Every content pack sitting in Documents, by the leaf folder name that
+  // staging matches on, sorted. One definition rather than two: the startup
+  // chooser and the staging pass were each running their own copy of this
+  // scan, and the level picker needs a third.
+  static std::vector<std::string> DiscoverContentPackNames(
+      const std::filesystem::path& documents);
   void StageContentPacks();
   void InstallDlcPackages();
   void ToggleSimpleSettings();

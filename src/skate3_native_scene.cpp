@@ -768,6 +768,16 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
                      "~9 cm. Applies live: the map recreates on change.")
     .range(1024, 8192)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size_max, 0, "Skate 3",
+                     "Read-only: the largest per-cascade size this device can "
+                     "actually build the static sun-shadow map at, published by "
+                     "the renderer once it has asked the device. 0 until then. "
+                     "The settings menu reads it so it stops offering a "
+                     "resolution that silently degrades - an Odin2 set 8192, got "
+                     "a map three times wider than Vulkan allows, and lost its "
+                     "shadows entirely with nothing said.")
+    .range(0, 8192)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_pcss, true, "Skate 3",
                     "Contact-hardening soft shadows (PCSS): a blocker search "
                     "estimates the caster distance per pixel and the filter "

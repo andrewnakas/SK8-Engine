@@ -15,6 +15,9 @@
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
 #include "skate3_pack_select.h"
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#include <rex/input/touch_input_driver.h>
+#endif
 #include "skate3_performance_profile.h"
 #include <rex/ui/windowed_app_context_sdl.h>
 // SDL_GetPrimaryDisplay / SDL_GetCurrentDisplayMode, for the display size
@@ -813,6 +816,16 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     const rex::PathConfig& defaults, std::function<void(rex::PathConfig)> resume) {
   config_path_ = defaults.config_path;
   user_settings_path_ = defaults.user_data_root / std::string(kSettingsFilename);
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+  // Beside the settings, and separate from them on purpose: sixteen controls
+  // times three numbers is not a settings row, and it is the one thing here
+  // somebody might reasonably want to edit or copy between devices by hand.
+  {
+    static std::string layout_path;
+    layout_path = (defaults.user_data_root / "touch_layout.txt").string();
+    rex::input::touch::SetTouchLayoutPath(layout_path.c_str());
+  }
+#endif
   profiles_path_ = skate3::ProfilesFilePath(defaults.user_data_root);
 
   auto profiles = skate3::LoadProfiles(profiles_path_);
@@ -935,39 +948,8 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   // loop start and the dialog render; startup resumes from the callback, the
   // same shape the install wizards above use on Apple platforms.
   if (REXCVAR_GET(skate3_content_pack).empty() && !chose_content_pack_) {
-    std::vector<std::string> packs;
-    std::error_code pack_ec;
-    const auto documents = runtime_paths.user_data_root.parent_path();
-    for (const auto& entry : std::filesystem::directory_iterator(documents, pack_ec)) {
-      if (pack_ec || !entry.is_directory()) {
-        continue;
-      }
-      const std::string name = entry.path().filename().string();
-      if (name == "user" || name == "game") {
-        continue;
-      }
-      if (IsContentPackFolder(entry.path())) {
-        packs.push_back(name);
-        continue;
-      }
-      // Packs are often shipped inside a wrapper folder holding the package
-      // beside a readme, and dragging that whole folder in is the obvious
-      // thing to do - so look one level down as well.
-      std::error_code nest_ec;
-      for (const auto& child : std::filesystem::directory_iterator(entry.path(), nest_ec)) {
-        if (nest_ec || !child.is_directory()) {
-          continue;
-        }
-        if (IsContentPackFolder(child.path())) {
-          // The LEAF name, which is what staging matches on - a wrapper-folder
-          // path would never compare equal to the candidate it refers to, and
-          // nothing would be staged at all.
-          packs.push_back(child.path().filename().string());
-          break;
-        }
-      }
-    }
-    std::sort(packs.begin(), packs.end());
+    const std::vector<std::string> packs =
+        DiscoverContentPackNames(runtime_paths.user_data_root.parent_path());
     if (packs.size() > 1) {
       skate3::ShowPackSelect(app_context(), imgui_drawer(), packs,
                              [this, paths = runtime_paths, resume](std::string choice) mutable {
@@ -1020,6 +1002,16 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
     if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
       ToggleSimpleSettings();
     }
+  });
+  // Without a launcher, the picker restarts us on the chosen pack itself. The
+  // name has to survive the relaunch, so it is written to the settings file
+  // before the restart rather than only set in this process.
+  level_select_dialog_->SetRestartCallback([this](const std::string& pack) {
+    rex::cvar::SetFlagByName("skate3_content_pack", pack);
+    if (simple_settings_dialog_) {
+      simple_settings_dialog_->SaveSettingsNow();
+    }
+    RestartGame();
   });
   if (skate3::LoaderPickerOpensAtStart()) {
     level_select_dialog_->RequestOpenOnGameplay();
@@ -1140,6 +1132,14 @@ void Skate3BaseApp::OnPostSetup() {
     input_system->SetMenuChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() { ToggleSimpleSettings(); });
     });
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    // The on-screen menu button. Same destination as the RB + Start chord,
+    // which on a touchscreen means hitting two buttons in opposite corners at
+    // the same instant - it works and nobody finds it.
+    rex::input::touch::SetMenuButtonCallback([this]() {
+      app_context().CallInUIThreadDeferred([this]() { ToggleSimpleSettings(); });
+    });
+#endif
     // Start + Select opens the performance menu (cvar perf_chord).
     input_system->SetPerfChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() { TogglePerformanceMenu(); });
@@ -1213,6 +1213,11 @@ void Skate3BaseApp::OnPostSetup() {
 }
 
 void Skate3BaseApp::OnShutdown() {
+  // Timed, because "quitting takes five to ten seconds" is a real report and
+  // nothing in the log said which part of it did. One line at the end naming
+  // the total, so a diagnostic report carries the answer without anyone having
+  // to reproduce it with a stopwatch.
+  const auto shutdown_began = std::chrono::steady_clock::now();
   rex::ui::UnregisterBind("bind_skate3_menu");
   rex::ui::UnregisterBind("bind_skate3_menu_alt");
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
@@ -1224,6 +1229,10 @@ void Skate3BaseApp::OnShutdown() {
   simple_settings_dialog_.reset();
   native_debug_dialog_.reset();
   render_mode_indicator_.reset();
+  REXLOG_WARN("[shutdown] app teardown took {} ms",
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - shutdown_began)
+                  .count());
 }
 
 void Skate3BaseApp::ToggleSimpleSettings() {
@@ -1231,6 +1240,15 @@ void Skate3BaseApp::ToggleSimpleSettings() {
     simple_settings_dialog_->Hide();
     return;
   }
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+  // Opening the settings is how the layout editor is left, which is what its
+  // own instructions say. Doing it here rather than on a button in the editor
+  // keeps the editor free of anything to press by mistake while dragging, and
+  // means the pad comes back by the route the player already knows.
+  if (rex::input::touch::TouchLayoutEditing()) {
+    rex::input::touch::SetTouchLayoutEditing(false);
+  }
+#endif
   EnsureSimpleSettingsDialog();
   ApplySettingsCursorMode();
   skate3::native_scene::SetSettingsMenuBlur(true);
@@ -1300,10 +1318,23 @@ void Skate3BaseApp::EnsureSimpleSettingsDialog() {
     }
   };
   auto close_game = [this]() {
-#if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
+    REXLOG_WARN("[shutdown] quit requested");
+#if REX_PLATFORM_MAC || REX_PLATFORM_LINUX || REX_PLATFORM_ANDROID
+    // Android joins the watchdog, with a shorter fuse.
+    //
+    // Quitting from the settings menu was timed at five to ten seconds on an
+    // Odin2, and that delay is not only an annoyance: the relaunch after
+    // "Apply & Restart" is issued from another process which then clears the
+    // task, and a game still tearing down its renderer when that happens is
+    // the ANR in the same report. Six seconds is well past a healthy shutdown
+    // and well inside the window where the relaunch is still waiting.
+    //
+    // Exiting hard is safe here because everything worth keeping is already
+    // written: settings are saved when the menu closes, and the guest's own
+    // saves go through the content manager as the game makes them.
     std::thread([]() {
-      std::this_thread::sleep_for(std::chrono::seconds(10));
-      REXLOG_WARN("Close Game watchdog exiting process after shutdown timeout");
+      std::this_thread::sleep_for(std::chrono::seconds(REX_PLATFORM_ANDROID ? 6 : 10));
+      REXLOG_WARN("[shutdown] watchdog: still not gone; exiting the process");
       std::_Exit(EXIT_SUCCESS);
     }).detach();
 #endif
@@ -1371,6 +1402,11 @@ void Skate3BaseApp::EnsureSimpleSettingsDialog() {
           imgui_drawer(), user_settings_path_, std::move(load_profiles), std::move(save_profile),
           std::move(close_settings), std::move(close_game), std::move(restart_game),
           std::move(poll_gamepad), std::move(poll_perf_stats));
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+  simple_settings_dialog_->SetTouchLayoutCallbacks(
+      [](bool editing) { rex::input::touch::SetTouchLayoutEditing(editing); },
+      [] { rex::input::touch::ResetTouchLayout(); });
+#endif
 }
 
 void Skate3BaseApp::ToggleNativeDebug() {
@@ -1740,6 +1776,43 @@ bool Skate3BaseApp::IsContentPackFolder(const std::filesystem::path& dir) {
   return false;
 }
 
+std::vector<std::string> Skate3BaseApp::DiscoverContentPackNames(
+    const std::filesystem::path& documents) {
+  std::vector<std::string> packs;
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(documents, ec)) {
+    if (ec || !entry.is_directory()) {
+      continue;
+    }
+    const std::string name = entry.path().filename().string();
+    if (name == "user" || name == "game") {
+      continue;
+    }
+    if (IsContentPackFolder(entry.path())) {
+      packs.push_back(name);
+      continue;
+    }
+    // Packs are often shipped inside a wrapper folder holding the package
+    // beside a readme, and dragging that whole folder in is the obvious thing
+    // to do - so look one level down as well.
+    std::error_code nest_ec;
+    for (const auto& child : std::filesystem::directory_iterator(entry.path(), nest_ec)) {
+      if (nest_ec || !child.is_directory()) {
+        continue;
+      }
+      if (IsContentPackFolder(child.path())) {
+        // The LEAF name, which is what staging matches on - a wrapper-folder
+        // path would never compare equal to the candidate it refers to, and
+        // nothing would be staged at all.
+        packs.push_back(child.path().filename().string());
+        break;
+      }
+    }
+  }
+  std::sort(packs.begin(), packs.end());
+  return packs;
+}
+
 void Skate3BaseApp::StageContentPacks() {
   // Custom map packs ship as already-extracted marketplace content - a .big
   // beside its .header - rather than an STFS package the DLC installer could
@@ -1775,8 +1848,8 @@ void Skate3BaseApp::StageContentPacks() {
   // what makes "which map am I loading" answerable. Which one is
   // skate3_content_pack; empty means the first by name.
   std::string wanted = REXCVAR_GET(skate3_content_pack);
-  std::vector<std::filesystem::path> candidates;
   std::error_code ec;
+  std::vector<std::filesystem::path> candidates;
   for (const auto& entry : std::filesystem::directory_iterator(documents, ec)) {
     if (ec || !entry.is_directory()) {
       continue;
@@ -1798,6 +1871,34 @@ void Skate3BaseApp::StageContentPacks() {
     }
   }
   std::sort(candidates.begin(), candidates.end());
+
+  // Tell the level picker what there is to pick.
+  //
+  // Its list comes from skate3_loader_levels, which only the desktop launcher
+  // ever set - so on a phone the Level Picker shortcut opened an empty dialog
+  // if it opened anything at all, and the shortcut itself could not fire
+  // (picker_chord was "guide", a button guide_button=false never delivers).
+  // An Odin2 report put it as "doesn't seem to do anything", which was exact.
+  //
+  // The packs found here ARE the list: one is staged per launch, so picking a
+  // different one means naming it and relaunching, which is what the picker's
+  // no-launcher path now does.
+  {
+    std::string levels;
+    for (const auto& entry : candidates) {
+      if (!levels.empty()) {
+        levels += '|';
+      }
+      levels += entry.filename().string();
+    }
+    if (!levels.empty()) {
+      rex::cvar::SetFlagByName("skate3_loader_levels", levels);
+      rex::cvar::SetFlagByName("skate3_loader_level_packs", levels);
+      rex::cvar::SetFlagByName("skate3_loader_current_pack",
+                               chose_content_pack_ ? chosen_content_pack_ : wanted);
+      REXLOG_INFO("Skate 3 level picker: {} pack(s) available: {}", candidates.size(), levels);
+    }
+  }
   // More than one and no choice already made: ask, before anything is staged.
   // The guest has not started, so blocking here is free - and it has to happen
   // now, because the boot content scan reads what this stages.
