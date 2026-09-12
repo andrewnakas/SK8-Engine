@@ -255,9 +255,16 @@ include(cmake/CodegenTargets.cmake)
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
+    src/skate3_audio_census_all.cpp
     src/skate3_audio_dump.cpp
-    src/skate3_audio_kernel_census.cpp
     src/skate3_audio_native.cpp
+    src/skate3_audio_port.cpp
+    src/skate3_audio_ports_66.cpp
+    src/skate3_audio_ports_67a.cpp
+    src/skate3_audio_ports_67b.cpp
+    src/skate3_audio_ports_68a.cpp
+    src/skate3_audio_ports_68b.cpp
+    src/skate3_audio_ports_misc.cpp
     src/skate3_audio_probe.cpp
     src/skate3_audio_shadow.cpp
     src/skate3_crash_report.cpp

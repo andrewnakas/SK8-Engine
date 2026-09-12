@@ -23,12 +23,12 @@
  * What is compared, and why not everything:
  *
  *   registers  only what the PowerPC ABI obliges a callee to preserve -- r1, r2, r13-r31,
- *              f14-f31, v14-v31, v64-v127 and cr2-cr4 -- plus the return registers the
- *              caller names. The ranges follow the __savegprlr/__savefpr/__savevmx helpers
- *              the image actually uses. A whole-context compare reports a divergence on
- *              every call, because lifted bodies leave scratch values in volatile
- *              registers (EVENT_SUBMIT leaves r9-r11 and cr6) that native code has no
- *              reason to reproduce.
+ *              f14-f31, v14-v31, v64-v127 and cr2-cr4 -- plus the result registers the
+ *              caller names in a ShadowResults mask. The ranges follow the
+ *              __savegprlr/__savefpr/__savevmx helpers the image actually uses. A
+ *              whole-context compare reports a divergence on every call, because lifted
+ *              bodies leave scratch values in volatile registers (EVENT_SUBMIT leaves
+ *              r9-r11 and cr6) that native code has no reason to reproduce.
  *   memory     a list of windows. They must cover every byte the function writes: a write
  *              outside them keeps the lifted value while the native body runs, so the
  *              native body could read it back and agree for the wrong reason.
@@ -51,13 +51,34 @@ struct ShadowWindow {
   uint32_t len;
 };
 
-/// Return registers to compare, since a void function leaves r3 as scratch.
-enum ShadowReturn : uint32_t {
-  kReturnNone = 0,
-  kReturnR3 = 1u << 0,
-  kReturnF1 = 1u << 1,
-  kReturnV2 = 1u << 2,
+/// Result registers to compare, beyond the ABI-preserved set. A void function leaves r3 as
+/// scratch, so nothing is compared unless named. Register-only kernels (no stores, results in
+/// volatile vector registers) name those registers here; without that a comparison of such a
+/// function checks nothing at all -- gate 4 in docs/PLAN.md.
+struct ShadowResults {
+  uint32_t gprs = 0;    // bit n = rN
+  uint32_t fprs = 0;    // bit n = fN
+  uint64_t vrs_lo = 0;  // bit n = vN for n < 64
+  uint64_t vrs_hi = 0;  // bit n = v(64+n)
+  uint8_t crs = 0;      // bit n = crN
+
+  constexpr ShadowResults operator|(ShadowResults o) const {
+    return {gprs | o.gprs, fprs | o.fprs, vrs_lo | o.vrs_lo, vrs_hi | o.vrs_hi,
+            static_cast<uint8_t>(crs | o.crs)};
+  }
+  constexpr bool empty() const { return !gprs && !fprs && !vrs_lo && !vrs_hi && !crs; }
 };
+
+constexpr ShadowResults kReturnNone{};
+constexpr ShadowResults kReturnR3{1u << 3};
+constexpr ShadowResults kReturnF1{0, 1u << 1};
+constexpr ShadowResults kReturnV2{0, 0, 1ull << 2};
+constexpr ShadowResults Gpr(int n) { return {1u << n}; }
+constexpr ShadowResults Fpr(int n) { return {0, 1u << n}; }
+constexpr ShadowResults Vr(int n) {
+  return n < 64 ? ShadowResults{0, 0, 1ull << n} : ShadowResults{0, 0, 0, 1ull << (n - 64)};
+}
+constexpr ShadowResults Cr(int n) { return {0, 0, 0, 0, static_cast<uint8_t>(1u << n)}; }
 
 /// Per-function counters. Keep one as a static beside the hook that owns it; constructing
 /// it registers it with the reporter that logs running totals.
@@ -67,6 +88,8 @@ struct ShadowStats {
   std::atomic<uint64_t> runs{0};
   std::atomic<uint64_t> register_diffs{0};
   std::atomic<uint64_t> memory_diffs{0};
+  std::atomic<uint64_t> skipped{0};   // calls the hook chose not to compare (not replayable)
+  std::atomic<uint64_t> overflow{0};  // calls whose windows exceeded the budget (never compared)
   std::atomic<uint64_t> reports{0};
   std::atomic<uint64_t> logged_runs{0};
 };
@@ -79,11 +102,18 @@ struct ShadowStats {
  * and 4096 runs, and every 10 s from a reporter thread whenever the count has moved. The
  * reporter is what gets the final count of a function that stops being called into the
  * log, so a clean session leaves positive evidence rather than an absence of errors.
+ *
+ * A window set over the byte budget is a HARD failure: nothing is compared, the lifted body
+ * alone runs, `stats.overflow` is incremented and an error is logged. Dropping windows would
+ * let a native write outside them reach the live game unrewound.
  */
 bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lifted,
                    std::span<const ShadowWindow> windows,
-                   std::span<const ShadowWindow> inputs, uint32_t returns,
+                   std::span<const ShadowWindow> inputs, ShadowResults returns,
                    ShadowStats& stats);
+
+/// Record a call the hook declined to compare, so the divergence figure is read against it.
+void ShadowSkip(ShadowStats& stats, const char* why);
 
 /// Why `inputs` exists, separately from `windows`.
 ///
@@ -100,5 +130,13 @@ bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lif
 
 /// Whether shadow comparison is armed (cvar-backed, read once).
 bool ShadowEnabled();
+
+/// True on this thread while ShadowCompare is running a NATIVE body against the rewound copy.
+/// A hooked callee reached from there must run its lifted body and compare nothing: the outer
+/// comparison already brackets it, and a nested compare would double every count and vector.
+bool ShadowNestedReplay();
+
+/// Total window bytes ShadowCompare accepts per call.
+constexpr uint32_t kShadowMaxWatch = 64 * 1024;
 
 }  // namespace skate3::audio
