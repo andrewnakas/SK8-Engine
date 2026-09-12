@@ -127,6 +127,17 @@ constexpr uint32_t kNodeNext = 0;
 constexpr uint32_t kNodePrev = 4;
 constexpr uint32_t kNodeLinked = 12;  // nonzero while the node is on a list
 
+// Buffer-pair init (sub_82B7F828). The object's written span is +0..+39 inclusive.
+constexpr uint32_t kPairFirst = 0;       // first buffer pointer
+constexpr uint32_t kPairFirstLen = 8;    // ...and its length
+constexpr uint32_t kPairSecond = 20;     // second buffer pointer
+constexpr uint32_t kPairSecondLen = 28;  // ...and its length
+constexpr uint32_t kPairSpan = 40;
+// Half the harness budget, as margin. Measured lengths are 192-400 bytes with maxima
+// (400,256), so this is ~50x observed -- but the guard exists because the maxima describe the
+// calls seen, not the function's range, and an uncovered native write is never rewound.
+constexpr uint32_t kPairWatchCap = 32 * 1024;
+
 bool UseNative() {
   static const bool on = REXCVAR_GET(skate3_audio_native);
   return on;
@@ -433,6 +444,56 @@ void NativeSchedulerRequeue(PPCContext& __restrict ctx, uint8_t* base) {
   REX_STORE_U32(element + kElementCleared, 0);
 }
 
+/**
+ * sub_82B7F828: initialise a buffer pair -- record each buffer with its length, zero the four
+ * bookkeeping words, and zero-fill each buffer that is present.
+ *
+ * Passes all three gates, measured: its only callee is sub_82F52040, a leaf confirmed to be
+ * memset; the written set is the object's 40-byte span plus the two buffers, whose lengths
+ * measured 192 and 196 on the first call with maxima 400 and 256; and it is deterministic.
+ *
+ * The fills call the guest memset on an isolated context copy rather than using a host
+ * memset. A host zero-fill would write identical bytes -- zero is endian-agnostic -- but the
+ * guest routine's behaviour at length 0 is not obvious from its alignment preamble, and no
+ * observed call has length 0. Calling the original makes the edge cases identical by
+ * construction instead of by my reading of them.
+ */
+void NativeBufferPairInit(PPCContext& __restrict ctx, uint8_t* base) {
+  const uint32_t object = ctx.r3.u32;
+  const uint32_t second = ctx.r4.u32;
+  const uint32_t second_len = ctx.r5.u32;
+  const uint32_t first = ctx.r6.u32;
+  const uint32_t first_len = ctx.r7.u32;
+
+  REX_STORE_U32(object + kPairFirst, first);
+  REX_STORE_U32(object + kPairFirstLen, first_len);
+  REX_STORE_U32(object + 4, 0);
+  REX_STORE_U32(object + 12, 0);
+  REX_STORE_U32(object + 16, 0);
+  if (first != 0) {
+    PPCContext fill = ctx;
+    fill.r3.u64 = first;
+    fill.r4.s64 = 0;
+    fill.r5.u64 = first_len;
+    sub_82F52040(fill, base);
+  }
+
+  REX_STORE_U32(object + kPairSecond, second);
+  REX_STORE_U32(object + kPairSecondLen, second_len);
+  REX_STORE_U32(object + 24, 0);
+  REX_STORE_U32(object + 32, 0);
+  REX_STORE_U32(object + 36, 0);
+  if (second != 0) {
+    PPCContext fill = ctx;
+    fill.r3.u64 = second;
+    fill.r4.s64 = 0;
+    fill.r5.u64 = second_len;
+    sub_82F52040(fill, base);
+  }
+
+  ctx.r3.u64 = object;  // the original returns the object it initialised
+}
+
 skate3::audio::ShadowStats g_event_submit_stats{"EVENT_SUBMIT"};
 skate3::audio::ShadowStats g_event_stop_stats{"EVENT_STOP"};
 std::atomic<uint64_t> g_event_stop_unverifiable{0};
@@ -440,6 +501,8 @@ skate3::audio::ShadowStats g_event_play_stats{"EVENT_PLAY"};
 std::atomic<uint64_t> g_event_play_unverifiable{0};
 skate3::audio::ShadowStats g_command_enqueue_stats{"ENQUEUE"};
 skate3::audio::ShadowStats g_requeue_stats{"REQUEUE"};
+skate3::audio::ShadowStats g_bufpair_stats{"BUFPAIR"};
+std::atomic<uint64_t> g_bufpair_oversize{0};
 
 // Measurement state for sub_82B7F828, which memsets two caller-supplied buffers. Whether it
 // can ever be shadow-compared depends on those lengths against kMaxWatch (64 KB across all
@@ -710,6 +773,39 @@ extern "C" REX_FUNC(sub_82B7F828) {
                   g_bufpair_first_null.load(std::memory_order_relaxed),
                   g_bufpair_second_null.load(std::memory_order_relaxed));
     }
+
+    // Structural guard, not a measured one: if the span plus both buffers would exceed the
+    // cap, the harness would drop a window and the native body's fill would land in the live
+    // game unrewound. Run the original and count it instead.
+    const uint32_t watched =
+        kPairSpan + (ctx.r6.u32 != 0 ? first_len : 0) + (ctx.r4.u32 != 0 ? second_len : 0);
+    if (watched > kPairWatchCap) {
+      const uint64_t skipped = g_bufpair_oversize.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (skipped == 1 || (skipped % 256) == 0) {
+        REXLOG_INFO("skate3-audio-shadow: BUFPAIR not comparable on {} calls so far "
+                    "(watched {} bytes over the {} cap)", skipped, watched, kPairWatchCap);
+      }
+      __imp__sub_82B7F828(ctx, base);
+      return;
+    }
+
+    ShadowWindow windows[3];
+    size_t count = 0;
+    windows[count++] = {ctx.r3.u32, kPairSpan};
+    if (ctx.r6.u32 != 0) windows[count++] = {ctx.r6.u32, first_len};
+    if (ctx.r4.u32 != 0) windows[count++] = {ctx.r4.u32, second_len};
+    skate3::audio::ShadowCompare(ctx, base, NativeBufferPairInit, __imp__sub_82B7F828,
+                                 {windows, count}, skate3::audio::kReturnR3, g_bufpair_stats);
+    return;
+  }
+  if (UseNative()) {
+    static std::atomic<uint64_t> native_runs{0};
+    const uint64_t runs = native_runs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (runs == 1 || runs == 16 || runs == 256) {
+      REXLOG_INFO("skate3-audio-native: BUFPAIR native runs={}", runs);
+    }
+    NativeBufferPairInit(ctx, base);
+    return;
   }
   __imp__sub_82B7F828(ctx, base);
 }
