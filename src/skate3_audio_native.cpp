@@ -115,6 +115,18 @@ static_assert(kVoiceLiveConstant == 0x82165A10u, "live constant address");
 static_assert(kVoiceGoneConstant == 0x8231A844u, "gone constant address");
 constexpr uint32_t kInvalidSentinel = 0x7FF7FFF1u;  // lis 32759; ori 65521
 
+// Scheduler entry requeue (sub_82B48B28). The bucket is scheduler + (state << 5).
+constexpr uint32_t kElementNode = 0;      // element -> the list node it owns
+constexpr uint32_t kElementCleared = 16;  // always zeroed on the way out
+constexpr uint32_t kElementState = 20;    // state byte; 3 means "nothing to do"
+constexpr uint32_t kStateParked = 3;
+constexpr uint32_t kBucketShift = 5;
+constexpr uint32_t kBucketFrom = 16;  // head of the list the node leaves
+constexpr uint32_t kBucketTo = 20;    // head of the list it joins
+constexpr uint32_t kNodeNext = 0;
+constexpr uint32_t kNodePrev = 4;
+constexpr uint32_t kNodeLinked = 12;  // nonzero while the node is on a list
+
 bool UseNative() {
   static const bool on = REXCVAR_GET(skate3_audio_native);
   return on;
@@ -371,12 +383,78 @@ void NativeCommandEnqueue(PPCContext& __restrict ctx, uint8_t* base) {
   REX_STORE_U32(params + kParamsSentinel, kInvalidSentinel);
 }
 
+/**
+ * sub_82B48B28: move a scheduler element's node onto the bucket list for its state.
+ *
+ * A leaf, deterministic, and every address it writes derives from state readable before the
+ * call -- the neighbour pointers are read before they are overwritten. That last property is
+ * what makes it comparable at all: the hook can enumerate every window up front without
+ * walking anything unbounded, which is exactly what sub_82B482F8 (the caller) cannot do.
+ *
+ * r3 is the scheduler, r4 the element. State 3 returns immediately, writing nothing at all.
+ * Otherwise the node is unlinked from the list headed at bucket+16 -- advancing that head if
+ * the node is it, then patching both neighbours -- and pushed onto the list at bucket+20.
+ */
+void NativeSchedulerRequeue(PPCContext& __restrict ctx, uint8_t* base) {
+  const uint32_t scheduler = ctx.r3.u32;
+  const uint32_t element = ctx.r4.u32;
+
+  const uint32_t state = REX_LOAD_U8(element + kElementState);
+  if (state == kStateParked) {
+    return;  // the original returns before touching anything, +16 included
+  }
+
+  const uint32_t node = REX_LOAD_U32(element + kElementNode);
+  const uint32_t bucket = scheduler + (state << kBucketShift);
+
+  if (REX_LOAD_U8(node + kNodeLinked) != 0) {
+    if (REX_LOAD_U32(bucket + kBucketFrom) == node) {
+      REX_STORE_U32(bucket + kBucketFrom, REX_LOAD_U32(node + kNodeNext));
+    }
+    const uint32_t prev = REX_LOAD_U32(node + kNodePrev);
+    if (prev != 0) {
+      REX_STORE_U32(prev + kNodeNext, REX_LOAD_U32(node + kNodeNext));
+    }
+    const uint32_t next = REX_LOAD_U32(node + kNodeNext);
+    if (next != 0) {
+      REX_STORE_U32(next + kNodePrev, REX_LOAD_U32(node + kNodePrev));
+    }
+    // The original loads bucket+20 twice with no store in between, so one read is the same
+    // value both times.
+    const uint32_t head = REX_LOAD_U32(bucket + kBucketTo);
+    REX_STORE_U32(node + kNodePrev, 0);
+    REX_STORE_U32(node + kNodeNext, head);
+    if (head != 0) {
+      REX_STORE_U32(head + kNodePrev, node);
+    }
+    REX_STORE_U32(bucket + kBucketTo, node);
+    REX_STORE_U8(node + kNodeLinked, 0);
+  }
+  REX_STORE_U32(element + kElementCleared, 0);
+}
+
 skate3::audio::ShadowStats g_event_submit_stats{"EVENT_SUBMIT"};
 skate3::audio::ShadowStats g_event_stop_stats{"EVENT_STOP"};
 std::atomic<uint64_t> g_event_stop_unverifiable{0};
 skate3::audio::ShadowStats g_event_play_stats{"EVENT_PLAY"};
 std::atomic<uint64_t> g_event_play_unverifiable{0};
 skate3::audio::ShadowStats g_command_enqueue_stats{"ENQUEUE"};
+skate3::audio::ShadowStats g_requeue_stats{"REQUEUE"};
+
+// Measurement state for sub_82B7F828, which memsets two caller-supplied buffers. Whether it
+// can ever be shadow-compared depends on those lengths against kMaxWatch (64 KB across all
+// windows), so the lengths get measured rather than assumed.
+std::atomic<uint64_t> g_bufpair_calls{0};
+std::atomic<uint32_t> g_bufpair_first_max{0};
+std::atomic<uint32_t> g_bufpair_second_max{0};
+std::atomic<uint64_t> g_bufpair_first_null{0};
+std::atomic<uint64_t> g_bufpair_second_null{0};
+
+void RecordMax(std::atomic<uint32_t>& slot, uint32_t value) {
+  uint32_t seen = slot.load(std::memory_order_relaxed);
+  while (value > seen && !slot.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+  }
+}
 // Calls per selector: 0 play, 1 stop, 2 submit, 3 the query path. A single total hides
 // which paths were actually exercised, and three of the four are appends while the fourth
 // mutates caller state instead -- so the split is part of the result, not a detail.
@@ -554,4 +632,84 @@ extern "C" REX_FUNC(sub_82B28A00) {
     return;
   }
   __imp__sub_82B28A00(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82B48B28) {
+  if (skate3::audio::ShadowEnabled()) {
+    // Enumerated from pre-call state: the element's cleared word, the bucket's two heads, the
+    // node's first 16 bytes (next, prev and the linked flag), and each neighbour that exists.
+    // Six windows, about 40 bytes, against a 64 KB budget -- no window is ever dropped, so
+    // every byte the function writes is both compared and rewound.
+    const uint32_t scheduler = ctx.r3.u32;
+    const uint32_t element = ctx.r4.u32;
+    const uint32_t state = REX_LOAD_U8(element + kElementState);
+    ShadowWindow windows[6];
+    size_t count = 0;
+    windows[count++] = {element + kElementCleared, 4};
+    if (state != kStateParked) {
+      const uint32_t node = REX_LOAD_U32(element + kElementNode);
+      const uint32_t bucket = scheduler + (state << kBucketShift);
+      windows[count++] = {bucket + kBucketFrom, 8};
+      windows[count++] = {node + kNodeNext, 16};
+      const uint32_t prev = REX_LOAD_U32(node + kNodePrev);
+      const uint32_t next = REX_LOAD_U32(node + kNodeNext);
+      const uint32_t head = REX_LOAD_U32(bucket + kBucketTo);
+      if (prev != 0) windows[count++] = {prev + kNodeNext, 4};
+      if (next != 0) windows[count++] = {next + kNodePrev, 4};
+      if (head != 0) windows[count++] = {head + kNodePrev, 4};
+    }
+    skate3::audio::ShadowCompare(ctx, base, NativeSchedulerRequeue, __imp__sub_82B48B28,
+                                 {windows, count}, skate3::audio::kReturnNone, g_requeue_stats);
+    return;
+  }
+  if (UseNative()) {
+    static std::atomic<uint64_t> native_runs{0};
+    const uint64_t runs = native_runs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (runs == 1 || runs == 16 || runs == 256 || runs == 1024) {
+      REXLOG_INFO("skate3-audio-native: REQUEUE native runs={}", runs);
+    }
+    NativeSchedulerRequeue(ctx, base);
+    return;
+  }
+  __imp__sub_82B48B28(ctx, base);
+}
+
+/**
+ * Measurement only -- no native body, no comparison.
+ *
+ * sub_82B7F828 zeroes two caller-supplied buffers: memset(r6, 0, r7) when r6 is non-null, then
+ * memset(r4, 0, r5) when r4 is non-null (its one callee, sub_82F52040, is a leaf confirmed to
+ * be memset). Shadow-comparing it would need windows covering both buffers, and the harness
+ * drops windows past a 64 KB total -- dropping the offending window and every one after it --
+ * while a write outside the windows is never rewound and so lands in the live game.
+ *
+ * So the question "can this be ported safely?" is a question about these two lengths, and this
+ * hook answers it with numbers. It runs the original and records, nothing else.
+ */
+extern "C" REX_FUNC(sub_82B7F828) {
+  if (skate3::audio::ShadowEnabled()) {
+    const uint32_t first_len = ctx.r7.u32;
+    const uint32_t second_len = ctx.r5.u32;
+    if (ctx.r6.u32 == 0) {
+      g_bufpair_first_null.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      RecordMax(g_bufpair_first_max, first_len);
+    }
+    if (ctx.r4.u32 == 0) {
+      g_bufpair_second_null.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      RecordMax(g_bufpair_second_max, second_len);
+    }
+    const uint64_t n = g_bufpair_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n == 16 || n == 256 || (n % 1024) == 0) {
+      const uint32_t a = g_bufpair_first_max.load(std::memory_order_relaxed);
+      const uint32_t b = g_bufpair_second_max.load(std::memory_order_relaxed);
+      REXLOG_INFO("skate3-audio-shadow: BUFPAIR calls={} this=({},{}) max=({},{}) sum={} "
+                  "budget=65536 null=({},{})",
+                  n, first_len, second_len, a, b, uint64_t(a) + uint64_t(b),
+                  g_bufpair_first_null.load(std::memory_order_relaxed),
+                  g_bufpair_second_null.load(std::memory_order_relaxed));
+    }
+  }
+  __imp__sub_82B7F828(ctx, base);
 }
