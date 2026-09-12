@@ -738,7 +738,7 @@ extern "C" REX_FUNC(sub_82B28A00) {
       // The fourth path writes the caller's params, not the queue.
       windows[count++] = {ctx.r5.u32 + kParamsSentinel, 8};
     }
-    ShadowWindow enq_inputs[5];
+    ShadowWindow enq_inputs[16];
     size_t in_count = 0;
     enq_inputs[in_count++] = {player + kSystemQueue, 4};
     enq_inputs[in_count++] = {ctx.r5.u32, 0x18};
@@ -749,6 +749,16 @@ extern "C" REX_FUNC(sub_82B28A00) {
     } else {
       enq_inputs[in_count++] = {player + kPlayerPacketHead, 4};
       enq_inputs[in_count++] = {player + kPlayerVoiceTable, kVoiceTableEntries * kVoiceTableStride};
+      // The query walks the FIFO before it scans the table, so replaying it needs the nodes
+      // too. Every recorded query so far arrived with an empty FIFO, which left that branch
+      // untested rather than verified. Bounded at 8 nodes on purpose: an unbounded walk is the
+      // gate-2 problem that makes sub_82B482F8 unwindowable, and a replay that runs off the end
+      // of a bounded prefix reports itself unreplayable rather than passing on short data.
+      uint32_t node = REX_LOAD_U32(player + kPlayerPacketHead);
+      for (int i = 0; i < 8 && node != 0 && in_count < 16; i++) {
+        enq_inputs[in_count++] = {node, 16};
+        node = REX_LOAD_U32(node + kPacketNext);
+      }
     }
     skate3::audio::ShadowCompare(ctx, base, NativeCommandEnqueue, __imp__sub_82B28A00,
                                  {windows, count}, {enq_inputs, in_count},
