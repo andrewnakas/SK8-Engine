@@ -256,6 +256,7 @@ set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
     src/skate3_audio_dump.cpp
+    src/skate3_audio_kernel_census.cpp
     src/skate3_audio_native.cpp
     src/skate3_audio_probe.cpp
     src/skate3_audio_shadow.cpp
