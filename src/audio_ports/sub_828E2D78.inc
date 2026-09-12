@@ -1,6 +1,6 @@
 // sub_828E2D78  role: validate a handle against its owner's +8 generation, then unlink a node   lifted: skate3_recomp.47.cpp:4485 (81 lines)
 // STATUS: verified
-// calls/session: boot 20  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 22  play 45  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_828E2D78.md
 namespace port_828E2D78 {
 

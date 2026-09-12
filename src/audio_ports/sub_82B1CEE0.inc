@@ -1,6 +1,6 @@
 // sub_82B1CEE0  role: return the smaller of two int32 fields, by signed compare   lifted: skate3_recomp.66.cpp:65788 (15 lines)
 // STATUS: verified
-// calls/session: boot 14552  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 13818  play 23549  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1CEE0.md
 namespace port_82B1CEE0 {
 

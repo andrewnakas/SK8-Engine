@@ -1,6 +1,6 @@
 // sub_82B1D1C8  role: signed quotient of the two words at +0 and +4, 0 on a zero divisor (op 25 of the 0x82FD3600 table)   lifted: skate3_recomp.66.cpp:66230 (30 lines)
 // STATUS: verified
-// calls/session: boot 118225  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 112486  play 145703  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D1C8.md
 namespace port_82B1D1C8 {
 

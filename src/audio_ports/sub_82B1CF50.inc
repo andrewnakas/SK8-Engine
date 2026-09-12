@@ -1,6 +1,6 @@
 // sub_82B1CF50  role: round-half-away-from-zero of scale(+4) * product of `count`(+0) s32 words from +8, as s32   lifted: skate3_recomp.66.cpp:65857 (188 lines)
 // STATUS: verified
-// calls/session: boot 1264336  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 1231306  play 1503552  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1CF50.md
 namespace port_82B1CF50 {
 

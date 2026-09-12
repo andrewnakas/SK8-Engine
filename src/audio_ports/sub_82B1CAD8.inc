@@ -1,6 +1,6 @@
 // sub_82B1CAD8  role: evaluate a sampled curve at a cursor's position (nearest or linear), cache at +8   lifted: skate3_recomp.66.cpp:65213 (328 lines)
 // STATUS: verified
-// calls/session: boot 1486527  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 1422684  play 1667332  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1CAD8.md
 namespace port_82B1CAD8 {
 

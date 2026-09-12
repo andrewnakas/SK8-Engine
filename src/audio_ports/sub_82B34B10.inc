@@ -1,6 +1,6 @@
 // sub_82B34B10  role: push an object's node onto a global singly-linked list   lifted: skate3_recomp.67.cpp:55556 (36 lines)
 // STATUS: verified
-// calls/session: boot 215  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 284  play 317  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B34B10.md
 namespace port_82B34B10 {
 

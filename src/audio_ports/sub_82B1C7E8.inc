@@ -1,6 +1,6 @@
 // sub_82B1C7E8  role: single-float timer: optionally zero the accumulator (+8 != 0), then fire when it reaches float(s32 +12) -- +4 = 1, park it at -1.0, return 1 -- else add a live step and return 0   lifted: skate3_recomp.66.cpp:64757 (90 lines)
 // STATUS: verified
-// calls/session: boot 82697  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 77185  play 95865  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1C7E8.md
 namespace port_82B1C7E8 {
 

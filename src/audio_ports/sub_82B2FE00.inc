@@ -1,6 +1,6 @@
 // sub_82B2FE00  role: clamp a rate into range, then fill a five-point ramp plus its span   lifted: skate3_recomp.67.cpp:44204 (113 lines)
 // STATUS: verified
-// calls/session: boot 4  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 8  play 8  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B2FE00.md
 namespace port_82B2FE00 {
 

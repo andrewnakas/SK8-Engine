@@ -1,6 +1,6 @@
 // sub_82B1D7B0  role: product of two int32 fields, capped at a third   lifted: skate3_recomp.66.cpp:67111 (19 lines)
 // STATUS: verified
-// calls/session: boot 2685  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 2527  play 5739  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D7B0.md
 namespace port_82B1D7B0 {
 

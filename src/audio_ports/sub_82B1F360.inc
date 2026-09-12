@@ -1,6 +1,6 @@
 // sub_82B1F360  role: advance a six-word cascading counter at a fixed global   lifted: skate3_recomp.67.cpp:3375 (137 lines)
 // STATUS: verified
-// calls/session: boot 2841  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 6624  play 8634  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1F360.md
 namespace port_82B1F360 {
 

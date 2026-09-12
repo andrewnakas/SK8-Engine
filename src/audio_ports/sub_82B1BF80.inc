@@ -1,6 +1,6 @@
 // sub_82B1BF80  role: take-and-clear accessor: return the u32 at [r3+0] and leave zero in its place   lifted: skate3_recomp.66.cpp:63544 (13 lines)
 // STATUS: verified
-// calls/session: boot 55578  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 52325  play 69016  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1BF80.md
 namespace port_82B1BF80 {
 

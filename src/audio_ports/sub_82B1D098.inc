@@ -1,6 +1,6 @@
 // sub_82B1D098  role: round(f32[+0] * s32[+4] * s32[+8]) to s32, half away from zero (register-only)   lifted: skate3_recomp.66.cpp:66046 (72 lines)
 // STATUS: verified
-// calls/session: boot 694465  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 663720  play 777914  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D098.md
 namespace port_82B1D098 {
 

@@ -1,6 +1,6 @@
 // sub_82B463A8  role: command handler: stamp {0x7FF7FFF1, float} into slot[index] of object+0x10, return 16   lifted: skate3_recomp.68.cpp:31590 (31 lines)
 // STATUS: verified
-// calls/session: boot 740566  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 761054  play 1137330  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B463A8.md
 namespace port_82B463A8 {
 

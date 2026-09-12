@@ -1,6 +1,6 @@
 // sub_82B4F8A8  role: size of a 28-byte-per-pair record plus an 88-byte header; writes 16 to *r4   lifted: skate3_recomp.68.cpp:54330 (17 lines)
 // STATUS: verified
-// calls/session: boot 1606  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 1930  play 2166  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B4F8A8.md
 namespace port_82B4F8A8 {
 

@@ -1,6 +1,6 @@
 // sub_82B1D200  role: signed remainder of two int32 fields, 0 when the divisor is 0   lifted: skate3_recomp.66.cpp:66261 (34 lines)
 // STATUS: verified
-// calls/session: boot 11845  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 8952  play 14092  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D200.md
 namespace port_82B1D200 {
 

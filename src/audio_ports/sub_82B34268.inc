@@ -1,6 +1,6 @@
 // sub_82B34268  role: store a 16-bit field at +460 of an object, return 0   lifted: skate3_recomp.67.cpp:54301 (11 lines)
 // STATUS: verified
-// calls/session: boot 209196  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 202510  play 304676  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B34268.md
 namespace port_82B34268 {
 

@@ -1,6 +1,6 @@
 // sub_82B1CE48  role: clear slot +4*(s16[+2]+2); if 0 < depth(+4) <= capacity(+0), copy word +8 into slot +4*(depth+2) and record depth in s16[+2]; return word +12   lifted: skate3_recomp.66.cpp:65704 (46 lines)
 // STATUS: verified
-// calls/session: boot 45121  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 43591  play 51927  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1CE48.md
 namespace port_82B1CE48 {
 

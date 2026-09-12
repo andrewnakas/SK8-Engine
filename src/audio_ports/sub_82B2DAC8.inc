@@ -1,6 +1,6 @@
 // sub_82B2DAC8  role: recompute a voice's pitch ratio and advance its fractional position   lifted: skate3_recomp.67.cpp:38898 (141 lines)
 // STATUS: verified
-// calls/session: boot 210879  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 204194  play 306361  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B2DAC8.md
 namespace port_82B2DAC8 {
 

@@ -1,6 +1,6 @@
 // sub_82B32550  role: claim the current slot of a 20-entry ring if free, and advance the index   lifted: skate3_recomp.67.cpp:50075 (50 lines)
 // STATUS: verified
-// calls/session: boot 2619  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 2935  play 5735  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B32550.md
 namespace port_82B32550 {
 

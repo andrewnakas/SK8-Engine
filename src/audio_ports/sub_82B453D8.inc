@@ -1,6 +1,6 @@
 // sub_82B453D8  role: store a 2D vector (f1,f2) and its squared length at r3+0/+4/+8, clamped to the unit disc: length^2 in (0.999,1) snaps +8 to 1; length^2 > 1 normalises x,y and stores 1   lifted: skate3_recomp.68.cpp:29082 (66 lines)
 // STATUS: verified
-// calls/session: boot 72810  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 292509  play 371733  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B453D8.md
 namespace port_82B453D8 {
 

@@ -1,6 +1,6 @@
 // sub_82F52318  role: atan2(y=f1, x=f2) in double -- octant-reduced rational atan, result in f1 (leaf)   lifted: skate3_recomp.106.cpp:66150 (176 lines)
 // STATUS: verified
-// calls/session: boot 73848  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 87372  play 56807  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82F52318.md
 namespace port_82F52318 {
 

@@ -1,6 +1,6 @@
 // sub_82B1CE18  role: top-of-stack read: return entry[depth] of a {u8 capacity, s32 depth, u32 entries[]} stack, 0 if empty/over   lifted: skate3_recomp.66.cpp:65675 (28 lines)
 // STATUS: verified
-// calls/session: boot 1921575  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 1834281  play 2063173  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1CE18.md
 namespace port_82B1CE18 {
 

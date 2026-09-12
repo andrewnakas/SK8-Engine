@@ -1,6 +1,6 @@
 // sub_82B47658  role: decode four variable-length fields into a 4-word result   lifted: skate3_recomp.68.cpp:34405 (60 lines)
 // STATUS: verified
-// calls/session: boot 610  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 2508  play 2060  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B47658.md
 namespace port_82B47658 {
 

@@ -1,6 +1,6 @@
 // sub_82B1C4B8  role: stepping cursor: return +20 if it lies in [+0,+4]; else, when +16 > 0, step +8 by s8 +12 wrapping over +4 to +0 and under +0 to +4; return +8   lifted: skate3_recomp.66.cpp:64309 (60 lines)
 // STATUS: verified
-// calls/session: boot 52778  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 49460  play 52502  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1C4B8.md
 namespace port_82B1C4B8 {
 

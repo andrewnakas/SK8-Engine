@@ -1,6 +1,6 @@
 // sub_82B2C8E8  role: return the fourth argument unchanged -- r3 = r6, 64-bit (register-only leaf)   lifted: skate3_recomp.67.cpp:36218 (7 lines)
 // STATUS: verified
-// calls/session: boot 131457  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 123881  play 225599  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B2C8E8.md
 namespace port_82B2C8E8 {
 

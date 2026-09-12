@@ -1,6 +1,6 @@
 // sub_82B45B60  role: scale a speaker-gain array (r6) by f1*f2, power-normalised over the selected speakers when f3 < 1.0   lifted: skate3_recomp.68.cpp:30244 (151 lines)
 // STATUS: verified
-// calls/session: boot 72810  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 219648  play 280497  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B45B60.md
 namespace port_82B45B60 {
 

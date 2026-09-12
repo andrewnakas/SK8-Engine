@@ -1,6 +1,6 @@
 // sub_82B1D118  role: sum the u8[+0]-counted u32 array at +4 into r3, 64-bit accumulate (register-only)   lifted: skate3_recomp.66.cpp:66119 (74 lines)
 // STATUS: verified
-// calls/session: boot 151451  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 147848  play 184076  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D118.md
 namespace port_82B1D118 {
 

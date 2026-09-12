@@ -1,6 +1,6 @@
 // sub_82B1D7D0  role: take-and-clear a byte flag at +25 of an object, return the old value   lifted: skate3_recomp.66.cpp:67131 (13 lines)
 // STATUS: verified
-// calls/session: boot 285531  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 268706  play 311108  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D7D0.md
 namespace port_82B1D7D0 {
 

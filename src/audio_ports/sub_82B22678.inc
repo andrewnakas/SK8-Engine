@@ -1,6 +1,6 @@
 // sub_82B22678  role: hard clipper -- clamp 256 samples/channel of the source buffer into [-level, level] in the dest buffer, then swap the pair   lifted: skate3_recomp.67.cpp:11130 (119 lines)
 // STATUS: verified
-// calls/session: boot 49732  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 49325  play 76864  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B22678.md
 namespace port_82B22678 {
 

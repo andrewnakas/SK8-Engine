@@ -1,6 +1,6 @@
 // sub_82B1BF68  role: detach word at +16: return its old value in r3 and clear it to 0   lifted: skate3_recomp.66.cpp:63530 (13 lines)
 // STATUS: verified
-// calls/session: boot 55578  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 52325  play 69016  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1BF68.md
 namespace port_82B1BF68 {
 

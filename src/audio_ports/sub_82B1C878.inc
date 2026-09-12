@@ -1,6 +1,6 @@
 // sub_82B1C878  role: scan a u32 flag table for the first non-zero entry i and copy value[i] (u32 at +8+4i) into +4; return +4   lifted: skate3_recomp.66.cpp:64848 (50 lines)
 // STATUS: verified
-// calls/session: boot 207107  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 195407  play 232114  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1C878.md
 namespace port_82B1C878 {
 

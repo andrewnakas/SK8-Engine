@@ -1,6 +1,6 @@
 // sub_82B23828  role: publish a command's value onto its target, one of two field sets   lifted: skate3_recomp.67.cpp:14026 (77 lines)
 // STATUS: verified
-// calls/session: boot 1914  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 1910  play 1495  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B23828.md
 namespace port_82B23828 {
 

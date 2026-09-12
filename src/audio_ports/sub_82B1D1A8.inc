@@ -1,6 +1,6 @@
 // sub_82B1D1A8  role: return the difference of two u32 fields, [+0] - [+4] (register-only)   lifted: skate3_recomp.66.cpp:66206 (11 lines)
 // STATUS: verified
-// calls/session: boot 71143  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 68584  play 110741  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D1A8.md
 namespace port_82B1D1A8 {
 

@@ -1,6 +1,6 @@
 // sub_82B1CF38  role: signed max of the two s32 words at +0 and +4, returned zero-extended in r3 (ties return +4)   lifted: skate3_recomp.66.cpp:65841 (15 lines)
 // STATUS: verified
-// calls/session: boot 34614  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 33196  play 62633  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1CF38.md
 namespace port_82B1CF38 {
 

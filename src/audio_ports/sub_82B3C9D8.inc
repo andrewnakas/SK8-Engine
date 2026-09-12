@@ -1,6 +1,6 @@
 // sub_82B3C9D8  role: advance a position (+28) by r4; on hitting the current 24-byte segment's end (+12) clear it, step the u8 index (+49) mod count (+50), and reload the position from the new segment's +8   lifted: skate3_recomp.68.cpp:8110 (70 lines)
 // STATUS: verified
-// calls/session: boot 126220  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 119335  play 178780  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B3C9D8.md
 namespace port_82B3C9D8 {
 

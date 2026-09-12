@@ -1,6 +1,6 @@
 // sub_82B1D5D0  role: ramp an f32 value(+0) toward an s32 target(+24), re-deriving the rate when target/duration change; return round(value) (op 29 of the 0x82FD3600 table)   lifted: skate3_recomp.66.cpp:66826 (180 lines)
 // STATUS: verified
-// calls/session: boot 131224  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 124236  play 147230  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D5D0.md
 namespace port_82B1D5D0 {
 

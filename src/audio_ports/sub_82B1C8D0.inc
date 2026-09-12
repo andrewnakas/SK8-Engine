@@ -1,6 +1,6 @@
 // sub_82B1C8D0  role: any-nonzero reducer: return 1 if any of the `count`(+0) u32 words at +4 is nonzero, else 0   lifted: skate3_recomp.66.cpp:64899 (38 lines)
 // STATUS: verified
-// calls/session: boot 115824  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 108418  play 123521  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1C8D0.md
 namespace port_82B1C8D0 {
 

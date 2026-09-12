@@ -1,6 +1,6 @@
 // sub_82B23C10  role: how much of stream `index` is still unconsumed: element limit minus its read cursor, 0 when the element is unbound   lifted: skate3_recomp.67.cpp:14645 (47 lines)
 // STATUS: verified
-// calls/session: boot 128966  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 122997  play 214853  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B23C10.md
 namespace port_82B23C10 {
 

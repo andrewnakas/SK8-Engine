@@ -1,6 +1,6 @@
 // sub_82F4DE80  role: floor(double) -- f1 in, largest integral value <= f1 out in f1 (register-only leaf)   lifted: skate3_recomp.106.cpp:53797 (34 lines)
 // STATUS: verified
-// calls/session: boot 2412020  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 2872661  play 2942889  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82F4DE80.md
 namespace port_82F4DE80 {
 

@@ -1,6 +1,6 @@
 // sub_82B1D700  role: sum the N u32 words of an operand block, clamped to the cap word (op 30 of the 0x82FD3600 table)   lifted: skate3_recomp.66.cpp:67007 (83 lines)
 // STATUS: verified
-// calls/session: boot 560549  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 532250  play 621829  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D700.md
 namespace port_82B1D700 {
 

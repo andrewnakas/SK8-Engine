@@ -1,6 +1,6 @@
 // sub_82B1D790  role: return max(u32[+4] - u32[+8], u32[+0]) of an operand block (op 31 of the 0x82FD3600 table)   lifted: skate3_recomp.66.cpp:67091 (19 lines)
 // STATUS: verified
-// calls/session: boot 83101  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 76831  play 114948  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D790.md
 namespace port_82B1D790 {
 

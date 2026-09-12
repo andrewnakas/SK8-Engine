@@ -1,6 +1,6 @@
 // sub_82B26B70  role: read r4 bits MSB-first from a byte stream, advancing the bit cursor   lifted: skate3_recomp.67.cpp:21737 (64 lines)
 // STATUS: verified
-// calls/session: boot 14455  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 36190  play 42524  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B26B70.md
 namespace port_82B26B70 {
 

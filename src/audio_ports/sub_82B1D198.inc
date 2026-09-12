@@ -1,6 +1,6 @@
 // sub_82B1D198  role: return the sum of two u32 fields at +0 and +4 (register-only)   lifted: skate3_recomp.66.cpp:66194 (11 lines)
 // STATUS: verified
-// calls/session: boot 725000  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 698485  play 856261  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D198.md
 namespace port_82B1D198 {
 

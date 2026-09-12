@@ -1,6 +1,6 @@
 // sub_82B349A8  role: advance a ring cursor and latch the new entry's parameters   lifted: skate3_recomp.67.cpp:55346 (91 lines)
 // STATUS: verified
-// calls/session: boot 786  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 865  play 908  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B349A8.md
 namespace port_82B349A8 {
 

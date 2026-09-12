@@ -1,6 +1,6 @@
 // sub_82B454B8  role: pan a 2D source into the speaker-gain array: distance weights over the four selected speakers (plus speaker 1 and the two 7.1 sides), scaled by sqrt(1 - lensq^2); a source at lensq == 1.0 zeroes the array   lifted: skate3_recomp.68.cpp:29225 (409 lines)
 // STATUS: verified
-// calls/session: boot 72810  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 219648  play 280497  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B454B8.md
 namespace port_82B454B8 {
 

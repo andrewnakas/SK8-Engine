@@ -1,6 +1,6 @@
 // sub_82B1D1B8  role: return the signed product of two 32-bit fields at +4 and +0 (register-only)   lifted: skate3_recomp.66.cpp:66218 (11 lines)
 // STATUS: verified
-// calls/session: boot 180538  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 170206  play 212282  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1D1B8.md
 namespace port_82B1D1B8 {
 

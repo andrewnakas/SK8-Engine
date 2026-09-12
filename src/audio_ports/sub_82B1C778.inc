@@ -1,6 +1,6 @@
 // sub_82B1C778  role: window trigger with hysteresis: latch +16 when +20 enters [+0,+4], clear it in [+8,+12]; +17 is the rising-edge pulse, returned in r3   lifted: skate3_recomp.66.cpp:64697 (59 lines)
 // STATUS: verified
-// calls/session: boot 835339  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 797279  play 906149  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1C778.md
 namespace port_82B1C778 {
 

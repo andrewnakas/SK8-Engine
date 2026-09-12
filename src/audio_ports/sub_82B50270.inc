@@ -1,6 +1,6 @@
 // sub_82B50270  role: advance a bit cursor by a field read from the stream, wrapping the page   lifted: skate3_recomp.68.cpp:55765 (162 lines)
 // STATUS: verified
-// calls/session: boot 2913  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 6354  play 5518  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B50270.md
 namespace port_82B50270 {
 

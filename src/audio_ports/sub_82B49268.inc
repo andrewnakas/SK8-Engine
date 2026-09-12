@@ -1,6 +1,6 @@
 // sub_82B49268  role: publish a float from a command record onto the object at its +4   lifted: skate3_recomp.68.cpp:38538 (17 lines)
 // STATUS: verified
-// calls/session: boot 528  play ?  map ?          thread: RwAudioCore Dac
+// calls/session: boot 745  play 981  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B49268.md
 namespace port_82B49268 {
 
