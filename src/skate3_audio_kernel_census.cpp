@@ -32,6 +32,16 @@
 #include "generated/skate3_init.h"
 
 REXCVAR_DEFINE_BOOL(
+    skate3_audio_kernel_windows, false, "Skate 3",
+    "Log sub_82B50380's address registers at entry, to size its shadow windows.\n"
+    "\n"
+    "It writes 111 stores through 14 distinct base/offset register pairs, and the shadow harness\n"
+    "drops windows past 64 KB in total - dropping the offending window and every one after it -\n"
+    "while an uncovered native write is never rewound and so reaches the live game. Whether it\n"
+    "can be ported safely is therefore a question about these spans, and this answers it with\n"
+    "numbers rather than an inference, the way BUFPAIR's buffer lengths were answered.");
+
+REXCVAR_DEFINE_BOOL(
     skate3_audio_kernel_census, false, "Skate 3",
     "Count calls to the audio-thread VMX128 kernels and log the totals every 10 s.\n"
     "\n"
@@ -83,6 +93,33 @@ void ReporterMain() {
   }
 }
 
+bool WindowProbeEnabled() {
+  static const bool on = REXCVAR_GET(skate3_audio_kernel_windows);
+  return on;
+}
+
+std::atomic<uint64_t> g_window_logged{0};
+
+/// The registers sub_82B50380's store addresses are built from, per the lifted body:
+/// `ea = r11`, `r11 + {r3,r4,r6,r7,r29,r30,r31}`, `r7 + {...}`, `(r10 + r9) & ~0xF`, `2 + r10`.
+/// Logged raw rather than reduced here: which register is the base and which the offset is not
+/// obvious from the body, so the spans get computed offline from real values.
+void LogWindowRegisters(const PPCContext& ctx) {
+  if (!WindowProbeEnabled()) {
+    return;
+  }
+  const uint64_t n = g_window_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n > 24 && (n % 50000) != 0) {
+    return;
+  }
+  REXLOG_INFO("skate3-kernel-windows: sub_82B50380 #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} "
+              "r7={:08X} r8={:08X} r9={:08X} r10={:08X} r11={:08X} r27={:08X} r28={:08X} "
+              "r29={:08X} r30={:08X} r31={:08X} r1={:08X}",
+              n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
+              ctx.r9.u32, ctx.r10.u32, ctx.r11.u32, ctx.r27.u32, ctx.r28.u32, ctx.r29.u32,
+              ctx.r30.u32, ctx.r31.u32, ctx.r1.u32);
+}
+
 void Count(size_t index) {
   if (!CensusEnabled()) {
     return;
@@ -103,7 +140,14 @@ void Count(size_t index) {
   }
 
 SKATE3_CENSUS(0, sub_82B22898)
-SKATE3_CENSUS(1, sub_82B50380)
+
+// Hand-written rather than SKATE3_CENSUS(1, ...), because this one also measures its own
+// window spans. Phase 3's first port target: 254,917 calls, leaf, 111 observable stores.
+extern "C" REX_FUNC(sub_82B50380) {
+  Count(1);
+  LogWindowRegisters(ctx);
+  __imp__sub_82B50380(ctx, base);
+}
 SKATE3_CENSUS(2, sub_82B42C98)
 SKATE3_CENSUS(3, sub_82B399D0)
 SKATE3_CENSUS(4, sub_82B44D18)
