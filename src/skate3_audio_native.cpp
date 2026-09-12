@@ -15,7 +15,9 @@
  * Offsets referenced here are documented in docs/rw_audio_structs.h, which asserts them.
  */
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -55,6 +57,24 @@ constexpr uint32_t kRecordPacket = 8;
 
 // Size EVENT_SUBMIT reports back to the drain, which advances by this.
 constexpr uint32_t kSubmitRecordSize = 0x0C;
+
+// The EVENT_PLAY command record. It shares only the player pointer at +4 with
+// EVENT_SUBMIT's; the rest is three floats, so the fields are named apart.
+constexpr uint32_t kRecordPlayFormat = 8;     // -> format_index, truncated to a byte
+constexpr uint32_t kRecordPlayRate = 12;      // -> sample_rate, stored as float32
+constexpr uint32_t kRecordPlayChannels = 16;  // -> channel_count, truncated to a byte
+
+// The rw_player fields EVENT_PLAY writes, from docs/rw_audio_structs.h.
+constexpr uint32_t kPlayerSource = 0x50;  // source object; EVENT_PLAY writes through it
+constexpr uint32_t kPlayerSampleRate = 0x154;
+constexpr uint32_t kPlayerChannelCount = 0x15F;
+constexpr uint32_t kPlayerFormatIndex = 0x160;
+// One window covering every player byte EVENT_PLAY writes: the decoder pointer at +0x150,
+// the sample rate at +0x154, and the state, channel and format bytes at +0x15E..+0x160.
+constexpr uint32_t kPlayerPlaySpan = 0x161 - kPlayerDecoder;
+
+// Size EVENT_PLAY reports back to the drain, which advances by this.
+constexpr uint32_t kPlayRecordSize = 20;
 
 bool UseNative() {
   static const bool on = REXCVAR_GET(skate3_audio_native);
@@ -142,9 +162,96 @@ void NativeEventStop(PPCContext& __restrict ctx, uint8_t* base) {
   ctx.r3.u64 = 8;  // EVENT_STOP's own record size
 }
 
+float BitsToFloat(uint32_t bits) {
+  float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+/**
+ * The guest's `fctidz` followed by `stfd` and `lbz +7`: truncate toward zero into a 64-bit
+ * integer, spill it big-endian, then read back the least significant byte.
+ *
+ * The lifted body special-cases NaN and anything above LLONG_MAX before handing the rest to
+ * x86 CVTTSD2SI, and those two cases disagree: saturation leaves a low byte of 0xFF, while
+ * CVTTSD2SI's out-of-range "integer indefinite" leaves 0x00. Exactly 2^63 takes the second
+ * path, because the lifted test is `>` and not `>=`. Reproduced branch for branch: a plain
+ * cast would be undefined behaviour out of range and would disagree at that boundary.
+ */
+uint8_t TruncatedLowByte(float value) {
+  constexpr double kTwoPow63 = 9223372036854775808.0;  // double(LLONG_MAX), exactly
+  const double widened = static_cast<double>(value);
+  uint64_t spilled;
+  if (std::isnan(widened)) {
+    spilled = 0x8000000000000000ULL;
+  } else if (widened > kTwoPow63) {
+    spilled = static_cast<uint64_t>(INT64_MAX);
+  } else if (widened >= kTwoPow63 || widened < -kTwoPow63) {
+    spilled = 0x8000000000000000ULL;
+  } else {
+    spilled = static_cast<uint64_t>(static_cast<int64_t>(widened));
+  }
+  return static_cast<uint8_t>(spilled & 0xFFu);
+}
+
+/**
+ * EVENT_PLAY: publish the stream's format onto the player and mark it playing.
+ *
+ * Lifted from sub_82B28B78. Order is the original's: clear the decoder pointer, convert the
+ * format byte, store the sample rate, mark the state playing, convert the channel count,
+ * then write the zero word and the format byte through the source pointer at +0x50.
+ *
+ * The original then reloads the state byte it has just set to 1 and calls sub_82B29018 only
+ * if that byte reads 4 or 0 -- which it cannot, unless the two stores through +0x50 overlap
+ * the byte. The branch survives in the binary because the compiler could not prove the
+ * pointer does not alias the field. Reproduced, reload included, rather than folded away:
+ * the job is to match the original, and the harness is what decides whether it does.
+ *
+ * The float conversions are the ones the lifted body performs, so a NaN in the record would
+ * trap on the audio worker thread (MXCSR 0x0000) in both. Deliberately not masked: masking
+ * here would make this body differ from the original it is being checked against.
+ */
+void NativeEventPlay(PPCContext& __restrict ctx, uint8_t* base) {
+  const uint32_t record = ctx.r3.u32;
+  const uint32_t player = REX_LOAD_U32(record + kRecordPlayer);
+
+  // Cleared, not torn down -- EVENT_PLAY runs before a decoder exists.
+  REX_STORE_U32(player + kPlayerDecoder, 0);
+
+  REX_STORE_U8(player + kPlayerFormatIndex,
+               TruncatedLowByte(BitsToFloat(REX_LOAD_U32(record + kRecordPlayFormat))));
+
+  // The original loads the rate with lfs and stores it with stfs: a float -> double ->
+  // float round trip, lossless except that it quiets a signalling NaN. Kept as a round
+  // trip for exactly that reason, rather than copied as a word.
+  const float rate =
+      static_cast<float>(static_cast<double>(BitsToFloat(REX_LOAD_U32(record + kRecordPlayRate))));
+  uint32_t rate_bits;
+  std::memcpy(&rate_bits, &rate, sizeof(rate_bits));
+
+  const uint32_t source = REX_LOAD_U32(player + kPlayerSource);
+  REX_STORE_U32(player + kPlayerSampleRate, rate_bits);
+  REX_STORE_U8(player + kPlayerState, 1);
+  REX_STORE_U8(player + kPlayerChannelCount,
+               TruncatedLowByte(BitsToFloat(REX_LOAD_U32(record + kRecordPlayChannels))));
+
+  REX_STORE_U32(source, 0);
+  REX_STORE_U8(source + 4, REX_LOAD_U8(player + kPlayerFormatIndex));
+
+  const uint8_t state = REX_LOAD_U8(player + kPlayerState);
+  if (state == 4 || state == 0) {
+    ctx.lr = 0x82B28C04;
+    sub_82B29018(ctx, base);
+  }
+
+  ctx.r3.u64 = kPlayRecordSize;
+}
+
 skate3::audio::ShadowStats g_event_submit_stats{"EVENT_SUBMIT"};
 skate3::audio::ShadowStats g_event_stop_stats{"EVENT_STOP"};
 std::atomic<uint64_t> g_event_stop_unverifiable{0};
+skate3::audio::ShadowStats g_event_play_stats{"EVENT_PLAY"};
+std::atomic<uint64_t> g_event_play_unverifiable{0};
 
 }  // namespace
 
@@ -218,4 +325,58 @@ extern "C" REX_FUNC(sub_82B28CC0) {
     return;
   }
   __imp__sub_82B28CC0(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82B28B78) {
+  if (skate3::audio::ShadowEnabled()) {
+    const uint32_t record = ctx.r3.u32;
+    const uint32_t player = REX_LOAD_U32(record + kRecordPlayer);
+    const uint32_t source = REX_LOAD_U32(player + kPlayerSource);
+    // sub_82B29018 reaches two indirect calls and three further functions, so if the
+    // original takes that branch the harness cannot rewind what it did. The branch is
+    // reachable only when the stores through +0x50 overlap the state byte at +0x15E, since
+    // the function sets that byte to 1 immediately before reloading it. Predict the overlap
+    // rather than asserting it never happens, and report what gets skipped -- a divergence
+    // figure with an invisible skip count reads as "verified" when nothing was compared.
+    const uint32_t state_ea = player + kPlayerState;
+    const bool overlaps_state = state_ea >= source && state_ea <= source + 4;
+    if (source == 0 || overlaps_state) {
+      const uint64_t skipped =
+          g_event_play_unverifiable.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (skipped == 1 || skipped == 16 || skipped == 256 || (skipped % 1024) == 0) {
+        REXLOG_INFO("skate3-audio-shadow: EVENT_PLAY not comparable on {} calls so far "
+                    "(null source, or a source pointer overlapping the state byte)", skipped);
+      }
+      __imp__sub_82B28B78(ctx, base);
+      return;
+    }
+    // EVENT_PLAY fires once per stream start, so a boot that plays one frontend movie
+    // yields exactly one comparison. Record which input that one call covered, rather than
+    // letting "zero divergence" stand for a distribution of one unnamed point.
+    static std::atomic<bool> s_logged_input{false};
+    bool expected = false;
+    if (s_logged_input.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+      const float format = BitsToFloat(REX_LOAD_U32(record + kRecordPlayFormat));
+      const float rate = BitsToFloat(REX_LOAD_U32(record + kRecordPlayRate));
+      const float channels = BitsToFloat(REX_LOAD_U32(record + kRecordPlayChannels));
+      REXLOG_INFO("skate3-audio-shadow: EVENT_PLAY input player={:08X} source={:08X} "
+                  "format={} -> {} rate={} channels={} -> {}",
+                  player, source, double(format), unsigned(TruncatedLowByte(format)),
+                  double(rate), double(channels), unsigned(TruncatedLowByte(channels)));
+    }
+    ShadowWindow windows[2] = {{player + kPlayerDecoder, kPlayerPlaySpan}, {source, 5}};
+    skate3::audio::ShadowCompare(ctx, base, NativeEventPlay, __imp__sub_82B28B78,
+                                 {windows, 2}, skate3::audio::kReturnR3, g_event_play_stats);
+    return;
+  }
+  if (UseNative()) {
+    static std::atomic<uint64_t> native_runs{0};
+    const uint64_t runs = native_runs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (runs == 1 || runs == 16 || runs == 256 || runs == 1024) {
+      REXLOG_INFO("skate3-audio-native: EVENT_PLAY native runs={}", runs);
+    }
+    NativeEventPlay(ctx, base);
+    return;
+  }
+  __imp__sub_82B28B78(ctx, base);
 }
