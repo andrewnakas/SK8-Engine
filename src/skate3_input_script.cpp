@@ -106,6 +106,15 @@ std::atomic<uint64_t> g_input_polls{0};
 
 // Wipeout observation, updated from guest threads with integer work only.
 constexpr int64_t kWipeoutGapMs = 1500;
+// IsWipeoutRequested's own inputs, read off the skater-animation interface it is polled on.
+// Offsets from the lifted body of sub_82DB9100 (generated/skate3_recomp.92.cpp:4994).
+constexpr uint32_t kInterfaceCondition = 1876;  // object the +1876 predicate runs on
+constexpr uint32_t kInterfacePhysics = 1804;    // object carrying the physics flag word
+constexpr uint32_t kPhysicsFlags = 2480;
+constexpr uint32_t kPhysicsWipeoutBit = 0x8;    // bit 3: the physics world's own request
+// Guest object band, the same one the tracer narrowed to after stack-band reads crashed it.
+constexpr uint32_t kGuestObjectLow = 0x40000000;
+constexpr uint32_t kGuestObjectHigh = 0x60000000;
 std::atomic<uint64_t> g_wipeout_polls{0};
 std::atomic<uint64_t> g_wipeout_true_polls{0};
 std::atomic<uint64_t> g_wipeout_events{0};
@@ -120,6 +129,12 @@ constexpr size_t kMaxWipeoutPlayers = 8;
 std::atomic<uint32_t> g_wipeout_player[kMaxWipeoutPlayers]{};
 std::atomic<uint64_t> g_wipeout_player_events[kMaxWipeoutPlayers]{};
 std::atomic<uint32_t> g_last_wipeout_object{0};
+// Attribution of the most recent wipeout event: 0 unknown, 1 physics bit 3, 2 the +1876
+// predicate by elimination.
+std::atomic<uint32_t> g_last_wipeout_path{0};
+std::atomic<uint32_t> g_last_wipeout_flags{0};
+std::atomic<uint32_t> g_last_wipeout_physics{0};
+std::atomic<uint32_t> g_last_wipeout_condition{0};
 
 void RecordWipeoutPlayer(uint32_t object) {
   g_last_wipeout_object.store(object, std::memory_order_relaxed);
@@ -285,6 +300,47 @@ void CaptureFrame(const std::string& dir, const std::string& name, int64_t t) {
 // "does the game keep deciding to put this skater down, and on what beat" - so it prints the
 // interval between events, and a heartbeat when there are none, because an empty log would
 // otherwise read the same as a hook that never ran.
+const char* WipeoutPathName(uint32_t path) {
+  switch (path) {
+    case 1: return "the physics flag (bit 3 at +1804/+2480)";
+    case 2: return "the +1876 predicate (by elimination)";
+    default: return "unknown (interface not readable)";
+  }
+}
+
+/**
+ * Which of IsWipeoutRequested's two conditions fired. From the lifted sub_82DB9100:
+ *
+ *   if (sub_82DB9188(this))                         return 0;   // a guard, not a trigger
+ *   if (sub_82D91098(*(this + 1876)))               return 1;
+ *   return (*(*(this + 1804) + 2480) & 0x8) != 0;
+ *
+ * A true result means the guard was false and at least one condition held. Bit 3 is readable
+ * without calling anything, so read it; if it is clear, the +1876 predicate is what fired, by
+ * elimination. Sampled immediately after the poll, on the polling thread: the poll writes
+ * nothing, so this is the state the function itself saw.
+ *
+ * Attribution stays 0 rather than guessing when the interface is not readable -- a flags word
+ * that defaulted to 0 would otherwise read as "the predicate fired", which is the kind of
+ * silent wrong answer this project has paid for before.
+ */
+void RecordWipeoutAttribution(uint8_t* base, uint32_t player) {
+  uint32_t physics = 0;
+  uint32_t flags = 0;
+  uint32_t path = 0;
+  if (player >= kGuestObjectLow && player < kGuestObjectHigh) {
+    g_last_wipeout_condition.store(REX_LOAD_U32(player + kInterfaceCondition), std::memory_order_relaxed);
+    physics = REX_LOAD_U32(player + kInterfacePhysics);
+    if (physics >= kGuestObjectLow && physics < kGuestObjectHigh) {
+      flags = REX_LOAD_U32(physics + kPhysicsFlags);
+      path = (flags & kPhysicsWipeoutBit) != 0 ? 1u : 2u;
+    }
+  }
+  g_last_wipeout_physics.store(physics, std::memory_order_relaxed);
+  g_last_wipeout_flags.store(flags, std::memory_order_relaxed);
+  g_last_wipeout_path.store(path, std::memory_order_relaxed);
+}
+
 void WipeoutLogMain() {
   const int64_t start = NowMs();
   REXLOG_INFO("wipeout log: armed (IsWipeoutRequested, all physical players)");
@@ -298,11 +354,17 @@ void WipeoutLogMain() {
     if (events != logged) {
       logged = events;
       const uint32_t player = g_last_wipeout_object.load(std::memory_order_relaxed);
+      const char* path = WipeoutPathName(g_last_wipeout_path.load(std::memory_order_relaxed));
+      const uint32_t physics = g_last_wipeout_physics.load(std::memory_order_relaxed);
+      const uint32_t flags = g_last_wipeout_flags.load(std::memory_order_relaxed);
       if (previous_ms < 0) {
-        REXLOG_INFO("wipeout log: #{} at {} ms, player {:08X} (first)", events, now, player);
+        REXLOG_INFO("wipeout log: #{} at {} ms, player {:08X} (first), fired via {} "
+                    "[physics {:08X} flags {:08X}]",
+                    events, now, player, path, physics, flags);
       } else {
-        REXLOG_INFO("wipeout log: #{} at {} ms, player {:08X}, +{} ms since the previous",
-                    events, now, player, now - previous_ms);
+        REXLOG_INFO("wipeout log: #{} at {} ms, player {:08X}, +{} ms since the previous, "
+                    "fired via {} [physics {:08X} flags {:08X}]",
+                    events, now, player, now - previous_ms, path, physics, flags);
       }
       previous_ms = now;
     }
@@ -489,6 +551,7 @@ extern "C" REX_FUNC(sub_82DB9100) {
   const int64_t previous = g_last_wipeout_true_ms.exchange(now, std::memory_order_relaxed);
   if (now - previous >= kWipeoutGapMs) {
     RecordWipeoutPlayer(player);
+    RecordWipeoutAttribution(base, player);
     g_wipeout_events.fetch_add(1, std::memory_order_relaxed);
   }
 }
