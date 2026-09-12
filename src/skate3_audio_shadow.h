@@ -81,8 +81,22 @@ struct ShadowStats {
  * log, so a clean session leaves positive evidence rather than an absence of errors.
  */
 bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lifted,
-                   std::span<const ShadowWindow> windows, uint32_t returns,
+                   std::span<const ShadowWindow> windows,
+                   std::span<const ShadowWindow> inputs, uint32_t returns,
                    ShadowStats& stats);
+
+/// Why `inputs` exists, separately from `windows`.
+///
+/// `windows` is a specification of what a function **writes**: the harness snapshots them,
+/// rewinds them and compares them. It is not a specification of what a function **reads**. A
+/// consumer reads its command record to find the player; the producer reads the system pointer
+/// and the ring base; `EVENT_PLAY` reads the source pointer. None of those are written, so none
+/// appear in `windows`.
+///
+/// That distinction is invisible until someone replays a recorded vector outside the game, at
+/// which point every vector fails on its first read rather than on a comparison. `inputs` is
+/// the read set, recorded into the vector dump so the replay can reconstruct the memory the
+/// function actually saw. Nothing else uses it: it is not snapshotted, rewound or compared.
 
 /// Whether shadow comparison is armed (cvar-backed, read once).
 bool ShadowEnabled();

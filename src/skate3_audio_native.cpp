@@ -606,8 +606,9 @@ extern "C" REX_FUNC(sub_82B28C18) {
       __imp__sub_82B28C18(ctx, base);
       return;
     }
+    const ShadowWindow stop_inputs[2] = {{record, kSubmitRecordSize}, {player + kPlayerDecoder, 4}};
     skate3::audio::ShadowCompare(ctx, base, NativeEventStop, __imp__sub_82B28C18,
-                                 {windows, count}, skate3::audio::kReturnR3,
+                                 {windows, count}, {stop_inputs, 2}, skate3::audio::kReturnR3,
                                  g_event_stop_stats);
     return;
   }
@@ -632,8 +633,9 @@ extern "C" REX_FUNC(sub_82B28CC0) {
     if (head != 0) {
       windows[count++] = {tail + kPacketNext, 4};
     }
+    const ShadowWindow submit_inputs[1] = {{record, kSubmitRecordSize}};
     skate3::audio::ShadowCompare(ctx, base, NativeEventSubmit, __imp__sub_82B28CC0,
-                                 {windows, count}, skate3::audio::kReturnR3,
+                                 {windows, count}, {submit_inputs, 1}, skate3::audio::kReturnR3,
                                  g_event_submit_stats);
     return;
   }
@@ -688,8 +690,11 @@ extern "C" REX_FUNC(sub_82B28B78) {
                   double(rate), double(channels), unsigned(TruncatedLowByte(channels)));
     }
     ShadowWindow windows[2] = {{player + kPlayerDecoder, kPlayerPlaySpan}, {source, 5}};
+    const ShadowWindow play_inputs[2] = {{record, kPlayRecordSize},
+                                        {player + kPlayerSource, 4}};
     skate3::audio::ShadowCompare(ctx, base, NativeEventPlay, __imp__sub_82B28B78,
-                                 {windows, 2}, skate3::audio::kReturnR3, g_event_play_stats);
+                                 {windows, 2}, {play_inputs, 2}, skate3::audio::kReturnR3,
+                                 g_event_play_stats);
     return;
   }
   if (UseNative()) {
@@ -733,9 +738,21 @@ extern "C" REX_FUNC(sub_82B28A00) {
       // The fourth path writes the caller's params, not the queue.
       windows[count++] = {ctx.r5.u32 + kParamsSentinel, 8};
     }
+    ShadowWindow enq_inputs[5];
+    size_t in_count = 0;
+    enq_inputs[in_count++] = {player + kSystemQueue, 4};
+    enq_inputs[in_count++] = {ctx.r5.u32, 0x18};
+    if (selector <= 2) {
+      const uint32_t sys = REX_LOAD_U32(player + kSystemQueue);
+      enq_inputs[in_count++] = {sys + kQueueBuffer, 4};
+      enq_inputs[in_count++] = {sys + kQueueWriteOffset, 4};
+    } else {
+      enq_inputs[in_count++] = {player + kPlayerPacketHead, 4};
+      enq_inputs[in_count++] = {player + kPlayerVoiceTable, kVoiceTableEntries * kVoiceTableStride};
+    }
     skate3::audio::ShadowCompare(ctx, base, NativeCommandEnqueue, __imp__sub_82B28A00,
-                                 {windows, count}, skate3::audio::kReturnNone,
-                                 g_command_enqueue_stats);
+                                 {windows, count}, {enq_inputs, in_count},
+                                 skate3::audio::kReturnNone, g_command_enqueue_stats);
     return;
   }
   if (UseNative()) {
@@ -774,8 +791,10 @@ extern "C" REX_FUNC(sub_82B48B28) {
       if (next != 0) windows[count++] = {next + kNodePrev, 4};
       if (head != 0) windows[count++] = {head + kNodePrev, 4};
     }
+    const ShadowWindow requeue_inputs[2] = {{element, 24}, {scheduler, 4}};
     skate3::audio::ShadowCompare(ctx, base, NativeSchedulerRequeue, __imp__sub_82B48B28,
-                                 {windows, count}, skate3::audio::kReturnNone, g_requeue_stats);
+                                 {windows, count}, {requeue_inputs, 2},
+                                 skate3::audio::kReturnNone, g_requeue_stats);
     return;
   }
   if (UseNative()) {
@@ -849,7 +868,7 @@ extern "C" REX_FUNC(sub_82B7F828) {
     if (ctx.r6.u32 != 0) windows[count++] = {ctx.r6.u32, first_len};
     if (ctx.r4.u32 != 0) windows[count++] = {ctx.r4.u32, second_len};
     skate3::audio::ShadowCompare(ctx, base, NativeBufferPairInit, __imp__sub_82B7F828,
-                                 {windows, count}, skate3::audio::kReturnR3, g_bufpair_stats);
+                                 {windows, count}, {}, skate3::audio::kReturnR3, g_bufpair_stats);
     return;
   }
   if (UseNative()) {

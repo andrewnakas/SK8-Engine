@@ -29,6 +29,21 @@ REXCVAR_DEFINE_UINT32(
     skate3_audio_shadow_reports, 16, "Skate 3",
     "How many divergences to report per function before going quiet.");
 
+REXCVAR_DEFINE_STRING(
+    skate3_audio_vectors_path, "", "Skate 3",
+    "Record every shadow comparison as a replayable vector to this path.\n"
+    "\n"
+    "Phase 4 tier 1 needs identical inputs fed to the verified C++ and to the Rust port. The "
+    "harness already brackets every call, so rather than generating synthetic vectors this "
+    "dumps the real ones: the entry registers, the watched windows, their bytes on entry, and "
+    "the bytes the ORIGINAL lifted body produced. The Rust port is then replayed against them "
+    "offline. Real inputs, because synthetic tests have never caught a format bug in this "
+    "project and real data has caught every one.");
+
+REXCVAR_DEFINE_INT32(
+    skate3_audio_vectors_max, 4096, "Skate 3",
+    "Stop recording shadow vectors after this many, so a session cannot fill the disk.");
+
 namespace skate3::audio {
 namespace {
 
@@ -139,8 +154,88 @@ bool ShadowEnabled() {
   return armed;
 }
 
+namespace {
+
+// Vector recording for Phase 4. One line per comparison, hex, self-describing:
+//
+//   name  run  r3 r4 r5 r6 r7  ret_r3  nwin  addr:len:entry:lifted ...
+//
+// Only r3-r7 and the returned r3 are recorded, not the whole PPCContext: it carries 128 vector
+// registers, and the functions these vectors cover take their arguments in r3-r7. A port that
+// needs more than that is a port this file should not be feeding.
+std::mutex g_vector_mutex;
+std::FILE* g_vector_file = nullptr;
+bool g_vector_tried = false;
+uint64_t g_vector_count = 0;
+
+void HexBytes(std::FILE* out, const uint8_t* data, uint32_t len) {
+  for (uint32_t i = 0; i < len; i++) {
+    std::fprintf(out, "%02X", data[i]);
+  }
+}
+
+void RecordVector(const char* name, const PPCContext& entry, const PPCContext& after,
+                  std::span<const ShadowWindow> windows, std::span<const ShadowWindow> inputs,
+                  const uint8_t* base, const std::vector<uint8_t>& mem_entry,
+                  const std::vector<uint8_t>& mem_lifted, uint64_t run) {
+  std::lock_guard<std::mutex> lock(g_vector_mutex);
+  if (!g_vector_tried) {
+    g_vector_tried = true;
+    const std::string path = REXCVAR_GET(skate3_audio_vectors_path);
+    if (!path.empty()) {
+      g_vector_file = std::fopen(path.c_str(), "w");
+      if (g_vector_file == nullptr) {
+        REXLOG_ERROR("skate3-audio-shadow: cannot write vectors to '{}'", path);
+      } else {
+        std::fprintf(g_vector_file,
+                     "# skate3 shadow vectors: name run r3 r4 r5 r6 r7 ret_r3 then spans.\n"
+                     "# I:addr:len:bytes      = read set, the memory the function saw\n"
+                     "# W:addr:len:entry:exp  = write set, entry bytes and what the ORIGINAL "
+                     "produced\n");
+        REXLOG_INFO("skate3-audio-shadow: recording vectors to '{}' (cap {})", path,
+                    REXCVAR_GET(skate3_audio_vectors_max));
+      }
+    }
+  }
+  if (g_vector_file == nullptr) {
+    return;
+  }
+  if (g_vector_count >= static_cast<uint64_t>(REXCVAR_GET(skate3_audio_vectors_max))) {
+    if (g_vector_count == static_cast<uint64_t>(REXCVAR_GET(skate3_audio_vectors_max))) {
+      g_vector_count++;
+      REXLOG_INFO("skate3-audio-shadow: vector cap reached, stopping at {}", g_vector_count - 1);
+      std::fflush(g_vector_file);
+    }
+    return;
+  }
+  g_vector_count++;
+
+  std::fprintf(g_vector_file, "%s\t%llu\t%08X\t%08X\t%08X\t%08X\t%08X\t%08X", name,
+               static_cast<unsigned long long>(run), entry.r3.u32, entry.r4.u32, entry.r5.u32,
+               entry.r6.u32, entry.r7.u32, after.r3.u32);
+  // The read set first, taken from memory as it stands now: these spans are not written by the
+  // function, so their entry bytes are still intact after the lifted body ran.
+  for (const ShadowWindow& w : inputs) {
+    std::fprintf(g_vector_file, "\tI:%08X:%u:", w.addr, w.len);
+    HexBytes(g_vector_file, base + w.addr, w.len);
+  }
+  size_t off = 0;
+  for (const ShadowWindow& w : windows) {
+    std::fprintf(g_vector_file, "\tW:%08X:%u:", w.addr, w.len);
+    HexBytes(g_vector_file, mem_entry.data() + off, w.len);
+    std::fputc(':', g_vector_file);
+    HexBytes(g_vector_file, mem_lifted.data() + off, w.len);
+    off += w.len;
+  }
+  std::fputc('\n', g_vector_file);
+  std::fflush(g_vector_file);  // per line: a killed session keeps whole records
+}
+
+}  // namespace
+
 bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lifted,
-                   std::span<const ShadowWindow> windows, uint32_t returns,
+                   std::span<const ShadowWindow> windows,
+                   std::span<const ShadowWindow> inputs, uint32_t returns,
                    ShadowStats& stats) {
   static const uint64_t report_cap = REXCVAR_GET(skate3_audio_shadow_reports);
   EnsureReporter();
@@ -178,6 +273,9 @@ bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lif
     std::memcpy(mem_lifted.data() + off, base + w.addr, w.len);
     off += w.len;
   }
+
+  RecordVector(stats.name, entry, after_lifted, windows, inputs, base, mem_entry, mem_lifted,
+               stats.runs.load(std::memory_order_relaxed) + 1);
 
   // 2. Rewind memory, last window first so overlapping windows end at their entry bytes.
   off = total;
