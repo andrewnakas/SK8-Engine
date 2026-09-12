@@ -75,6 +75,45 @@ constexpr uint32_t kPlayerPlaySpan = 0x161 - kPlayerDecoder;
 
 // Size EVENT_PLAY reports back to the drain, which advances by this.
 constexpr uint32_t kPlayRecordSize = 20;
+constexpr uint32_t kStopRecordSize = 8;
+
+// The command queue the producer appends to, reached from the System object in r3.
+constexpr uint32_t kSystemQueue = 8;         // System -> queue object
+constexpr uint32_t kQueueBuffer = 48;        // queue -> record buffer base
+constexpr uint32_t kQueueWriteOffset = 204;  // queue -> write offset; published FIRST
+
+// The params struct the producer reads its payload out of. Source stride is 8, destination
+// stride 4, so these are not the same offsets as the record's.
+constexpr uint32_t kParamsFirst = 4;
+constexpr uint32_t kParamsSecond = 12;
+constexpr uint32_t kParamsThird = 20;
+constexpr uint32_t kParamsSentinel = 8;   // the fourth path writes here
+constexpr uint32_t kParamsConstant = 12;  // ...and here
+
+// The fourth path scans the player's own 20-entry table rather than appending.
+constexpr uint32_t kPlayerVoiceTable = 0x54;
+constexpr uint32_t kVoiceTableEntries = 20;
+constexpr uint32_t kVoiceTableStride = 12;
+constexpr uint32_t kVoiceDiscriminator = 9;  // entry+9, i.e. +0x5D for entry 0
+
+// Handler addresses, derived the way the original derives them (lis then addi) so that a
+// misread of the lifted body fails the build instead of shipping quietly. The expected
+// values come from the three consumers, read independently of this function.
+constexpr uint32_t kHandlerBase = static_cast<uint32_t>(-2102198272);
+constexpr uint32_t kHandlerPlay = kHandlerBase + static_cast<uint32_t>(-29832);
+constexpr uint32_t kHandlerStop = kHandlerBase + static_cast<uint32_t>(-29672);
+constexpr uint32_t kHandlerSubmit = kHandlerBase + static_cast<uint32_t>(-29504);
+static_assert(kHandlerPlay == 0x82B28B78u, "selector 0 must dispatch to EVENT_PLAY");
+static_assert(kHandlerStop == 0x82B28C18u, "selector 1 must dispatch to EVENT_STOP");
+static_assert(kHandlerSubmit == 0x82B28CC0u, "selector 2 must dispatch to EVENT_SUBMIT");
+
+// The fourth path's two .rdata floats, and the NaN payload it marks the params with.
+constexpr uint32_t kVoiceLiveConstant = static_cast<uint32_t>(-2112487424) + 23056u;
+constexpr uint32_t kVoiceGoneConstant =
+    static_cast<uint32_t>(-2110652416) + static_cast<uint32_t>(-22460);
+static_assert(kVoiceLiveConstant == 0x82165A10u, "live constant address");
+static_assert(kVoiceGoneConstant == 0x8231A844u, "gone constant address");
+constexpr uint32_t kInvalidSentinel = 0x7FF7FFF1u;  // lis 32759; ori 65521
 
 bool UseNative() {
   static const bool on = REXCVAR_GET(skate3_audio_native);
@@ -247,11 +286,101 @@ void NativeEventPlay(PPCContext& __restrict ctx, uint8_t* base) {
   ctx.r3.u64 = kPlayRecordSize;
 }
 
+/**
+ * `lfs` then `stfs`: float -> double -> float. Lossless except that it quiets a signalling
+ * NaN, so it is reproduced rather than copied as a word.
+ */
+uint32_t RoundTripFloatBits(uint32_t bits) {
+  const float narrowed = static_cast<float>(static_cast<double>(BitsToFloat(bits)));
+  uint32_t out;
+  std::memcpy(&out, &narrowed, sizeof(out));
+  return out;
+}
+
+/**
+ * The command queue producer (sub_82B28A00), a leaf: four paths, no calls at all.
+ *
+ * Selectors 0/1/2 append a record whose first word is the consumer's own address and whose
+ * length the consumer implies -- 20 bytes for EVENT_PLAY, 8 for EVENT_STOP, 12 for
+ * EVENT_SUBMIT. Those sizes and handlers match the three consumers read independently.
+ *
+ * The write offset at +204 is published BEFORE the handler and payload are stored. That is
+ * bug 1 (`docs/command-queue.md`): a consumer seeing the advanced offset cannot know the
+ * record's length, because the length is implied by a handler written afterwards, so one
+ * torn append desynchronises the rest of the queue rather than corrupting one record.
+ * Reproduced exactly, store order included. Fixing it here would diverge from the original
+ * by construction, which is the one thing the harness cannot tell apart from a porting bug;
+ * the fix lands as its own change once this body is verified.
+ *
+ * Any other selector does not touch the queue. It asks whether the packet at params+4 is
+ * still live -- walking the submitted-packet FIFO at +0x148 through next at +0xC, the same
+ * list EVENT_STOP unlinks, then the 20-entry table at +0x54 -- and writes a constant plus
+ * the NaN payload 0x7FF7FFF1 into the caller's params instead. A table hit only counts as
+ * live when its discriminator byte is not 2.
+ */
+void NativeCommandEnqueue(PPCContext& __restrict ctx, uint8_t* base) {
+  const uint32_t player = ctx.r3.u32;
+  const uint32_t selector = ctx.r4.u32;
+  const uint32_t params = ctx.r5.u32;
+
+  if (selector <= 2) {
+    const uint32_t queue = REX_LOAD_U32(player + kSystemQueue);
+    const uint32_t offset = REX_LOAD_U32(queue + kQueueWriteOffset);
+    const uint32_t record = REX_LOAD_U32(queue + kQueueBuffer) + offset;
+    const uint32_t size =
+        selector == 0 ? kPlayRecordSize : (selector == 1 ? kStopRecordSize : kSubmitRecordSize);
+    const uint32_t handler =
+        selector == 0 ? kHandlerPlay : (selector == 1 ? kHandlerStop : kHandlerSubmit);
+
+    REX_STORE_U32(queue + kQueueWriteOffset, offset + size);
+    REX_STORE_U32(record, handler);
+    REX_STORE_U32(record + kRecordPlayer, player);
+    if (selector == 0) {
+      REX_STORE_U32(record + kRecordPlayFormat,
+                    RoundTripFloatBits(REX_LOAD_U32(params + kParamsFirst)));
+      REX_STORE_U32(record + kRecordPlayRate,
+                    RoundTripFloatBits(REX_LOAD_U32(params + kParamsSecond)));
+      REX_STORE_U32(record + kRecordPlayChannels,
+                    RoundTripFloatBits(REX_LOAD_U32(params + kParamsThird)));
+    } else if (selector == 2) {
+      REX_STORE_U32(record + kRecordPacket, REX_LOAD_U32(params + kParamsFirst));
+    }
+    return;
+  }
+
+  const uint32_t wanted = REX_LOAD_U32(params + kParamsFirst);
+  bool live = false;
+  for (uint32_t node = REX_LOAD_U32(player + kPlayerPacketHead); node != 0;
+       node = REX_LOAD_U32(node + kPacketNext)) {
+    if (node == wanted) {
+      live = true;
+      break;
+    }
+  }
+  if (!live) {
+    for (uint32_t i = 0; i < kVoiceTableEntries; i++) {
+      const uint32_t entry = player + kPlayerVoiceTable + i * kVoiceTableStride;
+      if (REX_LOAD_U32(entry) == wanted) {
+        live = REX_LOAD_U8(entry + kVoiceDiscriminator) != 2;
+        break;
+      }
+    }
+  }
+  REX_STORE_U32(params + kParamsConstant,
+                RoundTripFloatBits(REX_LOAD_U32(live ? kVoiceLiveConstant : kVoiceGoneConstant)));
+  REX_STORE_U32(params + kParamsSentinel, kInvalidSentinel);
+}
+
 skate3::audio::ShadowStats g_event_submit_stats{"EVENT_SUBMIT"};
 skate3::audio::ShadowStats g_event_stop_stats{"EVENT_STOP"};
 std::atomic<uint64_t> g_event_stop_unverifiable{0};
 skate3::audio::ShadowStats g_event_play_stats{"EVENT_PLAY"};
 std::atomic<uint64_t> g_event_play_unverifiable{0};
+skate3::audio::ShadowStats g_command_enqueue_stats{"ENQUEUE"};
+// Calls per selector: 0 play, 1 stop, 2 submit, 3 the query path. A single total hides
+// which paths were actually exercised, and three of the four are appends while the fourth
+// mutates caller state instead -- so the split is part of the result, not a detail.
+std::atomic<uint64_t> g_enqueue_selector[4]{};
 
 }  // namespace
 
@@ -379,4 +508,50 @@ extern "C" REX_FUNC(sub_82B28B78) {
     return;
   }
   __imp__sub_82B28B78(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82B28A00) {
+  if (skate3::audio::ShadowEnabled()) {
+    // A leaf on every path, so unlike EVENT_STOP and EVENT_PLAY there is nothing here the
+    // harness cannot replay: no skip counter, and the divergence figure covers every call.
+    const uint32_t player = ctx.r3.u32;
+    const uint32_t selector = ctx.r4.u32;
+    g_enqueue_selector[selector <= 2 ? selector : 3].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<uint64_t> seen{0};
+    const uint64_t n = seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || (n % 2048) == 0) {
+      REXLOG_INFO("skate3-audio-shadow: ENQUEUE selectors play={} stop={} submit={} query={}",
+                  g_enqueue_selector[0].load(std::memory_order_relaxed),
+                  g_enqueue_selector[1].load(std::memory_order_relaxed),
+                  g_enqueue_selector[2].load(std::memory_order_relaxed),
+                  g_enqueue_selector[3].load(std::memory_order_relaxed));
+    }
+    ShadowWindow windows[2];
+    size_t count = 0;
+    if (selector <= 2) {
+      const uint32_t queue = REX_LOAD_U32(player + kSystemQueue);
+      const uint32_t offset = REX_LOAD_U32(queue + kQueueWriteOffset);
+      const uint32_t size =
+          selector == 0 ? kPlayRecordSize : (selector == 1 ? kStopRecordSize : kSubmitRecordSize);
+      windows[count++] = {queue + kQueueWriteOffset, 4};
+      windows[count++] = {REX_LOAD_U32(queue + kQueueBuffer) + offset, size};
+    } else {
+      // The fourth path writes the caller's params, not the queue.
+      windows[count++] = {ctx.r5.u32 + kParamsSentinel, 8};
+    }
+    skate3::audio::ShadowCompare(ctx, base, NativeCommandEnqueue, __imp__sub_82B28A00,
+                                 {windows, count}, skate3::audio::kReturnNone,
+                                 g_command_enqueue_stats);
+    return;
+  }
+  if (UseNative()) {
+    static std::atomic<uint64_t> native_runs{0};
+    const uint64_t runs = native_runs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (runs == 1 || runs == 16 || runs == 256 || runs == 1024) {
+      REXLOG_INFO("skate3-audio-native: ENQUEUE native runs={}", runs);
+    }
+    NativeCommandEnqueue(ctx, base);
+    return;
+  }
+  __imp__sub_82B28A00(ctx, base);
 }
