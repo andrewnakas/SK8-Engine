@@ -26,6 +26,17 @@
 #include "skate3_audio_shadow.h"
 
 REXCVAR_DEFINE_BOOL(
+    skate3_audio_buffer_size_guard, true, "Skate 3",
+    "Clamp a negative buffer length to zero before rwaudio_InitBufferPair uses it.\n"
+    "\n"
+    "Bug 3 (docs/buffer-size-bug.md): sub_82B7F8A8 validates the two descriptor STATUS words "
+    "for non-negativity but validates the two sizes only as an unsigned SUM, so one negative "
+    "size masked by a positive one reaches memset(buf, 0, -12) -- 0xFFFFFFF4 as a size_t, the "
+    "reported 4 GB walk. The upstream fix belongs in that caller, which the shadow harness "
+    "cannot bracket, so this guards the point of damage instead. It sits before the hook "
+    "dispatches, so normal calls stay bit-identical and shadow verification remains valid.");
+
+REXCVAR_DEFINE_BOOL(
     skate3_audio_native, false, "Skate 3",
     "Use the native audio implementations instead of the recompiled originals.\n"
     "\n"
@@ -137,6 +148,48 @@ constexpr uint32_t kPairSpan = 40;
 // (400,256), so this is ~50x observed -- but the guard exists because the maxima describe the
 // calls seen, not the function's range, and an uncovered native write is never rewound.
 constexpr uint32_t kPairWatchCap = 32 * 1024;
+
+bool BufferSizeGuardEnabled() {
+  static const bool on = REXCVAR_GET(skate3_audio_buffer_size_guard);
+  return on;
+}
+
+std::atomic<uint64_t> g_bufpair_negative{0};
+
+/**
+ * Bug 3's guard, applied to the incoming registers before any body runs.
+ *
+ * A negative length here means sub_82B7F8A8's sum check let one through: it tests the two
+ * descriptor status words for non-negativity and the two sizes only as an unsigned sum, so
+ * sizeA = -12 with sizeB = 1000 sums to 988 and passes. The fill would then be
+ * memset(buf, 0, 0xFFFFFFF4).
+ *
+ * Clamping before the dispatch keeps every mode consistent: the original and the native body
+ * see the same inputs and still agree, so this does not invalidate the comparison, and the
+ * length recorded in the object becomes 0 rather than a claim about a buffer that was never
+ * zeroed. That is weaker than validating upstream -- the caller still believes it received a
+ * buffer -- and it is what is reachable in a function the harness can actually check.
+ */
+void GuardBufferLengths(PPCContext& __restrict ctx) {
+  if (!BufferSizeGuardEnabled()) {
+    return;
+  }
+  const int32_t first = static_cast<int32_t>(ctx.r7.u32);
+  const int32_t second = static_cast<int32_t>(ctx.r5.u32);
+  if (first >= 0 && second >= 0) {
+    return;
+  }
+  const uint64_t n = g_bufpair_negative.fetch_add(1, std::memory_order_relaxed) + 1;
+  REXLOG_WARN("skate3-audio: bug 3 fired - negative buffer length ({}, {}) clamped to zero "
+              "(occurrence {}); sub_82B7F8A8's sum check passed a negative size",
+              first, second, n);
+  if (first < 0) {
+    ctx.r7.u64 = 0;
+  }
+  if (second < 0) {
+    ctx.r5.u64 = 0;
+  }
+}
 
 bool UseNative() {
   static const bool on = REXCVAR_GET(skate3_audio_native);
@@ -750,6 +803,7 @@ extern "C" REX_FUNC(sub_82B48B28) {
  * hook answers it with numbers. It runs the original and records, nothing else.
  */
 extern "C" REX_FUNC(sub_82B7F828) {
+  GuardBufferLengths(ctx);  // bug 3: before anything reads the lengths, in every mode
   if (skate3::audio::ShadowEnabled()) {
     const uint32_t first_len = ctx.r7.u32;
     const uint32_t second_len = ctx.r5.u32;
