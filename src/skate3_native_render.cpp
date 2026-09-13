@@ -8,6 +8,7 @@
 #include "native/skate3_native_palette.h"
 #include "skate3_crash_report.h"
 #include "skate3_image_watch.h"
+#include "skate3_alloc_counter.h"
 #include "skate3_native_scene.h"
 
 #include "generated/skate3_init.h"
@@ -566,6 +567,12 @@ void ReportPacing() {
 }
 
 void OnFrameEnd(uint8_t* base) {
+  // Everything this thread allocates outside BuildFrameScene is the GAME's own
+  // per-frame code, and it was landing in kOther with nothing to say about it.
+  // Set here because this is the one function guaranteed to run on the guest
+  // render thread every frame; one thread-local byte store.
+  skate3::alloc_counter::SetThreadDefaultPhase(
+      skate3::alloc_counter::Phase::kGuestThread);
   PaceGuestFrame();
   ReportPacing();
   // EMULATED-mode guest frame breakdown (emulated gameplay once regressed

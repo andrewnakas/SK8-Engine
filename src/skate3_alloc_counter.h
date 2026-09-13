@@ -23,8 +23,21 @@ enum class Phase : uint8_t {
   kRenderScene,  // RenderScene, on the command processor
   kDecode,       // mesh/texture decode
   kTwoD,         // 2D capture and replay
+  // The two below are THREAD DEFAULTS, not scopes: everything the guest render
+  // thread and the command processor allocate OUTSIDE the scopes above. That
+  // is the game's own per-frame code and the emulated pipeline around it, and
+  // between them they were 1,000 of the 1,400 allocations a frame that landed
+  // in kOther with nothing to say about them. Whatever is left in kOther after
+  // these is genuinely some other thread - audio, jobs, the VFS.
+  kGuestThread,       // guest render thread, outside BuildFrameScene
+  kCommandProcessor,  // command processor, outside RenderScene
   kCount,
 };
+
+// The phase this thread falls back to when no scope is active. Set once per
+// thread and never restored, so a ScopedPhase that ends returns here instead of
+// to kOther. Cheap enough to call every frame: one thread-local byte compare.
+void SetThreadDefaultPhase(Phase p);
 
 // Sets the calling thread's phase for its lifetime. Restores the previous one,
 // so scopes nest.

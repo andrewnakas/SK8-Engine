@@ -8023,7 +8023,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "tail={:.2f}/{:.2f}ms twod={:.2f}/{:.2f}ms "
         "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
         "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}] "
-        "alloc[{}/frame {}KB/frame live={} | build={} render={} decode={} 2d={} other={}]",
+        "alloc[{}/frame {}KB/frame live={} | build={} render={} decode={} 2d={} "
+        "guest={} cp={} other={}]",
         guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
         g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
         g_pw_build.MaxMs(), g_pw_b2d.AvgMs(), g_pw_b2d.MaxMs(), g_pw_bspl.AvgMs(),
@@ -8054,7 +8055,8 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         alloc_delta.allocs / interval, alloc_delta.bytes / interval / 1024,
         int64_t(alloc_now.allocs) - int64_t(alloc_now.frees),
         ph_delta[1] / interval, ph_delta[2] / interval, ph_delta[3] / interval,
-        ph_delta[4] / interval, ph_delta[0] / interval);
+        ph_delta[4] / interval, ph_delta[5] / interval, ph_delta[6] / interval,
+        ph_delta[0] / interval);
     // Deep per-item attribution (see the perf-items cvar): visibility-class
     // draw costs, completed-draw stage split, build-walk decomposition, and
     // the off-screen retention pass. Averages are per item (the windows Add
@@ -8518,6 +8520,11 @@ void AddGuestOcclSkipped(uint32_t n) {
 namespace {
 
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
+  // Same reason as the guest thread's: what the command processor allocates
+  // around the scene render is the emulated pipeline, and it was invisible.
+  // Set before the scope, so the scope restores to it rather than to kOther.
+  skate3::alloc_counter::SetThreadDefaultPhase(
+      skate3::alloc_counter::Phase::kCommandProcessor);
   const skate3::alloc_counter::ScopedPhase alloc_phase(
       skate3::alloc_counter::Phase::kRenderScene);
   if (!SceneEnabled() ||

@@ -34,6 +34,8 @@ std::atomic<uint64_t> g_phase_allocs[size_t(Phase::kCount)] = {};
 ScopedPhase::ScopedPhase(Phase p) : prev_(g_phase) { g_phase = uint8_t(p); }
 ScopedPhase::~ScopedPhase() { g_phase = prev_; }
 
+void SetThreadDefaultPhase(Phase p) { g_phase = uint8_t(p); }
+
 uint64_t PhaseAllocs(Phase p) {
   return g_phase_allocs[size_t(p)].load(std::memory_order_relaxed);
 }
