@@ -37,6 +37,16 @@ REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, false, "Skate 3",
                     "yet painting - it blocks there and the screen stays black, so it needs a "
                     "different insertion point before it can be on by default.");
 
+REXCVAR_DEFINE_BOOL(
+    skate3_match_guest_refresh_to_cap, true, "Skate 3",
+    "Report the guest display's refresh rate as whatever the frame rate is "
+    "capped to. This title advances ONE REPORTED REFRESH PERIOD of simulation "
+    "per rendered frame, so its speed is fps/refresh: tell it 60 Hz and only "
+    "deliver 30 and it runs at half speed, which is the slow motion. Matching "
+    "the two means a frame rate the console can actually hold plays at the "
+    "right speed, at the cost of it being a lower frame rate. Takes effect at "
+    "launch, because the title reads the video mode once at startup.");
+
 REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
                       "Which custom content pack in Documents to stage this launch, by folder "
                       "name. Empty stages the first by name. Only one is staged per launch: the "
@@ -136,6 +146,11 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam_capture_input);
 REXCVAR_DECLARE(std::string, skate3_install_iso);
 // Set when a custom map pack is staged; see ApplyContentPackWorkarounds.
 REXCVAR_DECLARE(uint32_t, license_mask);
+// The guest's simulation step is one reported refresh period per rendered
+// frame, so these three have to agree. See MatchGuestRefreshToFrameCap.
+REXCVAR_DECLARE(double, video_mode_refresh_rate);
+REXCVAR_DECLARE(double, skate3_guest_fps_cap);
+REXCVAR_DECLARE(bool, skate3_guest_fps_cap_auto);
 REXCVAR_DECLARE(std::string, vfs_path_alias);
 REXCVAR_DECLARE(std::string, skate3_install_tu);
 
@@ -1128,7 +1143,61 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         });
 }
 
+// Keep the reported guest refresh in step with the frame cap.
+//
+// This title takes ONE reported refresh period of simulation per rendered
+// frame - measured on hardware over four runs, felt speed has been fps/refresh
+// every time - so the two numbers are not independent. Telling it 60 Hz while
+// delivering 30 runs the game at half speed, and that is the slow motion:
+// there is no separate clock bug to find, and speeding the guest CLOCK up does
+// not help, because the step is derived from the refresh rather than measured.
+//
+// Matching them trades frame rate for correct speed: pick 30 and a console
+// that holds 30 plays at full speed. It cannot help where the frame rate falls
+// below the cap anyway - nothing can, short of making the frames cheaper.
+//
+// Must run before the guest starts: the title reads the video mode once.
+void MatchGuestRefreshToFrameCap() {
+  if (!REXCVAR_GET(skate3_match_guest_refresh_to_cap)) {
+    return;
+  }
+  // Auto-cap follows the host display, which is already the honest refresh.
+  if (REXCVAR_GET(skate3_guest_fps_cap_auto)) {
+    return;
+  }
+  const double cap = REXCVAR_GET(skate3_guest_fps_cap);
+  // Uncapped: there is no rate to match, and reporting a wrong one would make
+  // a fast machine run FAST rather than slow.
+  if (cap < 1.0) {
+    return;
+  }
+  // The kernel clamps what it reports to 24-240; outside that the two would
+  // silently disagree again, which is worse than not matching at all.
+  if (cap < 24.0 || cap > 240.0) {
+    REXLOG_WARN(
+        "Skate 3: frame cap {:.0f} is outside the 24-240 Hz the guest video "
+        "mode can report; leaving the refresh at {:.0f} (the game will run at "
+        "{:.0f}/{:.0f} speed at the cap)",
+        cap, REXCVAR_GET(video_mode_refresh_rate), cap,
+        REXCVAR_GET(video_mode_refresh_rate));
+    return;
+  }
+  const double current = REXCVAR_GET(video_mode_refresh_rate);
+  if (current == cap) {
+    return;
+  }
+  REXCVAR_SET(video_mode_refresh_rate, cap);
+  REXLOG_WARN(
+      "Skate 3: guest display reported as {:.0f} Hz to match the {:.0f} fps "
+      "cap (was {:.0f}). The title advances one refresh period per frame, so "
+      "this is what makes {:.0f} fps play at full speed rather than {:.0f}/60.",
+      cap, cap, current, cap, cap);
+}
+
 void Skate3BaseApp::OnPostSetup() {
+  // Before the guest runs, because the title reads the video mode once at
+  // startup and its simulation step comes straight out of it.
+  MatchGuestRefreshToFrameCap();
   // Arm the hang watchdog before the guest runs. The full reporter installs
   // from the guest's first D3D Swap, so a boot that never reaches one - the
   // freeze where the main thread is resumed and then simply never executes -
