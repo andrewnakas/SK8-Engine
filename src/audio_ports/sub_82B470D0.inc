@@ -133,7 +133,11 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   if (static_cast<uint64_t>(self) + kObjectBytes > 0xFFFFFFFFull) return false;
   spec.write(self, kObjectBytes);
   spec.read(self, kObjectBytes);  // +4 and +28 are read back by both record parsers
-  spec.read(stream, 2 * kHeaderBytes);
+  // Reads, for replay only. Both record parsers walk on past the header -- fixed records or four
+  // run-length streams -- for a length no entry state bounds, so a fixed summary is declared, the same
+  // 1 KB sub_82B474B8's own window builder uses.
+  const uint64_t summary_end = uint64_t(stream) + 1024;
+  spec.read(stream, uint32_t((summary_end > 0x100000000ull ? 0x100000000ull : summary_end) - stream));
   return true;
 }
 

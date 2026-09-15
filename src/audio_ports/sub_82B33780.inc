@@ -113,7 +113,12 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(object + kArray, 4);
   spec.read(slot + kSlotFlag, 12);  // +28, +32, +36 -- +36 is re-read after being written
   if (ctx.r6.s32 > 0 && ctx.r5.u32 != 0) {
-    spec.read(ctx.r5.u32, uint32_t(ctx.r6.u32) < 256u ? uint32_t(ctx.r6.u32) : 256u);
+    // For replay only. The length in r6 reaches the walkers as a TARGET, not a byte count, so the
+    // parser reads past it: 12 of 300 recorded calls ran off a length-sized read. A fixed 1 KB summary
+    // matches sub_82B470D0's own.
+    const uint64_t summary_end = uint64_t(ctx.r5.u32) + 1024;
+    spec.read(ctx.r5.u32,
+              uint32_t((summary_end > 0x100000000ull ? 0x100000000ull : summary_end) - ctx.r5.u32));
   }
 
   spec.write(slot + kSlotFlag, 12);      // +28, +32, +36

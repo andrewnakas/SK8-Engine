@@ -1,5 +1,5 @@
 // sub_82B376B8  role: the metering tick -- count off the interval at +380, and when it expires re-derive the ring length from the current rate, clear both history rings, then run the meters and re-expand the parameter blocks   lifted: skate3_recomp.67.cpp:62133 (171 lines)
-// STATUS: verified
+// STATUS: thin -- verified (zero divergence) but on too few calls for its size: 23 comparable calls in the weaker profile, 10112 in the stronger, against 171 lifted lines -- 23 calls in the weaker profile. Held out of default promotion by docs/promotion.md; shadows normally, never promoted.
 // calls/session: boot 23  play 10147  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B376B8.md
 namespace port_82B376B8 {
@@ -230,6 +230,21 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   const uint32_t format = REX_LOAD_U32(desc + kDescFormat);
   if (format == 0) return false;  // lfs f13,12(r11) through null; not comparable
   spec.read(desc + kDescChannels, 4);
+  // For replay only: sub_82B373C8's channel descriptor, +4 the base and +14 the stride.
+  const uint32_t channel_desc = REX_LOAD_U32(desc + kDescChannels);
+  if (channel_desc != 0) {
+    spec.read(channel_desc + 4, 12);
+    // ...the metered blocks, a quarter of which it loads, and its two rodata singles.
+    const uint32_t first_row = REX_LOAD_U32(channel_desc + 4);
+    const uint32_t row_step = uint32_t(REX_LOAD_U16(channel_desc + 14)) << 2;
+    const uint32_t metered = REX_LOAD_U8(object + kChannels);
+    for (uint32_t k = 0; k < metered && k < kMaxChannels; k++) {
+      const uint32_t row = first_row + row_step * k;
+      if (uint64_t(row) + 1024 <= 0x100000000ull) spec.read(row, 1024);
+    }
+  }
+  spec.read(0x82165A10u, 4);  // sub_82B373C8's floor
+  spec.read(0x822F8A44u, 4);  // and its mean-square scale
   spec.read(desc + kDescFormat, 4);
   spec.read(format + kFormatRate, 4);
   spec.read(kHalfSingle, 4);
@@ -291,4 +306,4 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
 }
 
 }  // namespace port_82B376B8
-SKATE3_PORT(82B376B8, skate3::audio::kPortVerified, skate3::audio::kReturnR3)
+SKATE3_PORT(82B376B8, skate3::audio::kPortVerifiedThin, skate3::audio::kReturnR3)

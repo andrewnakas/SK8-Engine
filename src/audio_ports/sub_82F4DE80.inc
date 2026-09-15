@@ -5,9 +5,11 @@
 namespace port_82F4DE80 {
 
 // Two doubles in the image's constant pool, reached by lis + displacement. Nothing in
-// docs/rw_audio_structs.h names them. By the algorithm's shape they should be 1.0 (the
-// step-down) and 2^52 (the "already integral" magnitude), but the body loads them rather
-// than assuming: a wrong guess would not be caught by the harness if it also read them.
+// docs/rw_audio_structs.h names them. Measured from the image dump: 1.0 (the step-down) and
+// 1e18 (the "already integral" magnitude, 0x43ABC16D674EC800). This comment used to guess
+// 2^52 "by the algorithm's shape"; that was wrong. The body loads them rather than assuming,
+// which is why the wrong guess never mattered: a folded constant would not be caught by the
+// harness if the original also read the same cell.
 constexpr uint32_t kPoolStepDown = 0x82010000u + 264;    // lis r11,-32255 ; lfd f13,264(r11)
 constexpr uint32_t kPoolIntegralMag = 0x82050000u + 5336;  // lis r10,-32251 ; lfd f0,5336(r10)
 

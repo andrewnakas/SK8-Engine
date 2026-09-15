@@ -25,6 +25,7 @@
 #include "audio_ports/sub_82B426D0.inc"
 #include "audio_ports/sub_82B427D8.inc"
 #include "audio_ports/sub_82B42C98.inc"
+#include "audio_ports/sub_82B43340.inc"
 #include "audio_ports/sub_82B43AF8.inc"
 #include "audio_ports/sub_82B43CC0.inc"
 #include "audio_ports/sub_82B43D78.inc"

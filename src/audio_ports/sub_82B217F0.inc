@@ -1,5 +1,5 @@
 // sub_82B217F0  role: start the Dac profiler -- round the config rate, start the worker, zero the timing block   lifted: skate3_recomp.67.cpp:8933 (112 lines)
-// STATUS: gate-3 (reaches mftb through sub_82B1F7E8)
+// STATUS: partial -- compared 0, skipped 1, zero divergence (session g1_splits, 150 s scripted); armed and waiting: the one call took the uncomparable path. NEVER promoted: the skipped path has a native body but no comparison. (comparable only when the run-state word at 0x830845CC is non-zero -- that path is a pure `li r3,16` with no stores, no callee and no timebase read; the zero path is gate-3 through sub_82B1F7E8's mftb and gate-1 through sub_82B218E8's bctrl, and stays uncompared)
 // calls/session: boot 1  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B217F0.md
 namespace port_82B217F0 {
@@ -78,14 +78,19 @@ REX_FUNC(Native) {
   ctx.fpscr.disableFlushModeUnconditional();  // lfd f31,-24(r1) -- the frame reload's mode call
 }
 
-// Never called: the macro skips the shadow branch for a gate-labelled port. The write set this
-// would have declared is in the note, for whoever gains a way to stub the timebase.
+// Split by path. Both gates sit on the far side of one test: the zero path reaches sub_82B218E8's
+// `bctrl` (gate 1) and then stamps 0x830BDEC4 from sub_82B1F7E8's `mftb` (gate 3, and no care in
+// any rewrite can make two timebase reads agree). The non-zero path -- already running -- has no
+// stores, no callee and no timebase read, so it is deterministic and fully comparable. Its write
+// set is empty; what it checks is that the guard is read from the right word and that the status
+// really is the constant 16 on that path. The float rounding, the profiler block and the stamp
+// stay unchecked, which is what the header line says.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  spec.read(kRunState, 4);
+  spec.read(ctx.r3.u32 + kConfigTarget, 4);  // lwz r3,4(r3), before the branch on both paths
+  // lwz r10,17868(r10) ; cmpwi cr6,r10,0 ; bne cr6,0x82b21888
+  return REX_LOAD_U32(kRunState) != 0;
 }
 
 }  // namespace port_82B217F0
-SKATE3_PORT(82B217F0, skate3::audio::kPortGate3, skate3::audio::kReturnR3)
+SKATE3_PORT(82B217F0, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

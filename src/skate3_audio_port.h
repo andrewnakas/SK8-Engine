@@ -39,6 +39,8 @@ namespace skate3::audio {
 enum PortStatus : uint8_t {
   kPortPending = 0,   // written, not yet compared clean
   kPortVerified,      // zero divergence over a session; promotable
+  kPortPartial,       // one path compared clean, another never compared; NEVER promotable
+  kPortVerifiedThin,  // verified, but on too few calls for its size to carry promotion
   kPortDivergent,     // compared and disagreed; kept for the record, never promoted
   kPortUncalled,      // passes the gates, the game never reached it
   kPortGate1,         // callees not replayable
@@ -50,16 +52,24 @@ enum PortStatus : uint8_t {
 /// Half the harness budget: a port declaring more than this runs the original and counts.
 constexpr uint32_t kPortWatchCap = 32 * 1024;
 constexpr size_t kPortMaxSpans = 32;
+/// Read spans are snapshotted for replay and never rewound, so they cost nothing against
+/// kPortWatchCap and this cap is far larger than the write one. **Raised from 32 on 2026-09-13**:
+/// sub_82B426D0 declares four spans per route plus its tables, which reached 64, and the excess was
+/// dropped silently -- the shadow comparison still passed (it only rewinds writes) while every
+/// recorded vector became unreplayable, which is the worst of both. Anything past this now sets
+/// `reads_truncated` and the harness records no vector at all for that call.
+constexpr size_t kPortMaxReads = 192;
 
 /// Filled per call by a port's Windows(): the write set, the read set, and which result
 /// registers to compare.
 struct PortSpec {
   ShadowWindow windows[kPortMaxSpans];
   size_t nwin = 0;
-  ShadowWindow inputs[kPortMaxSpans];
+  ShadowWindow inputs[kPortMaxReads];
   size_t nin = 0;
   ShadowResults returns{};
   bool overflowed = false;  // more spans than fit: the hook must skip, not truncate
+  bool reads_truncated = false;  // the read set did not fit: a recorded vector could not be replayed
 
   void write(uint32_t addr, uint32_t len) {
     if (len == 0) return;
@@ -68,7 +78,8 @@ struct PortSpec {
   }
   void read(uint32_t addr, uint32_t len) {
     if (len == 0) return;
-    if (nin < kPortMaxSpans) inputs[nin++] = {addr, len};
+    if (nin < kPortMaxReads) inputs[nin++] = {addr, len};
+    else reads_truncated = true;
   }
   uint32_t total() const {
     uint32_t t = 0;
@@ -115,7 +126,8 @@ void PortOversize(PortCounters& c, ShadowStats& stats, uint32_t total);
 void PortNativeRun(PortCounters& c);
 bool PortPromoted(PortStatus s);
 constexpr bool PortShadowable(PortStatus s) {
-  return s == kPortPending || s == kPortVerified || s == kPortDivergent || s == kPortUncalled;
+  return s == kPortPending || s == kPortVerified || s == kPortPartial ||
+         s == kPortVerifiedThin || s == kPortDivergent || s == kPortUncalled;
 }
 
 /// Call a guest function from a native body with its arguments in r3.. on the LIVE context, so
@@ -158,7 +170,7 @@ inline void GuestCall(PPCContext& ctx, uint8_t* base, PPCFunc* fn, Args... args)
         return;                                                                                \
       }                                                                                        \
       ShadowCompare(ctx, base, port_##ADDR::Native, __imp__sub_##ADDR, {spec.windows, spec.nwin}, \
-                    {spec.inputs, spec.nin}, spec.returns, stats);                             \
+                    {spec.inputs, spec.nin}, spec.returns, stats, spec.reads_truncated);        \
       return;                                                                                  \
     }                                                                                          \
     if (PortPromoted(STATUS)) {                                                                \

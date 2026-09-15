@@ -162,6 +162,15 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     spec.read(source_buffer + ((source_stride * channel) << 2), kBlockBytes);
   }
 
+  // The cells sub_82B3C098 reads. Copied here rather than referenced across ports, which the
+  // lint forbids and which would break if that port changed: if sub_82B3C098's constants move,
+  // move these too. Declared so this port's vectors carry what its callee reaches.
+  spec.read(0x82257308, 4);   // the step scale
+  spec.read(0x820ED958, 4);   // the ramp span
+  spec.read(0x82060C50, 4);   // lane 2's scale
+  spec.read(0x82063B08, 4);   // lane 3's scale
+  spec.read(0x8231BA20, 64);  // the group multipliers 5..8
+  spec.read(0x8231BA60, 64);  // the group multipliers 1..4
   spec.read(object + kChannelCount, 1);
   spec.read(object + kTargetGain, 8);
   spec.read(pair + kSourceDesc, 8);

@@ -325,6 +325,37 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(self + kTail, 12);                    // the tail single and the two counts
   spec.read(dst_desc, kDescriptorBytes);
   spec.read(src_desc, kDescriptorBytes);
+  // Reads for replay only (they cost nothing against the budget): the ten live parameters, and
+  // every rodata cell the four callees reach, copied from their own Windows() -- the panner layout
+  // and its clamp, place_panner and the angular pan, the image's sine, cosine and atan2 pools, the
+  // matrix fill, and both gain kernels. If a callee's constant set changes, this list changes too.
+  spec.read(self + kLiveFirst, kLiveStride * kLiveCount);
+  static const skate3::audio::ShadowWindow kCalleeRodata[] = {
+      {0x822F8E48u, 8},
+      {0x82256FD8u, 4},
+      {0x822538BCu, 4},
+      {0x8231A844u, 4},
+      {0x820ED800u, 4},
+      {0x822F8A6Cu, 4},
+      {0x82165A10u, 4},
+      {0x82060C44u, 4},
+      {0x82FB5068u, 192},
+      {0x82FB4E20u, 120},
+      {0x82010108u, 8},
+      {0x82FB58C8u, 8},
+      {0x8209975Cu, 4},
+      {0x821A0318u, 4},
+      {0x822F8904u, 4},
+      {0x820B411Cu, 4},
+      {0x820514D8u, 8},
+      {0x822F87E0u, 4},
+      {0x82257308u, 4},
+      {0x820ED958u, 4},
+      {0x82060C50u, 4},
+      {0x82063B08u, 4},
+      {0x8231BA20u, 128},
+  };
+  for (const skate3::audio::ShadowWindow& cell : kCalleeRodata) spec.read(cell.addr, cell.len);
   const uint64_t src_stride = REX_LOAD_U16(src_desc + kChannelStride);
   const uint64_t src_buffer = REX_LOAD_U32(src_desc + kBufferBase);
   uint32_t src_lo = uint32_t(src_buffer);

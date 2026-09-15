@@ -1,5 +1,5 @@
 // sub_82B43D78  role: build the five normalised high-shelf biquad coefficients from an angle and a gain   lifted: skate3_recomp.68.cpp:25687 (163 lines)
-// STATUS: verified
+// STATUS: thin -- verified (zero divergence) but on too few calls for its size: 23 comparable calls in the weaker profile, 257 in the stronger, against 163 lifted lines -- thin in both profiles. Held out of default promotion by docs/promotion.md; shadows normally, never promoted.
 // calls/session: boot 82  play 514  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B43D78.md
 namespace port_82B43D78 {
@@ -141,8 +141,14 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(kAlphaScale, 4);
   spec.read(kTwo, 4);
   spec.read(kMinusTwo, 4);
+  // The image's sine and cosine, which the coefficient build reaches: their table, 1.0 and the NaN
+  // cell. Declared for replay only (reads cost nothing against the budget); without them every
+  // vector on the rebuild path is unreplayable. Values from recomp/src/audio_ports/sub_82F4DED0.inc.
+  spec.read(0x82FB4E20u, 120);
+  spec.read(0x82010108u, 8);
+  spec.read(0x82FB58C8u, 8);
   return true;
 }
 
 }  // namespace port_82B43D78
-SKATE3_PORT(82B43D78, skate3::audio::kPortVerified, skate3::audio::kReturnNone)
+SKATE3_PORT(82B43D78, skate3::audio::kPortVerifiedThin, skate3::audio::kReturnNone)

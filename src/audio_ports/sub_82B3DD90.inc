@@ -240,6 +240,8 @@ inline SegStep PredictStep(uint64_t need, uint64_t cap, uint64_t dest, uint64_t 
 // A change there requires the same change here.
 struct SegRun {
   uint64_t want = 0;   // the words written at dest, and sub_82B3DB90's return value
+  uint64_t src = 0;    // where the first run reads from, so the read set can name it
+  int32_t first_run = 0;  // words from src to the ring end, before any wrap
   bool known = false;
 };
 
@@ -256,6 +258,8 @@ inline SegRun PredictRun(uint64_t limit, uint64_t want_in, uint64_t cursor, uint
   if (!(uint32_t(src) < ring_base)) inside = ring_end > uint32_t(src);
   if (!inside) src += WordsToBytes(span_high - span_low);
   const int32_t length = int32_t(uint32_t(uint64_t(ring_end) - src)) >> 2;
+  run.src = src;
+  run.first_run = length;
   if (length < 0) return run;                         // a ~4 GB first run; not enumerable
   if (int32_t(uint32_t(run.want)) < 0) return run;    // nor a negative second run
   run.known = true;
@@ -358,6 +362,17 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
                                   uint32_t(ring_start), uint32_t(ring_end), span, lag);
     if (!run.known) return false;
     seg_out[which] = step.out;
+    // The ring words this copy reads, split at the ring end as sub_82B3DC48's own Windows() splits
+    // them. For replay only: without them a recorded vector holds the ring's header, not its data.
+    if (uint32_t(run.want) != 0) {
+      const uint64_t want = uint64_t(uint32_t(run.want));
+      const uint64_t first = uint64_t(uint32_t(run.first_run));
+      const uint64_t first_words = want < first ? want : first;
+      spec.read(uint32_t(run.src), uint32_t(4ull * first_words));
+      if (want > first_words) {
+        spec.read(uint32_t(ring_start), uint32_t(4ull * (want - first_words)));
+      }
+    }
 
     const uint64_t bytes = 4ull * uint64_t(uint32_t(run.want));
     if (bytes > skate3::audio::kPortWatchCap) return false;

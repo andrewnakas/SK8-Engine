@@ -292,6 +292,7 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   if (clashes(owner + kOwnerHead16, 4, after_c1)) return false;
 
   spec.read(self, 36);  // the gains, the owner, the node -- read back by the relink
+  spec.read(kZeroFloat, 4);  // lfs f0,23056(r10), for replay
   for (uint32_t i = 0; i < n; i++) spec.write(spans[i].addr, spans[i].len);
   return true;
 }

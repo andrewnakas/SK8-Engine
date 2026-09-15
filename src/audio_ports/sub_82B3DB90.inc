@@ -123,6 +123,16 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   if (second == 0 && plan.rest_bytes != 0) return false;
   spec.write(first, uint32_t(plan.run_bytes));
   spec.write(second, uint32_t(plan.rest_bytes));
+
+  // The SOURCE runs, declared so a recorded vector carries the bytes this copy reads. They are
+  // not part of the write set and are never rewound; a read span costs nothing against the
+  // window budget, which counts writes only. Without them the recording holds the ring's header
+  // and not its data, and a replay of this function cannot address the memory it copies from --
+  // measured: 312 of 312 vectors unreplayable, every one at the ring's data.
+  spec.read(uint32_t(plan.src), uint32_t(plan.run_bytes));
+  if (plan.rest_bytes != 0) {
+    spec.read(REX_LOAD_U32(ctx.r4.u32 + kRingBase), uint32_t(plan.rest_bytes));
+  }
   return true;
 }
 

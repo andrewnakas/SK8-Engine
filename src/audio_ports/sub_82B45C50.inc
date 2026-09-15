@@ -291,6 +291,10 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     spec.read(kPlaceBias, 4);
   }
   spec.read(kAtanTable, kAtanTableBytes);
+  // The image's sine and cosine pools, reached through the callees -- for replay only.
+  spec.read(0x82FB4E20u, 120);
+  spec.read(0x82010108u, 8);
+  spec.read(0x82FB58C8u, 8);
   return true;
 }
 

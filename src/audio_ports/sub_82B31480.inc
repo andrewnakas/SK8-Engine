@@ -142,7 +142,7 @@ bool UnlinkWindows(uint8_t* base, skate3::audio::PortSpec& spec, uint32_t node, 
 // kDestArray entries, i.e. a word of kScratch, and each of those writes exactly [dst, dst + 4*n)
 // with n the literal 1 passed in r7 (so never the dcbzl vector path, which needs n % 64 == 0).
 // sub_82B426D0, reached when both counts are in {1,2,4,6,8}, indexes the same two arrays with
-// (byte & 7) out of a read-only table pair at 0x820CD700 / 0x820CD780 and keeps its visited flags
+// (byte & 7) out of a read-only table pair at 0x820ED700 / 0x820ED780 and keeps its visited flags
 // in its own frame. So the only writes this call makes above r1 are sub_82B34BD0's plus the
 // eight-word gain clear -- which is why the fold arm is NOT gate 2 here even though it is from
 // sub_82B31680, whose entry state cannot name a frame this function has not built yet.
@@ -168,6 +168,12 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     return false;  // would index past the eight-entry frame arrays: not enumerable
   }
   spec.read(voice + kGains, 4 * kGainWords);
+  // The gather's rodata, declared for replay only (reads cost nothing against the budget): the
+  // scatter-mixer's gain table and its range and route tables, and the copy path's unity gain.
+  spec.read(0x820ED6C0u, 16);
+  spec.read(0x820ED700u, 128);
+  spec.read(0x820ED780u, 256);
+  spec.read(0x8231A844u, 4);
   if (!UnlinkWindows(base, spec, node, true, gain_count)) return false;
   spec.write(voice + kGains, 4 * kGainWords);  // stwu r9,4(r11) x8
   return true;

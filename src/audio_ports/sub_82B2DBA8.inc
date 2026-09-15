@@ -451,6 +451,19 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     spec.read(tail_row, uint32_t(carried_bytes));  // the carried tail leads the scratch run
   }
 
+  // Reads, for replay only: the voice and stream fields this path reads, the system and arena
+  // words, both descriptors, and sub_82B43FB8's fraction-scale cell (its pool +428).
+  spec.read(voice + kSystem, 4);
+  spec.read(voice + kChannels, 1);
+  spec.read(voice + kRateCache, 20);  // +64 .. +83: the cache, step, phase, tail offset, cap, counts
+  spec.read(stream + kPairBack, 8);
+  spec.read(stream + kInputFrames, 8);  // +48 frames, +52 rate
+  spec.read(REX_LOAD_U32(voice + kSystem), 4);
+  spec.read(p.arena + kArenaTop, 4);
+  spec.read(p.src_desc + kBufferBase, 12);
+  spec.read(p.dst_desc + kBufferBase, 12);
+  spec.read(0x822F87ACu, 4);
+
   // The publish, loc_82B2DDC8. The pairs are adjacent, so two spans cover four stores.
   spec.write(voice + kTailCount, 1);    // stb r30,80(r31) -- the low byte only
   spec.write(voice + kPhase, 4);        // stw r9,72(r31)

@@ -272,6 +272,11 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(0x821A0318, 4);   // 0.0005f, sub_82B454B8's snap threshold
   spec.read(0x822F8904, 4);   // sub_82B45788's angle scale
   spec.read(0x820B411C, 4);   // sub_82B45788's angle step
+  // The rest of sub_82B45788's reads, for replay only: the image's sine and cosine pools.
+  spec.read(0x82FB4E20u, 120);
+  spec.read(0x82010108u, 8);
+  spec.read(0x82FB58C8u, 8);
+  spec.read(0x820514D8u, 8);
   return true;
 }
 

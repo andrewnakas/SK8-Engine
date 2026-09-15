@@ -10,6 +10,8 @@
 #include "audio_ports/sub_82B46FB0.inc"
 #include "audio_ports/sub_82B47010.inc"
 #include "audio_ports/sub_82B470D0.inc"
+#include "audio_ports/sub_82B471D8.inc"
+#include "audio_ports/sub_82B472C0.inc"
 #include "audio_ports/sub_82B474B8.inc"
 #include "audio_ports/sub_82B47658.inc"
 #include "audio_ports/sub_82B47A68.inc"

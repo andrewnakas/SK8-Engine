@@ -7,6 +7,7 @@
  */
 #include "skate3_audio_shadow.h"
 
+#include <unordered_map>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +45,19 @@ REXCVAR_DEFINE_STRING(
 REXCVAR_DEFINE_INT32(
     skate3_audio_vectors_max, 4096, "Skate 3",
     "Stop recording shadow vectors after this many, so a session cannot fill the disk.");
+
+REXCVAR_DEFINE_STRING(
+    skate3_audio_vectors_only, "", "Skate 3",
+    "Comma-separated function names to record vectors for; empty records every comparing port. "
+    "Without this the cap is spent on whichever functions run most -- one four-lane sine kernel "
+    "runs millions of times a session -- so a rarely called function gets no vectors at all and "
+    "cannot be replayed against its Rust translation.");
+
+REXCVAR_DEFINE_INT32(
+    skate3_audio_vectors_per_function, 0, "Skate 3",
+    "Stop recording one function's vectors after this many; 0 sets no per-function limit. With "
+    "it, one session can record a kernel called 5,000 times a second and one called four times "
+    "side by side, instead of the global cap filling with the hot one first.");
 
 REXCVAR_DEFINE_BOOL(
     skate3_audio_vectors_diverged_only, false, "Skate 3",
@@ -281,7 +295,8 @@ void HexBytes(std::FILE* out, const uint8_t* data, uint32_t len) {
 
 void RecordVector(const char* name, const PPCContext& entry, const PPCContext& after,
                   std::span<const ShadowWindow> windows, std::span<const ShadowWindow> inputs,
-                  const uint8_t* base, const std::vector<uint8_t>& mem_entry,
+                  const uint8_t* base, const std::vector<uint8_t>& mem_inputs,
+                  const std::vector<uint8_t>& mem_entry,
                   const std::vector<uint8_t>& mem_lifted, uint64_t run) {
   std::lock_guard<std::mutex> lock(g_vector_mutex);
   if (!g_vector_tried) {
@@ -294,6 +309,10 @@ void RecordVector(const char* name, const PPCContext& entry, const PPCContext& a
       } else {
         std::fprintf(g_vector_file,
                      "# skate3 shadow vectors: name run r3 r4 r5 r6 r7 ret_r3 then spans.\n"
+                     "# F:n:bits              = entry f1..f8 as raw 64-bit patterns\n"
+                     "# R64:n:bits            = entry r1 and r3..r10, full 64 bits\n"
+                     "# V:n:words / Vr:1:words = entry v1..v3 and the v1 the original left\n"
+                     "# Fr:1:bits             = f1 as the ORIGINAL left it\n"
                      "# I:addr:len:bytes      = read set, the memory the function saw\n"
                      "# W:addr:len:entry:exp  = write set, entry bytes and what the ORIGINAL "
                      "produced\n");
@@ -305,6 +324,53 @@ void RecordVector(const char* name, const PPCContext& entry, const PPCContext& a
   if (g_vector_file == nullptr) {
     return;
   }
+  // The filter is parsed once, under the same lock that guards the file.
+  static bool s_filter_parsed = false;
+  static std::vector<std::string> s_wanted;
+  if (!s_filter_parsed) {
+    s_filter_parsed = true;
+    const std::string only = REXCVAR_GET(skate3_audio_vectors_only);
+    size_t at = 0;
+    while (at < only.size()) {
+      size_t comma = only.find(',', at);
+      if (comma == std::string::npos) {
+        comma = only.size();
+      }
+      std::string one = only.substr(at, comma - at);
+      while (!one.empty() && (one.front() == ' ' || one.front() == '\t')) one.erase(one.begin());
+      while (!one.empty() && (one.back() == ' ' || one.back() == '\t')) one.pop_back();
+      if (!one.empty()) {
+        s_wanted.push_back(one);
+      }
+      at = comma + 1;
+    }
+    if (!s_wanted.empty()) {
+      REXLOG_INFO("skate3-audio-shadow: recording vectors for {} named function(s) only",
+                  s_wanted.size());
+    }
+  }
+  if (!s_wanted.empty()) {
+    bool wanted = false;
+    for (const std::string& one : s_wanted) {
+      if (one == name) {
+        wanted = true;
+        break;
+      }
+    }
+    if (!wanted) {
+      return;
+    }
+  }
+  // The per-function cap, counted under the same lock as the file.
+  static std::unordered_map<std::string, uint64_t> s_per_function;
+  uint64_t* recorded_here = nullptr;
+  const int32_t per_function = REXCVAR_GET(skate3_audio_vectors_per_function);
+  if (per_function > 0) {
+    recorded_here = &s_per_function[std::string(name)];
+    if (*recorded_here >= static_cast<uint64_t>(per_function)) {
+      return;
+    }
+  }
   if (g_vector_count >= static_cast<uint64_t>(REXCVAR_GET(skate3_audio_vectors_max))) {
     if (g_vector_count == static_cast<uint64_t>(REXCVAR_GET(skate3_audio_vectors_max))) {
       g_vector_count++;
@@ -314,15 +380,79 @@ void RecordVector(const char* name, const PPCContext& entry, const PPCContext& a
     return;
   }
   g_vector_count++;
+  if (recorded_here != nullptr) {
+    (*recorded_here)++;
+  }
 
   std::fprintf(g_vector_file, "%s\t%llu\t%08X\t%08X\t%08X\t%08X\t%08X\t%08X", name,
                static_cast<unsigned long long>(run), entry.r3.u32, entry.r4.u32, entry.r5.u32,
                entry.r6.u32, entry.r7.u32, after.r3.u32);
-  // The read set first, taken from memory as it stands now: these spans are not written by the
-  // function, so their entry bytes are still intact after the lifted body ran.
+  // Float arguments, as raw bit patterns. Without these a kernel whose scale factor arrives in
+  // f1 -- which is most of the DSP surface -- records its memory and its integer registers and is
+  // still unreplayable, because the one value that decides its output is missing. `Fr:1` is what
+  // the ORIGINAL left in f1, for the bodies that return a float.
+  // f1..f8. Most bodies take at most four, but the one-pole filter stage takes its recursion
+  // state in f5, and a missing float argument cannot be told apart from a zero one on replay.
+  {
+    const PPCRegister* const fprs[8] = {&entry.f1, &entry.f2, &entry.f3, &entry.f4,
+                                        &entry.f5, &entry.f6, &entry.f7, &entry.f8};
+    for (int i = 0; i < 8; ++i) {
+      std::fprintf(g_vector_file, "\tF:%d:%016llX", i + 1,
+                   static_cast<unsigned long long>(fprs[i]->u64));
+    }
+  }
+  std::fprintf(g_vector_file, "\tFr:1:%016llX",
+               static_cast<unsigned long long>(after.f1.u64));
+  // The fixed columns above keep only the low word of r3..r7. Two things that costs:
+  //
+  // A chain formed 64-bit -- RexGlue's add and mullw are 64-bit on zero-extended operands --
+  // carries the high half into a returned address, so a truncated recording cannot exercise it
+  // and a truncated port passes. One port's ring copy receives an argument with all 64 bits set,
+  // produced by a branch-free max in its caller.
+  //
+  // And r8 was not recorded at all, so a body taking six arguments could not be replayed: feeding
+  // zero for the sixth makes every address it computes wrong, which turns a failure into a pass.
+  {
+    const PPCRegister* const gprs[6] = {&entry.r3, &entry.r4, &entry.r5,
+                                        &entry.r6, &entry.r7, &entry.r8};
+    for (int i = 0; i < 6; ++i) {
+      std::fprintf(g_vector_file, "\tR64:%d:%016llX", i + 3,
+                   static_cast<unsigned long long>(gprs[i]->u64));
+    }
+    // r9 and r10 carry the seventh and eighth integer arguments, and r1 is the caller's stack
+    // pointer: a body that reads arguments nine and up off the caller's frame, as the filter
+    // stage does at 84..103(r1), cannot be replayed without it.
+    std::fprintf(g_vector_file, "\tR64:9:%016llX\tR64:10:%016llX\tR64:1:%016llX",
+                 static_cast<unsigned long long>(entry.r9.u64),
+                 static_cast<unsigned long long>(entry.r10.u64),
+                 static_cast<unsigned long long>(entry.r1.u64));
+  }
+  // Entry v1..v3 and the v1 the original left, four host-order words each. The four-lane sine kernel
+  // takes its argument and returns its result in v1 and writes no memory at all, so without these
+  // its recorded calls hold nothing that could be replayed.
+  {
+    const PPCVRegister* const vrs[3] = {&entry.v1, &entry.v2, &entry.v3};
+    for (int i = 0; i < 3; ++i) {
+      std::fprintf(g_vector_file, "\tV:%d:%08X%08X%08X%08X", i + 1, vrs[i]->u32[0],
+                   vrs[i]->u32[1], vrs[i]->u32[2], vrs[i]->u32[3]);
+    }
+    std::fprintf(g_vector_file, "\tVr:1:%08X%08X%08X%08X", after.v1.u32[0], after.v1.u32[1],
+                 after.v1.u32[2], after.v1.u32[3]);
+  }
+  // The read set, from a snapshot taken BEFORE the lifted body ran.
+  //
+  // It used to be read from live memory here, on the reasoning that a read span is not written
+  // and so still holds its entry bytes. That reasoning is wrong whenever a span is both read and
+  // written -- a header word a function reads and then updates, which is common -- and the
+  // recording then held the POST-call value while claiming to be the input. Measured on one
+  // recorded file: of 4,454 bytes covered by both a read span and a write span whose entry and
+  // expected bytes differ, 4,454 held the expected byte and none held the entry byte. Replaying
+  // those vectors fed a function its own output and made a correct port look broken.
+  size_t in_off = 0;
   for (const ShadowWindow& w : inputs) {
     std::fprintf(g_vector_file, "\tI:%08X:%u:", w.addr, w.len);
-    HexBytes(g_vector_file, base + w.addr, w.len);
+    HexBytes(g_vector_file, mem_inputs.data() + in_off, w.len);
+    in_off += w.len;
   }
   size_t off = 0;
   for (const ShadowWindow& w : windows) {
@@ -341,7 +471,7 @@ void RecordVector(const char* name, const PPCContext& entry, const PPCContext& a
 bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lifted,
                    std::span<const ShadowWindow> windows,
                    std::span<const ShadowWindow> inputs, ShadowResults returns,
-                   ShadowStats& stats) {
+                   ShadowStats& stats, bool reads_truncated) {
   static const uint64_t report_cap = REXCVAR_GET(skate3_audio_shadow_reports);
   static const bool diverged_only = REXCVAR_GET(skate3_audio_vectors_diverged_only);
   EnsureReporter();
@@ -377,6 +507,18 @@ bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lif
     std::memcpy(mem_entry.data() + off, base + w.addr, w.len);
     off += w.len;
   }
+  // The read set is snapshotted here, before anything runs. See RecordVector for why reading it
+  // afterwards was wrong.
+  size_t input_total = 0;
+  for (const ShadowWindow& w : inputs) {
+    input_total += w.len;
+  }
+  std::vector<uint8_t> mem_inputs(input_total);
+  size_t in_off = 0;
+  for (const ShadowWindow& w : inputs) {
+    std::memcpy(mem_inputs.data() + in_off, base + w.addr, w.len);
+    in_off += w.len;
+  }
 
   // 1. The lifted body, for real.
   const PPCContext entry = ctx;
@@ -389,9 +531,17 @@ bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lif
   }
 
   const uint64_t run_number = stats.runs.load(std::memory_order_relaxed) + 1;
-  if (!diverged_only) {
-    RecordVector(stats.name, entry, after_lifted, windows, inputs, base, mem_entry, mem_lifted,
-                 run_number);
+  // A truncated read set is worse than no vector: the comparison below is still sound -- only
+  // writes are rewound -- but a replay of the row would reach memory the row does not carry and
+  // count itself unreplayable. Say so once and record nothing.
+  if (reads_truncated && run_number == 1) {
+    REXLOG_WARN(
+        "skate3-audio-shadow: {} declares more read spans than fit; recording no vectors for it",
+        stats.name);
+  }
+  if (!diverged_only && !reads_truncated) {
+    RecordVector(stats.name, entry, after_lifted, windows, inputs, base, mem_inputs, mem_entry,
+                 mem_lifted, run_number);
   }
 
   // 2. Rewind memory, last window first so overlapping windows end at their entry bytes.
@@ -437,9 +587,9 @@ bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lif
   if (bad_window) stats.memory_diffs.fetch_add(1, std::memory_order_relaxed);
   const uint64_t runs = stats.runs.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  if (diverged && diverged_only) {
-    RecordVector(stats.name, entry, after_lifted, windows, inputs, base, mem_entry, mem_lifted,
-                 runs);
+  if (diverged && diverged_only && !reads_truncated) {
+    RecordVector(stats.name, entry, after_lifted, windows, inputs, base, mem_inputs, mem_entry,
+                 mem_lifted, runs);
   }
   if (diverged && stats.reports.fetch_add(1, std::memory_order_relaxed) < report_cap) {
     if (bad_register.name) {

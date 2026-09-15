@@ -1,5 +1,5 @@
 // sub_828E2EA0  role: unlink a node from the list whose cursor is at container+8, decrement the count at +4, and when it reaches zero free the container through the global allocator at 0x83083CCC (vtable slot +12); returns 0 -- sub_828E2E08 with the cursor moved from +12 to +8   lifted: skate3_recomp.47.cpp:4657 (89 lines)
-// STATUS: gate-1 (its own bctrl: the free entry of the vtable at u32[u32[0x83083CCC]+0], `bctrl` at 0x828E2F20)
+// STATUS: partial -- compared 42, skipped 122, zero divergence (session g1_splits, 150 s scripted); substantive -- the unlink compares. NEVER promoted: the skipped path has a native body but no comparison. (comparable on every call that is not the container's last -- the free at 0x828E2F20 fires only when u32[container+4] == 1 and an allocator is installed, both readable at entry, so the whole unlink compares on the other calls)
 // calls/session: boot 154  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_828E2EA0.md
 namespace port_828E2EA0 {
@@ -67,14 +67,59 @@ REX_FUNC(Native) {
   ctx.r3.s64 = 0;  // li r3,0 -- the only result, on every path
 }
 
-// Never called: the macro skips the shadow branch for a gate-labelled port. Kept so the file has
-// the same shape as every other port. The write set this WOULD declare is in the note.
+// Two 4-byte guest accesses that share a byte. `stw`/`lwz` need no alignment on this target, so
+// equal addresses are not the only overlap; 64-bit arithmetic so the compare cannot wrap. Kept
+// local rather than shared with port_828E2E08: the two files are in the same aggregator, but a
+// copied four-line predicate is cheaper to audit than a cross-port reference.
+inline bool Overlaps(uint32_t a, uint32_t b) {
+  return static_cast<uint64_t>(a) + 4 > b && static_cast<uint64_t>(b) + 4 > a;
+}
+
+// Split by path, exactly as port_828E2E08 -- the only difference is the cursor offset. The free is
+// the only unreplayable thing here and it fires only when the decrement lands on zero AND an
+// allocator is installed, both readable before the call. Every other call is a four-word unlink.
+// Each store address is checked against the words read after it first, so a list corrupted into an
+// aliasing shape declines instead of declaring a window set that could miss a byte.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  const uint32_t container = ctx.r3.u32;
+  const uint32_t node = ctx.r4.u32;
+  const uint32_t cursor_ea = container + kCursor;
+  const uint32_t count_ea = container + kCount;
+
+  // stw r11,8(r3) happens before prev, next, the count and the allocator cell are read.
+  const bool moves_cursor = (node == REX_LOAD_U32(cursor_ea));
+  if (moves_cursor &&
+      (Overlaps(cursor_ea, node + kNext) || Overlaps(cursor_ea, node + kPrev) ||
+       Overlaps(cursor_ea, count_ea) || Overlaps(cursor_ea, kAllocatorPtr))) {
+    return false;
+  }
+  const uint32_t prev = REX_LOAD_U32(node + kPrev);
+  const uint32_t next = REX_LOAD_U32(node + kNext);
+  // stw r10,0(r11) happens before next, the count and the allocator cell are read. Writing the
+  // node's own `next` through a self-link stores the value already there, so that case is safe.
+  if (prev != 0 && ((prev != node && Overlaps(prev + kNext, node + kNext)) ||
+                    Overlaps(prev + kNext, count_ea) || Overlaps(prev + kNext, kAllocatorPtr))) {
+    return false;
+  }
+  // stw r10,4(r11) happens before the count and the allocator cell are read.
+  if (next != 0 &&
+      (Overlaps(next + kPrev, count_ea) || Overlaps(next + kPrev, kAllocatorPtr))) {
+    return false;
+  }
+
+  // addic. r11,r11,-1 ; bne -- the last registration frees the container through vtable slot +12
+  // of the allocator at 0x83083CCC. Replaying that frees it twice.
+  if (REX_LOAD_U32(count_ea) == 1 && REX_LOAD_U32(kAllocatorPtr) != 0) return false;
+
+  if (moves_cursor) spec.write(cursor_ea, 4);  // stw r11,8(r3)
+  if (prev != 0) spec.write(prev + kNext, 4);  // stw r10,0(r11)
+  if (next != 0) spec.write(next + kPrev, 4);  // stw r10,4(r11)
+  spec.write(count_ea, 4);                     // stw r11,4(r3)
+  spec.read(count_ea, 8);                      // +4 the count, +8 this list's cursor
+  spec.read(node + kNext, 8);                  // the node's two links
+  spec.read(kAllocatorPtr, 4);
+  return true;
 }
 
 }  // namespace port_828E2EA0
-SKATE3_PORT(828E2EA0, skate3::audio::kPortGate1, skate3::audio::kReturnR3)
+SKATE3_PORT(828E2EA0, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

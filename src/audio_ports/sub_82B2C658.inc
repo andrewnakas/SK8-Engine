@@ -284,6 +284,12 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(kQualityCeiling, 4);
   spec.read(kDenomGain, 4);
   spec.read(kCosineGain, 4);
+  // The image's sine and cosine, reached on the rebuild path: their table, 1.0 and the NaN cell.
+  // Declared for replay only; without them every rebuild-path vector is unreplayable. Values from
+  // recomp/src/audio_ports/sub_82F4DED0.inc.
+  spec.read(0x82FB4E20u, 120);
+  spec.read(0x82010108u, 8);
+  spec.read(0x82FB58C8u, 8);
 
   // The path is fixed at entry: +60 is loaded before any store and compared with 1.0.
   if (LoadSingle(base, object + kGain) == LoadSingle(base, kUnit)) return true;

@@ -1,5 +1,5 @@
 // sub_82B33970  role: advance voice `index` of the system at r3 to its next buffer -- the voice's mode byte at +73 picks one of three shapes: 0 opens the next buffer straight away, 1 pushes a timestamp to the 0x82EC subsystem and hands the voice to sub_82B332D0, anything else opens the next buffer only while the slot cursor is still short of the voice's watermark and then decides between "keep going" and sub_82B332D0. Writes 1 through the r6 byte pointer when the slot cursor has already gone negative, 0 otherwise   lifted: skate3_recomp.67.cpp:52996 (368 lines)
-// STATUS: gate-1 (function pointers and a lock, on every path that calls anything: sub_82B33418 -> sub_82B3C870 indirect call, sub_82B332D0 -> the same, sub_82EC0E08 -> sub_82EC1290 RtlEnterCriticalSection/RtlLeaveCriticalSection)
+// STATUS: partial -- compared 4569, skipped 2170, zero divergence (session g1_splits, 150 s scripted); thin -- the compared path writes one byte and returns 1. NEVER promoted: the skipped path has a native body but no comparison. (comparable only when the slot cursor at slot+24 is already negative -- that path calls nothing at all, writes one byte through r6 and returns 1; every other cursor value reaches sub_82B33418, sub_82B332D0 or sub_82EC0E08, i.e. two function pointers and a critical section)
 // calls/session: boot 2070  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B33970.md
 namespace port_82B33970 {
@@ -220,11 +220,31 @@ REX_FUNC(Native) {
 // Never called: the macro skips the shadow branch for a gate-labelled port. Kept so the file has
 // the same shape as every other port. One path here is in fact comparable -- see the note.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  const uint32_t object = ctx.r3.u32;
+  // The same r28 arithmetic Native does, from the same entry bytes: object + u16(+464) + 48*index.
+  const uint32_t slot_base = REX_LOAD_U16(object + kSlotTable);
+  const uint32_t slot = (slot_base + (static_cast<uint32_t>(ctx.r4.u32 * 3u) << 4)) + object;
+  spec.read(object + kSlotTable, 2);
+  spec.read(slot + kSlotCursor, 4);
+
+  // Both bodies store the frame link word at r1-144 before reading the cursor. If that word were
+  // the cursor the entry read would not be the value the body tests, so decline rather than assume
+  // the stack and the system object are disjoint.
+  const uint32_t frame_link = ctx.r1.u32 - kFrameBytes;
+  if (static_cast<uint64_t>(frame_link) + 4 > slot + kSlotCursor &&
+      static_cast<uint64_t>(slot + kSlotCursor) + 4 > frame_link) {
+    return false;
+  }
+
+  // lwz r11,24(r28) ; cmpwi cr6,r11,0 ; blt -> loc_82B33BF4. A spent stream is the one path that
+  // calls nothing: `li r11,1 ; stb r11,0(r6) ; li r3,1`. Every other value reaches sub_82B33418 or
+  // sub_82B332D0 (both -> sub_82B3C870's `bctrl`) or sub_82EC0E08 (-> sub_82EC1290's critical
+  // section), none of which the harness can replay on rewound memory.
+  if (static_cast<int32_t>(REX_LOAD_U32(slot + kSlotCursor)) >= 0) return false;
+
+  spec.write(ctx.r6.u32, 1);  // stb r11,0(r6) -- the only byte this path writes
+  return true;
 }
 
 }  // namespace port_82B33970
-SKATE3_PORT(82B33970, skate3::audio::kPortGate1, skate3::audio::kReturnR3)
+SKATE3_PORT(82B33970, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

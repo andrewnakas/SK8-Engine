@@ -1,5 +1,5 @@
 // sub_828E2F38  role: validate a handle, and if the incoming word differs from the holder's stored one, write it and notify every listener with the cell's address   lifted: skate3_recomp.47.cpp:4747 (109 lines)
-// STATUS: gate-1 (indirect call: sub_828E2F38's own bctrl, once per list node, through the function pointer at node+8)
+// STATUS: partial -- compared 83, skipped 2461, zero divergence (session g1_splits, 150 s scripted); substantive on the stale path, which writes two real words. NEVER promoted: the skipped path has a native body but no comparison. (comparable only when the publish does not happen -- a negative token, a null holder, a stale generation, or an incoming word equal to the stored one; all four decidable from entry state, and the stale path writes two real words)
 // calls/session: boot 3442  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_828E2F38.md
 namespace port_828E2F38 {
@@ -80,14 +80,41 @@ REX_FUNC(Native) {
   ctx.lr = entry_lr;  // lwz r12,-8(r1) / mtlr r12
 }
 
-// Never called: the macro skips the shadow branch for a gate-labelled port. Kept so the file
-// has the same shape as every other port.
+// Split by path. The `bctrl` is inside the notify loop, and the notify loop runs only on the
+// publish path. Every other exit -- and there are four of them -- is decidable before the call
+// from the handle, the holder and the incoming word, none of which this function writes before it
+// has decided. Three of the four write nothing and prove only the result value; the stale-handle
+// path writes two words and is a real comparison.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  const uint32_t handle = ctx.r3.u32;
+  const uint32_t source = ctx.r4.u32;
+  spec.read(handle + kHolder, 8);  // +0 the holder, +4 the token
+
+  // lwz r9,4(r3) ; cmpwi ; blt -- an already-negative token returns itself, zero-extended.
+  const uint32_t token = REX_LOAD_U32(handle + kToken);
+  if (static_cast<int32_t>(token) < 0) return true;  // no stores
+
+  // lwz r11,0(r3) ; cmplwi ; bne -- a null holder returns -6, sign-extended.
+  const uint32_t holder = REX_LOAD_U32(handle + kHolder);
+  if (holder == 0) return true;  // no stores
+
+  spec.read(holder + kHolderHead, 16);  // +0 head, +4 value, +12 generation
+  // lwz r8,12(r11) ; cmpw ; beq -- a moved generation marks the handle dead: stw +4 then stw +0,
+  // two adjacent words, and returns -3. No call on this path.
+  if (static_cast<int32_t>(token) !=
+      static_cast<int32_t>(REX_LOAD_U32(holder + kHolderGeneration))) {
+    spec.write(handle + kHolder, 8);
+    return true;
+  }
+
+  spec.read(source, 4);
+  // lwz r10,0(r4) ; cmplw ; beq -- an unchanged word writes nothing and notifies nobody. A
+  // changed one publishes and then `bctrl`s every node of a list whose length is not bounded from
+  // entry state, handing each the address of the cell; replaying that re-notifies every listener
+  // with a value that did not change the second time, which is the whole observable effect of the
+  // function. Not replayable: run the original and count the skip.
+  return REX_LOAD_U32(source) == REX_LOAD_U32(holder + kHolderValue);
 }
 
 }  // namespace port_828E2F38
-SKATE3_PORT(828E2F38, skate3::audio::kPortGate1, skate3::audio::kReturnR3)
+SKATE3_PORT(828E2F38, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

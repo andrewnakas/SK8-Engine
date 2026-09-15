@@ -198,6 +198,12 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(object + kBlockBase, 12);  // +84 through +95, so +84 and +92
   spec.read(kChannelCountByte, 1);
   spec.read(kRampFlagByte, 1);
+  // Rodata the mixing tree reads, declared for replay only (reads cost nothing against the budget):
+  // the scatter-mixer's gain table and sub_82B20E18's zero and scale. Without them every recorded
+  // vector of this function is unreplayable.
+  spec.read(0x820ED6C0u, 16);  // sub_82B426D0's gain table
+  spec.read(0x82165A10u, 4);   // sub_82B20E18's zero
+  spec.read(0x820300D4u, 4);   // sub_82B20E18's scale
   spec.read(kModeCompare, 4);
   spec.read(kClampHigh, 4);
   spec.read(kClampLow, 4);
@@ -226,6 +232,9 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     spec.write(dst_base + i * dst_stride, kPlaneBytes);
     spec.read(dst_base + i * dst_stride, kPlaneBytes);  // sub_82B44B20 accumulates in place
   }
+  // sub_82B46B30 interleaves all six planes whatever the output count, so the ones past it are read
+  // without ever being written. Declared for replay.
+  for (uint32_t i = output_count; i < 6; i++) spec.read(dst_base + i * dst_stride, kPlaneBytes);
 
   // The eight source planes, read-only here.
   const uint32_t src_base = REX_LOAD_U32(src_desc + kPlaneBase);

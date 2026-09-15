@@ -1,5 +1,5 @@
 // sub_82B305C0  role: when enabled, bump a counter in the buffer block and mix N source channels of the pair's back descriptor into N consecutive 1 KB destination runs -- a gain ramp (sub_82B44D18) for record modes 1 and 3, a flat scale (sub_82B44B20) otherwise -- keeping each source's last sample   lifted: skate3_recomp.67.cpp:45400 (269 lines)
-// STATUS: verified
+// STATUS: thin -- verified (zero divergence) but on too few calls for its size: 0 comparable calls in the weaker profile, 100810 in the stronger, against 269 lifted lines -- never compared at all in the boot profile. Held out of default promotion by docs/promotion.md; shadows normally, never promoted.
 // calls/session: boot 0  play 101160  map ?          thread: RwAudioCore Dac (census; never called in the traced boot)
 // note: probe/ports/notes/sub_82B305C0.md
 namespace port_82B305C0 {
@@ -223,8 +223,15 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(kRampStep1, 4);
   spec.read(kGainStart3, 4);
   spec.read(kRampStep3, 4);
+  // sub_82B44D18's constant pool, as its own Windows() declares it, so a recorded vector carries
+  // everything the ramp kernel reads. For replay only; reads cost nothing against the budget.
+  spec.read(0x82257308u, 4);        // its kStepScale
+  spec.read(0x820ED958u, 4);        // kRampSpan
+  spec.read(0x82060C50u, 4);        // kLane2Scale
+  spec.read(0x82063B08u, 4);        // kLane3Scale
+  spec.read(0x8231BA20u, 16 * 8);   // kScale5..kScaleStep, then kScale1..kScale4
   return true;
 }
 
 }  // namespace port_82B305C0
-SKATE3_PORT(82B305C0, skate3::audio::kPortVerified, skate3::audio::kReturnR3)
+SKATE3_PORT(82B305C0, skate3::audio::kPortVerifiedThin, skate3::audio::kReturnR3)

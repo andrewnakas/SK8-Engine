@@ -1,5 +1,5 @@
 // sub_82B218E8  role: start the Dac profiler worker -- when the run-state word is clear, arm the global byte, and for mode 0 drive the sink at +76 through its vtable slot +48 with 1.0f before publishing run-state 1 (mode 1 publishes 2, any other mode publishes nothing)   lifted: skate3_recomp.67.cpp:9086 (84 lines)
-// STATUS: gate-1 (its own bctrl: slot +48 of the vtable at u32[u32[object+76]+0], `bctrl` at 0x82B21944)
+// STATUS: partial -- compared 0, skipped 1, zero divergence (session g1_splits, 150 s scripted); armed and waiting: the one call took the calling path. NEVER promoted: the skipped path has a native body but no comparison. (comparable unless the run state is zero AND the mode is 0 AND the sink at +76 is non-null -- only that combination reaches the `bctrl` at 0x82B21944; the already-running, null-sink, mode-1 and other-mode paths all call nothing, and three of the four write the armed byte and the run state)
 // calls/session: boot 1  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B218E8.md
 namespace port_82B218E8 {
@@ -56,14 +56,34 @@ REX_FUNC(Native) {
   REX_STORE_U32(kRunState, state);  // stw r11,17868(r31)
 }
 
-// Never called: the macro skips the shadow branch for a gate-labelled port. Kept so the file has
-// the same shape as every other port. The write set this WOULD declare is in the note.
+// Split by path. Three of the four store shapes here call nothing at all, and the one `bctrl`
+// needs a specific entry state: run state zero, mode 0, and a non-null sink. Every term is a fixed
+// global or an entry register, so the predicate is exact.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  const uint32_t object = ctx.r3.u32;
+  spec.read(kRunState, 4);
+  // lwz r11,17868(r31) ; cmpwi ; bne cr6,0x82b21960 -- already running: no stores at all, and r3
+  // and r4 are left exactly as they arrived.
+  if (REX_LOAD_U32(kRunState) != 0) return true;
+
+  // stb r11,28759(r10) is issued before either mode branch, and the sink pointer is read after it.
+  // If the armed byte were inside that word the entry read would not be the value the body reads,
+  // so decline instead of assuming the two globals are disjoint from the object.
+  const uint32_t sink_ea = object + kSink;
+  if (kArmedByte >= sink_ea && kArmedByte < static_cast<uint64_t>(sink_ea) + 4u) return false;
+
+  // cmpwi cr6,r4,0 ; lwz r11,76(r3) ; cmplwi ; beq -- mode 0 with a live sink drives slot +48 of
+  // the sink's vtable with f1 = 1.0f. The target is read from memory the harness rewinds and the
+  // effect (a rate or gain setter) is not memory at all, so that one combination is not replayable.
+  if (ctx.r4.s32 == 0 && REX_LOAD_U32(sink_ea) != 0) return false;
+
+  spec.read(sink_ea, 4);
+  spec.write(kArmedByte, 1);  // stb r11,28759(r10) -- on every zero-run-state path
+  // stw r11,17868(r31) -- 1 on the mode-0 path, 2 on mode 1, and NOT written when the mode is
+  // neither; declared as the union, which costs nothing since an unwritten window compares equal.
+  spec.write(kRunState, 4);
+  return true;
 }
 
 }  // namespace port_82B218E8
-SKATE3_PORT(82B218E8, skate3::audio::kPortGate1, skate3::audio::kReturnR3)
+SKATE3_PORT(82B218E8, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

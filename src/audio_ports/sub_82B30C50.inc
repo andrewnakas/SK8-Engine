@@ -1,5 +1,5 @@
 // sub_82B30C50  role: run one output frame of the DAC -- gather the source channels into a scratch bank when the channel counts differ (sub_82B468C0), resample each channel through its history tail (sub_82B43FB8) at the ratio between the stream's rate and the device's, convert the result to interleaved little-endian 16-bit, copy it into the device buffer, and give every scratch block back to the bump allocator it came from   lifted: skate3_recomp.67.cpp:46372 (958 lines)
-// STATUS: gate-2 (four sequential bump allocations sized from a 16.16 ratio this call itself computes and rewrites, callees addressed through two pointer tables this call fills in its own frame, and ~20 KB of the 32 KB budget at six channels -- 98 KB on the zero-ratio fallback; see the note)
+// STATUS: partial -- compared 13240, skipped 0, zero divergence (session g1_splits, 150 s scripted); NEARLY VACUOUS -- every call in this session took the early exit, so the 958-line working path never ran and zero skips means the game's behaviour, not coverage. NEVER promoted: the skipped path has a native body but no comparison. (comparable only when u32[device+92] == 0, the early exit, which writes nothing outside its own frame and returns 1. The working path is still gate-2 and is skipped: four sequential bump allocations sized from a 16.16 ratio this call itself computes and rewrites, callees addressed through two pointer tables this call fills in its own frame, and ~20 KB of the 32 KB budget at six channels -- 98 KB on the zero-ratio fallback; see the note)
 // calls/session: boot 18684  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B30C50.md
 namespace port_82B30C50 {
@@ -518,16 +518,21 @@ REX_FUNC(Native) {
 //      the object rows. Eight channels fits only just, and the `+108 == 0` fallback asks for 8192
 //      frames, which is about 98 KB in the output block alone -- three times the cap.
 //
-// The one comparable path is the early exit (`+92 == 0`), which writes nothing and returns 1; a
-// future pass that wants it can relabel the port kPortPending and return true just for that case.
-// Doing so now would let a session mark this port "verified" on the strength of the empty path,
-// which is exactly the false green the gate labels exist to prevent.
+// So the split is by path: true for the early exit (`+92 == 0`), which writes nothing outside its
+// own frame and returns 1, and false for the working path, where the macro runs the original and
+// counts a PortSkip. The earlier draft of this file left the whole port gate-2 to avoid a session
+// reporting it "verified" on the strength of the empty path; the STATUS line now carries the
+// partiality, and the skip count says on every session how little was compared, so that objection
+// is met by labelling rather than by refusing the comparison. What the empty path does check:
+// the guard word's offset, the 352-byte frame discipline, r14-r31 and f31 coming back intact
+// through __savegprlr_14/__restgprlr_14, and `li r3,1`. What it does not check is everything in
+// the three paragraphs above.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  spec.read(ctx.r3.u32 + kActive, 4);
+  // lwz r11,92(r3) ; cmplwi cr6,r11,0 ; beq cr6,0x82b312c8 -- read before the frame is even used,
+  // so Native and Windows test the same byte of the same word. No writes on that path.
+  return REX_LOAD_U32(ctx.r3.u32 + kActive) == 0;
 }
 
 }  // namespace port_82B30C50
-SKATE3_PORT(82B30C50, skate3::audio::kPortGate2, skate3::audio::kReturnR3)
+SKATE3_PORT(82B30C50, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

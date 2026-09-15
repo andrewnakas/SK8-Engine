@@ -1,5 +1,5 @@
 // sub_82B1C210  role: clamp a block of N values into their per-value [min,max] ranges, then broadcast the block to the record's listener list   lifted: skate3_recomp.66.cpp:63915 (99 lines)
-// STATUS: gate-1 (indirect call: sub_828E29C0 at depth 1 -- its bctrl calls every registered listener)
+// STATUS: partial -- compared 15804, skipped 304, zero divergence (session g1_splits, 150 s scripted); substantive -- the clamp loop runs on the compared side. NEVER promoted: the skipped path has a native body but no comparison. (comparable only when the value block's header word is zero -- that is what guards the sub_828E29C0 broadcast, and the clamp loop, the whole substance of the function, runs on both sides of it)
 // calls/session: boot 25894  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1C210.md
 namespace port_82B1C210 {
@@ -67,14 +67,43 @@ REX_FUNC(Native) {
   ctx.lr = entry_lr;  // lwz r12,-8(r1) / mtlr r12
 }
 
-// Never called: the macro skips the shadow branch for a gate-labelled port. Kept so the file
-// has the same shape as every other port.
+// Split by path. sub_828E29C0's `bctrl` fires once per registered listener and is guarded by the
+// value block's header word -- which this function never writes, only tests, so its entry value is
+// the value the body tests. Header zero: the broadcast never happens and the clamp loop is fully
+// comparable in one span. Header non-zero: false, so the macro runs the original and counts a
+// PortSkip rather than firing every listener a second time on rewound memory.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  const uint32_t self = ctx.r3.u32;
+  spec.read(self + kClampEnabled, 2);  // +8 the flag, +9 the count
+
+  // The same arithmetic Native does, from the same entry bytes: with the range table absent the
+  // value block starts at +12, otherwise 8N past it.
+  uint32_t count = 0;
+  uint64_t block;
+  if (REX_LOAD_U8(self + kClampEnabled) == 0) {
+    block = static_cast<uint64_t>(self) + kTableBase;  // addi r5,r3,12
+  } else {
+    count = REX_LOAD_U8(self + kCount);  // lbz r9,9(r3)
+    block = static_cast<uint64_t>(__builtin_rotateleft32(count, 3)) +
+            (static_cast<uint64_t>(self) + kTableBase);  // rotlwi r10,r9,3 ; add r5,r10,r11
+    spec.read(self + kTableBase, kRangeStride * count);  // the (min,max) pairs the loop reads
+  }
+  const uint32_t values = static_cast<uint32_t>(block);
+  spec.read(values + kBlockHeader, 4);
+
+  // lwz r11,0(r5) ; cmpwi cr6,r11,0 ; beq -- non-zero broadcasts the block through sub_828E29C0,
+  // whose `bctrl` walks an unbounded subscriber list and calls each node's stored function
+  // pointer. Neither the targets nor the count is knowable from entry state, and a listener is
+  // free to do anything, so that path is not replayable.
+  if (static_cast<int32_t>(REX_LOAD_U32(values + kBlockHeader)) != 0) return false;
+
+  // stwu r10,4(r8), N times, four bytes apart with no gaps: one contiguous span, at most 1,020
+  // bytes because the count is an `lbz`. The loop re-reads +9 every iteration, so the trip count
+  // is not fixed at entry in general -- but every store lands at block+4 or above and
+  // block >= self+12, so nothing in the call can move +9 and the count cannot grow.
+  if (static_cast<int32_t>(count) > 0) spec.write(values + kBlockValues, 4 * count);
+  return true;
 }
 
 }  // namespace port_82B1C210
-SKATE3_PORT(82B1C210, skate3::audio::kPortGate1, skate3::audio::kReturnR3)
+SKATE3_PORT(82B1C210, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

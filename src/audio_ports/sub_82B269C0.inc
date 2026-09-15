@@ -75,6 +75,13 @@ REX_FUNC(Native) {
 }
 
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
+  // Read by the image's sine and cosine, which this body calls. Copied here rather than referenced
+  // across ports: if sub_82F4DED0's table moves, move these too. Declared so a recorded vector
+  // carries what the callees reach; a read is never rewound and costs nothing against the budget.
+  spec.read(0x82FB4E20, 120);  // the shared trig table: 1/pi, pi in two parts, the coefficients
+  spec.read(0x82010108, 8);    // 1.0, the polynomial's leading term
+  spec.read(0x82FB58C8, 8);    // the NaN returned past the range limit
+
   (void)base;
   const uint32_t object = ctx.r3.u32;
   if (object == 0) return false;  // sub_82B453D8 would store through null
@@ -83,6 +90,11 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(kAngleScale, 4);
   spec.read(kZeroFloat, 4);
   spec.read(kAngleBias, 4);
+  // Read by the callee sub_82B453D8, not by this body. A read span is never rewound and costs
+  // nothing against the window budget, and without these a recorded vector cannot be replayed:
+  // the replay reaches a constant the recording never captured.
+  spec.read(0x8231A844, 4);
+  spec.read(0x820ED800, 4);
   return true;
 }
 

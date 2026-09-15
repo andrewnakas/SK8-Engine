@@ -1,5 +1,5 @@
 // sub_828E2D78  role: validate a handle against its owner's +8 generation, then unlink a node   lifted: skate3_recomp.47.cpp:4485 (81 lines)
-// STATUS: verified
+// STATUS: thin -- verified (zero divergence) but on too few calls for its size: 20 comparable calls in the weaker profile, 45 in the stronger, against 81 lifted lines -- thin in both profiles. Held out of default promotion by docs/promotion.md; shadows normally, never promoted.
 // calls/session: boot 22  play 45  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_828E2D78.md
 namespace port_828E2D78 {
@@ -75,4 +75,4 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
 }
 
 }  // namespace port_828E2D78
-SKATE3_PORT(828E2D78, skate3::audio::kPortVerified, skate3::audio::kReturnR3)
+SKATE3_PORT(828E2D78, skate3::audio::kPortVerifiedThin, skate3::audio::kReturnR3)

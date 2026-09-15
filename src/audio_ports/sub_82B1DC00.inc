@@ -1,5 +1,5 @@
 // sub_82B1DC00  role: find the global list entry whose container key matches u32[arg+8], unlink it, and when that empties the list hand the global record to sub_82B489D0; returns 12 always   lifted: skate3_recomp.67.cpp:3 (115 lines)
-// STATUS: verified
+// STATUS: thin -- verified (zero divergence) but on too few calls for its size: 5 comparable calls in the weaker profile, 8 in the stronger, against 115 lifted lines -- a handful of calls. Held out of default promotion by docs/promotion.md; shadows normally, never promoted.
 // calls/session: boot 5  play 8  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1DC00.md
 namespace port_82B1DC00 {
@@ -29,7 +29,9 @@ constexpr uint32_t kFrameBytes = 96;
 // A hard cap on the list walk so both the body and the window builder are visibly bounded. The
 // original walks until the next pointer is null.
 constexpr uint32_t kMaxNodes = 4096;
-constexpr uint32_t kMaxWalkReads = 8;
+// Key and next-pointer reads declared per walked node, for replay only: two spans a node, so 64
+// nodes stay well inside kPortMaxReads. A longer walk still shadows; its vector just cannot replay.
+constexpr uint32_t kMaxWalkReads = 64;
 
 inline bool Overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen) {
   return uint64_t(a) < uint64_t(b) + blen && uint64_t(b) < uint64_t(a) + alen;
@@ -147,7 +149,10 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   uint32_t reads = 0;
   for (uint32_t guard = 0; guard < kMaxNodes; guard++) {
     const uint32_t container = cursor - kNodeInContainer;
-    if (reads++ < kMaxWalkReads) spec.read(container + kContainerKey, 4);
+    if (reads++ < kMaxWalkReads) {
+      spec.read(container + kContainerKey, 4);
+      spec.read(cursor, 4);  // lwz r10,80(r10): the next pointer, read when the key misses
+    }
     if (int32_t(REX_LOAD_U32(container + kContainerKey)) == int32_t(key)) {
       node = cursor;
       break;
@@ -197,4 +202,4 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
 }
 
 }  // namespace port_82B1DC00
-SKATE3_PORT(82B1DC00, skate3::audio::kPortVerified, skate3::audio::kReturnR3)
+SKATE3_PORT(82B1DC00, skate3::audio::kPortVerifiedThin, skate3::audio::kReturnR3)

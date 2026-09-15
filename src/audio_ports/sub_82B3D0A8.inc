@@ -358,6 +358,9 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   const uint32_t e = ctx.r10.u32;
   const uint32_t f = REX_LOAD_U32(ctx.r1.u32 + kNinthArgSlot);
   spec.read(ctx.r1.u32 + kNinthArgSlot, 4);  // lwz r30,84(r1): the ninth argument
+  // The 1.0 the remainder loop reads whenever the vector path leaves elements over. Declared so a
+  // recorded vector carries it; a read is never rewound and costs nothing against the budget.
+  spec.read(kOneConstant, 4);
 
   int32_t done = 0;
   if (((b & 0xFu) == 0) && ((c & 0xFu) == 0)) {

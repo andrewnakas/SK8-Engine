@@ -265,6 +265,7 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
 
   const uint32_t owner = REX_LOAD_U32(object + kModeOwner);
   if (owner == 0) return false;  // lbz 72(r11) through null
+  spec.read(object + kModeOwner, 4);  // lwz r11,12(r31), for replay
   spec.read(owner + kModeByte, 1);
 
   // Which bus blocks the mixers touch is a routing-table walk, and the table is rodata: readable
@@ -308,6 +309,19 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     if ((touched_channels & (1u << channel)) == 0) continue;
     spec.read(static_cast<uint32_t>(base_source + stride * channel), kBusBytes);
   }
+  // Reads for replay only. The publish loop reads every channel's gain cell, not only the channels a
+  // route touches; the ramp paths reach sub_82B46810's rate and sub_82B44D18's pool.
+  for (uint32_t channel = 0; channel < channels; channel++) {
+    spec.read(static_cast<uint32_t>(base_source + stride * channel) + kSourceGain, 4);
+  }
+  spec.read(0x822F8A00u, 4);        // sub_82B46810's kRampRate
+  // sub_82B44D18's constant pool, as its own Windows() declares it, so a recorded vector carries
+  // everything the ramp kernel reads. For replay only; reads cost nothing against the budget.
+  spec.read(0x82257308u, 4);        // its kStepScale
+  spec.read(0x820ED958u, 4);        // kRampSpan
+  spec.read(0x82060C50u, 4);        // kLane2Scale
+  spec.read(0x82063B08u, 4);        // kLane3Scale
+  spec.read(0x8231BA20u, 16 * 8);   // kScale5..kScaleStep, then kScale1..kScale4
   return true;
 }
 

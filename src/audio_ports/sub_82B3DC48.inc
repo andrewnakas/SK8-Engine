@@ -137,6 +137,11 @@ REX_FUNC(Native) {
 // go negative (a ~4 GB memcpy length) refuses instead of being guessed at.
 struct Copy {
   uint64_t want = 0;   // the return value, and the words written at dest
+  // Where sub_82B3DB90 reads from, so this call's read set can name it. Declaring the source is
+  // what makes a recorded vector replayable: without it the recording holds the ring's header and
+  // not its data, and 206 of 206 vectors were unreplayable at the ring.
+  uint64_t src = 0;
+  int32_t run = 0;     // words from src to the ring end, before any wrap
   bool known = false;
 };
 
@@ -164,6 +169,8 @@ inline Copy PredictCopy(uint8_t* base, uint32_t object, uint32_t window, uint64_
   }
   const uint32_t ring_end = REX_LOAD_U32(window + kWinEnd);   // re-read, as the original does
   const int32_t run = int32_t(uint32_t(uint64_t(ring_end) - src)) >> 2;  // srawi r29,r10,2
+  copy.src = src;
+  copy.run = run;
   if (run < 0) return copy;                              // known stays false
   if (int32_t(uint32_t(copy.want)) < 0) return copy;     // the second run would be ~4 GB
   copy.known = true;
@@ -219,6 +226,19 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     if (!copy.known) return false;
     const uint64_t bytes = 4ull * uint64_t(uint32_t(copy.want));
     if (bytes > skate3::audio::kPortWatchCap) return false;
+    // The source runs this segment's copy reads, split at the ring end exactly as the callee
+    // splits them. Reads are never rewound and do not count against the window budget.
+    {
+      const uint64_t first_words =
+          (uint64_t(uint32_t(copy.want)) < uint64_t(uint32_t(copy.run)))
+              ? uint64_t(uint32_t(copy.want))
+              : uint64_t(uint32_t(copy.run));
+      spec.read(uint32_t(copy.src), uint32_t(4ull * first_words));
+      if (uint64_t(uint32_t(copy.want)) > first_words) {
+        spec.read(REX_LOAD_U32(window + kWinBase),
+                  uint32_t(4ull * (uint64_t(uint32_t(copy.want)) - first_words)));
+      }
+    }
     const uint32_t at = uint32_t(dest);
     if (bytes != 0) {
       if (at == 0) return false;                                 // a copy to guest 0

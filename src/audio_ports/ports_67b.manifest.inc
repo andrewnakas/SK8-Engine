@@ -7,6 +7,7 @@
 #include "audio_ports/sub_82B2F8C0.inc"
 #include "audio_ports/sub_82B2FE00.inc"
 #include "audio_ports/sub_82B2FEA8.inc"
+#include "audio_ports/sub_82B2FF88.inc"
 #include "audio_ports/sub_82B305C0.inc"
 #include "audio_ports/sub_82B30C50.inc"
 #include "audio_ports/sub_82B31368.inc"

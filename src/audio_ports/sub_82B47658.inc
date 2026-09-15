@@ -33,7 +33,10 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     spec.write(obj + 4, 9);
     spec.write(cursor, 4);
     spec.read(obj, 4);
-    spec.read(REX_LOAD_U32(cursor), 8);  // the byte stream, up to 5 bytes per code
+    // The byte stream. Each sub-object can consume two codes of up to five bytes, and all four may
+    // share one cursor, so the stream can advance 40 bytes before the last read. Recorded for
+    // replay only; 8 bytes left most shared-cursor vectors unreplayable.
+    spec.read(REX_LOAD_U32(cursor), 40);
   }
   return true;
 }

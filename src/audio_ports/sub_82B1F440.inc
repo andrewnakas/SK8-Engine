@@ -1,5 +1,5 @@
 // sub_82B1F440  role: deactivate an audio object -- release the instance it owns at +8 through that instance's vtable slot 0, null the pointer, then zero the two words of the stride-12 slot the byte index at +14 selects; returns 0   lifted: skate3_recomp.67.cpp:3513 (75 lines)
-// STATUS: gate-1 (its own bctrl: the release entry of whatever vtable sits at u32[object+8], `bctrl` at 0x82B1F474)
+// STATUS: partial -- compared 367, skipped 544, zero divergence (session g1_splits, 150 s scripted); substantive -- the whole tail compares. NEVER promoted: the skipped path has a native body but no comparison. (comparable only when u32[object+8] == 0 -- the release `bctrl` at 0x82B1F474 is the only unreplayable call and it sits on the other side of that test, so the whole tail still compares)
 // calls/session: boot 451  play ?  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B1F440.md
 namespace port_82B1F440 {
@@ -45,14 +45,32 @@ REX_FUNC(Native) {
   }
 }
 
-// Never called: the macro skips the shadow branch for a gate-labelled port. Kept so the file has
-// the same shape as every other port. The write set this WOULD declare is in the note.
+// Split by path. The only thing here the harness cannot replay is the release entry called
+// through u32[u32[object+8]+0], and it is reached only when that pointer is non-null -- which is
+// readable before the call, because nothing stores anything before the test. So: false when the
+// instance is still live (the macro runs the original and counts a PortSkip), true when it is
+// already null, where the comparable path is the whole tail -- the armed test at +15, the byte
+// index at +14, the stride-12 arithmetic and both stores.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
-  (void)ctx;
-  (void)base;
-  (void)spec;
-  return false;
+  const uint32_t object = ctx.r3.u32;
+  spec.read(object + kOwned, 4);
+  // lwz r3,8(r3) ; cmplwi cr6,r3,0 ; beq -- non-zero reaches the `bctrl`. Replaying that would
+  // run an unknown release entry a second time; no window rewinds a release.
+  if (REX_LOAD_U32(object + kOwned) != 0) return false;
+
+  // On this path the first store in the function is the one below, so the flag and the index read
+  // here are exactly the bytes the body reads.
+  spec.read(object + kSlotIndex, 2);  // +14 the index, +15 the armed flag
+  // lbz r11,15(r31) ; cmplwi ; beq -- unarmed writes nothing at all and returns the same 0.
+  if (REX_LOAD_U8(object + kSlotArmed) != 0) {
+    const uint64_t index = REX_LOAD_U8(object + kSlotIndex);
+    const uint32_t slot =
+        static_cast<uint32_t>(index * kSlotStride + static_cast<uint64_t>(object));
+    // stw +32 then stw +28: adjacent words, one span from the lower of the two.
+    spec.write(slot + kSlotWordB, 8);
+  }
+  return true;
 }
 
 }  // namespace port_82B1F440
-SKATE3_PORT(82B1F440, skate3::audio::kPortGate1, skate3::audio::kReturnR3)
+SKATE3_PORT(82B1F440, skate3::audio::kPortPartial, skate3::audio::kReturnR3)

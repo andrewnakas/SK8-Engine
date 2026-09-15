@@ -1,5 +1,5 @@
 // sub_82B3D578  role: store the .rdata zero float into two fields at +16 and +20   lifted: skate3_recomp.68.cpp:9840 (18 lines)
-// STATUS: verified
+// STATUS: thin -- verified (zero divergence) but on too few calls for its size: 10 comparable calls in the weaker profile, 11 in the stronger, against 18 lifted lines -- small, but seen ten times. Held out of default promotion by docs/promotion.md; shadows normally, never promoted.
 // calls/session: boot 10  play 11  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B3D578.md
 namespace port_82B3D578 {
@@ -31,4 +31,4 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
 }
 
 }  // namespace port_82B3D578
-SKATE3_PORT(82B3D578, skate3::audio::kPortVerified, skate3::audio::kReturnNone)
+SKATE3_PORT(82B3D578, skate3::audio::kPortVerifiedThin, skate3::audio::kReturnNone)

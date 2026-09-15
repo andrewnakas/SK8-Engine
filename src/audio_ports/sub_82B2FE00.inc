@@ -1,5 +1,5 @@
 // sub_82B2FE00  role: clamp a rate into range, then fill a five-point ramp plus its span   lifted: skate3_recomp.67.cpp:44204 (113 lines)
-// STATUS: verified
+// STATUS: thin -- verified (zero divergence) but on too few calls for its size: 4 comparable calls in the weaker profile, 4 in the stronger, against 113 lifted lines -- four calls, and this is the body whose misread constant caused the first divergence. Held out of default promotion by docs/promotion.md; shadows normally, never promoted.
 // calls/session: boot 8  play 8  map ?          thread: RwAudioCore Dac
 // note: probe/ports/notes/sub_82B2FE00.md
 namespace port_82B2FE00 {
@@ -96,4 +96,4 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
 }
 
 }  // namespace port_82B2FE00
-SKATE3_PORT(82B2FE00, skate3::audio::kPortVerified, skate3::audio::kReturnR3)
+SKATE3_PORT(82B2FE00, skate3::audio::kPortVerifiedThin, skate3::audio::kReturnR3)

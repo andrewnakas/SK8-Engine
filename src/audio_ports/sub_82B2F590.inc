@@ -351,6 +351,28 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(object + kReady, 2);
   spec.read(kFloorSingle, 4);
   spec.read(kOneSingle, 4);
+  // The callees' rodata, for replay only, copied from their own window builders: sub_82B2FE00's
+  // pool words and singles, sub_82B2FEA8's pool and its 1652-entry table, sub_82B2F2C8's edges, knot
+  // table, rates, headroom and zero, and sub_82B2FF88's rates and candidates. 3 of 300 recorded calls
+  // stopped at sub_82B2FE00's +468 before this.
+  spec.read(0x822F87C8u, 24);   // +456 .. +479: sub_82B2FEA8's three singles, sub_82B2FE00's +468..+479
+  spec.read(0x82060C50u, 4);
+  spec.read(0x8208824Cu, 4);
+  spec.read(0x822249B4u, 4);
+  spec.read(0x820ED57Cu, 4);
+  spec.read(0x82099280u, 4);
+  const uint32_t table = REX_LOAD_U32(object + kTableOffset);
+  if (table != 0 && uint64_t(table) + 1652ull * 4 <= 0x100000000ull) spec.read(table, 1652 * 4);
+  spec.read(0x821161A0u, 12);
+  spec.read(0x821161B0u, 216);
+  spec.read(0x822F8A50u, 20);   // +1104 .. +1123: sub_82B2FF88's three and sub_82B2F2C8's +1120
+  spec.read(0x822F8A64u, 4);    // sub_82B2F2C8's +1124
+  spec.read(0x82063A48u, 4);
+  spec.read(0x82165A10u, 4);
+  spec.read(0x82116288u, 4);
+  spec.read(0x821161ACu, 4);
+  spec.read(0x820BA9D0u, 4);
+  spec.read(0x8209975Cu, 4);
 
   // The +1088 byte decides the last block. On the blend path this function has just stored zero into
   // it, so sub_82B2FF88 is certain; otherwise the entry value decides.

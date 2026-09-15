@@ -140,6 +140,14 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
   spec.read(owner + kOwnerTotal, 4);
   spec.read(kZeroFloat, 4);
   spec.read(kCorrectionScale, 4);
+  // The correction path reaches sub_82F55068 and its natural log, whose rodata no window of theirs
+  // is recorded under this function's name. Declared here for replay only -- reads cost nothing
+  // against the budget -- so a correction-path vector carries every byte the callees read. Values
+  // and offsets are the ones recomp/src/audio_ports/sub_82F55068.inc declares for itself.
+  spec.read(0x82050000u + 8344, 144);  // the log pool, log10(e) inside it at +8368
+  spec.read(0x82010000u + 248, 24);    // 0.0, -1.0, 1.0
+  spec.read(0x82010000u + 648, 8);     // 0.5
+  spec.read(0x82FB0000u + 22720, 16);  // +inf and the NaN, both negated on the way out
 
   spec.write(self + kValue, 8);           // stfs +28 ; stfs +32
   spec.write(owner + kOwnerTotal, 4);     // stfs f10,40(r11) / stfs f11,40(r10)

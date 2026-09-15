@@ -110,7 +110,7 @@ struct ShadowStats {
 bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lifted,
                    std::span<const ShadowWindow> windows,
                    std::span<const ShadowWindow> inputs, ShadowResults returns,
-                   ShadowStats& stats);
+                   ShadowStats& stats, bool reads_truncated = false);
 
 /// Record a call the hook declined to compare, so the divergence figure is read against it.
 void ShadowSkip(ShadowStats& stats, const char* why);

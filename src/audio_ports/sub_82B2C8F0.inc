@@ -26,8 +26,11 @@ constexpr uint32_t kArrayWords = 8;
 
 // sub_82B426D0's channel-mapping tables, reached when both counts are in {1,2,4,6,8}. Both computed
 // from lis -32241 (0x820F0000) plus -10496 / -10368, not read by eye.
-constexpr uint32_t kMatrixIndex = 0x820CD700u;  // 64 (start,end) byte pairs
-constexpr uint32_t kMatrixBytes = 0x820CD780u;  // one byte per mapping: dst = b & 7
+// CORRECTED 2026-09-13: these read 0x820CD700 / 0x820CD780 -- a digit wrong, by eye. 0x820F0000 -
+// 10496 is 0x820ED700, which is what sub_82B426D0 and sub_82B468C0 use and what the Rust gather
+// replays clean against. Until the fix, MappingStaysInBounds below checked the wrong table.
+constexpr uint32_t kMatrixIndex = 0x820ED700u;  // 64 (start,end) byte pairs
+constexpr uint32_t kMatrixBytes = 0x820ED780u;  // one byte per mapping: dst = b & 7
 
 // A cap on the declared row length so a corrupt +48 cannot run the span arithmetic away. 8 KB of
 // floats is already far past the 1 KB rows the mixer actually uses.

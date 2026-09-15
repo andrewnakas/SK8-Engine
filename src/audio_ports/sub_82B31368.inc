@@ -108,6 +108,12 @@ bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
     return false;  // would index past the eight-entry frame arrays: not enumerable
   }
   spec.read(voice + kGains, 4 * kGainWords);
+  // The gather's rodata, declared for replay only (reads cost nothing against the budget): the
+  // scatter-mixer's gain table and its range and route tables, and the copy path's unity gain.
+  spec.read(0x820ED6C0u, 16);
+  spec.read(0x820ED700u, 128);
+  spec.read(0x820ED780u, 256);
+  spec.read(0x8231A844u, 4);
   if (!UnlinkWindows(base, spec, node, true, gain_count)) return false;
   spec.write(voice + kGains, 4 * kGainWords);  // stwu r9,4(r11) x8
   return true;

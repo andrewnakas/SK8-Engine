@@ -120,6 +120,9 @@ REX_FUNC(Native) {
 // What this does NOT lean on is sub_82B3D0A8's own port being green: its note says it has never
 // been compared. It leans on the lifted body.
 bool Windows(PPCContext& ctx, uint8_t* base, skate3::audio::PortSpec& spec) {
+  // Reached through the callee sub_82B3D0A8, whose remainder loop reads this 1.0. Copied rather than
+  // referenced across ports: if that port's kOneConstant moves, move this too.
+  spec.read(0x8231A844, 4);
   const uint32_t desc = ctx.r7.u32;
   spec.read(desc, kDescBytes);
   spec.read(ctx.r3.u32 + kGain0, 8);
