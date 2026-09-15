@@ -121,6 +121,13 @@ REXCVAR_DEFINE_BOOL(skate3_audio_probe_messages, false, "Skate 3",
 REXCVAR_DEFINE_UINT32(skate3_audio_probe_messages_count, 4000, "Skate 3",
                       "How many audio object messages to log in full.");
 
+REXCVAR_DEFINE_UINT32(skate3_audio_probe_opens_count, 400, "Skate 3",
+                      "How many voice opens, and separately how many graph builds, to log.");
+
+REXCVAR_DEFINE_UINT32(skate3_audio_probe_updates_count, 6000, "Skate 3",
+                      "How many message re-deliveries to log in full; after that, one line in "
+                      "every 20000.");
+
 namespace {
 
 constexpr uint32_t kObjectTable = 0x8302D4A4;  // {char* name; u16 project; u16 name_id}
@@ -205,7 +212,10 @@ namespace {
 
 std::atomic<uint64_t> g_opens{0};
 std::atomic<uint64_t> g_graphs{0};
-constexpr uint64_t kSeamCap = 400;
+uint64_t SeamCap() {
+  static const uint64_t cap = REXCVAR_GET(skate3_audio_probe_opens_count);
+  return cap;
+}
 
 }  // namespace
 
@@ -214,7 +224,7 @@ constexpr uint64_t kSeamCap = 400;
 // descriptor words, r7/r8 = two bank words, r9 = {u32 count, u32 records*} of 12-byte records.
 extern "C" REX_FUNC(sub_824A3140) {
   static const bool enabled = REXCVAR_GET(skate3_audio_probe_messages);
-  if (!enabled || g_opens.load(std::memory_order_relaxed) >= kSeamCap) {
+  if (!enabled || g_opens.load(std::memory_order_relaxed) >= SeamCap()) {
     __imp__sub_824A3140(ctx, base);
     return;
   }
@@ -252,7 +262,7 @@ extern "C" REX_FUNC(sub_824A3140) {
 // descriptors; each names a module class at +4 whose vtable +4 sizes the instance. Returns the player.
 extern "C" REX_FUNC(sub_82B48C48) {
   static const bool enabled = REXCVAR_GET(skate3_audio_probe_messages);
-  if (!enabled || g_graphs.load(std::memory_order_relaxed) >= kSeamCap) {
+  if (!enabled || g_graphs.load(std::memory_order_relaxed) >= SeamCap()) {
     __imp__sub_82B48C48(ctx, base);
     return;
   }
@@ -276,7 +286,10 @@ extern "C" REX_FUNC(sub_82B48C48) {
 namespace {
 
 std::atomic<uint64_t> g_updates{0};
-constexpr uint64_t kUpdateCap = 6000;
+uint64_t UpdateCap() {
+  static const uint64_t cap = REXCVAR_GET(skate3_audio_probe_updates_count);
+  return cap;
+}
 
 }  // namespace
 
@@ -289,7 +302,7 @@ extern "C" REX_FUNC(sub_828E2D18) {
     return;
   }
   const uint64_t n = g_updates.fetch_add(1, std::memory_order_relaxed);
-  if (n < kUpdateCap || n % 20000 == 0) {
+  if (n < UpdateCap() || n % 20000 == 0) {
     const uint32_t node = ctx.r3.u32, payload = ctx.r4.u32;
     const char* name = "(unknown)";
     if (node >= 0x40000000 && node < 0xF0000000) {
