@@ -30,6 +30,7 @@
 // tree is shared with the phone builds and compiles a plain 100u there.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 #include <rex/cvar.h>
@@ -45,7 +46,28 @@ REXCVAR_DEFINE_UINT32(
     "frame-rate dip; lower it towards 100 if a hitch throws the skater "
     "through the world.");
 
+namespace {
+// Is sub_82B82720 even executed?
+//
+// Raising the cap to 600 should have made a 55 ms frame advance 3.3 periods
+// instead of 1, and on hardware it changed nothing - not when the clamp was
+// binding, and not when it was not. The simplest explanation left is that this
+// code does not run, or does not feed the simulation, and that has never been
+// checked. It is worth exactly one counter to find out, because the whole
+// "patch the guest's timestep" approach stands or falls on it.
+//
+// This function is called from the patched compare, so it ticks once every
+// time the clamp is evaluated - which, if this is the per-frame path, means
+// about once per guest frame.
+std::atomic<uint64_t> g_calls{0};
+}  // namespace
+
+namespace skate3::frame_advance {
+uint64_t TakeClampCalls() { return g_calls.exchange(0, std::memory_order_relaxed); }
+}  // namespace skate3::frame_advance
+
 extern "C" unsigned int Skate3GuestFrameAdvanceCap(void) {
+  g_calls.fetch_add(1, std::memory_order_relaxed);
   // Never below 100: under one period would run the game slower than the
   // stock title everywhere, which is the opposite of the point.
   return std::max<uint32_t>(100u, REXCVAR_GET(skate3_frame_advance_cap));

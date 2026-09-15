@@ -36,6 +36,11 @@ extern "C" void svcSleepThread(int64_t nano);
 #include <windows.h>
 #endif
 
+namespace skate3::frame_advance {
+// Executions of the patched guest simulation clamp; see skate3_frame_advance.cpp.
+uint64_t TakeClampCalls();
+}  // namespace skate3::frame_advance
+
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -556,11 +561,15 @@ void ReportPacing() {
   // "slow" and "juddering". At info it has never once reached a Switch log,
   // because raising that console to info turns on the guest driver's own
   // printing and changes the pacing being measured.
+  // clamp= is executions of the guest's own per-frame time clamp over the same
+  // window (see skate3_frame_advance.cpp). Compare it to frames: about one per
+  // frame means that code IS the game's frame timing and patching it is worth
+  // doing; ZERO means it never runs and every theory built on it is wrong.
   REXLOG_WARN(
       "[pace] {:.0f}s: frames={} fps={:.1f} p50={:.1f}ms p95={:.1f}ms max={:.1f}ms "
-      "guest_clock={:.3f}x",
+      "guest_clock={:.3f}x clamp={}",
       secs, sorted.size(), double(sorted.size()) / secs, pct(0.50), pct(0.95), sorted.back(),
-      secs > 0.0 ? guest_secs / secs : 0.0);
+      secs > 0.0 ? guest_secs / secs : 0.0, skate3::frame_advance::TakeClampCalls());
   s_intervals_ms.clear();
   s_window_start = now;
   s_window_start_guest_ticks = guest_ticks_now;
