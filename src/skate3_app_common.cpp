@@ -34,11 +34,15 @@ REXCVAR_DECLARE(std::string, skate3_loader_request_path);
 REXCVAR_DECLARE(std::string, picker_chord);
 REXCVAR_DECLARE(bool, guide_button);
 
-REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, false, "Skate 3",
-                    "Ask which content pack to load when several are installed. Off: the first "
-                    "by name is staged. The chooser runs from OnPostSetup, where the UI is not "
-                    "yet painting - it blocks there and the screen stays black, so it needs a "
-                    "different insertion point before it can be on by default.");
+REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, true, "Skate 3",
+                    "Ask which content pack to load when several are installed, even if one is "
+                    "already remembered. Off: the remembered pack loads straight away, or the "
+                    "first by name if there is none.\n"
+                    "\n"
+                    "This was off and read by nothing, because the chooser used to run from "
+                    "OnPostSetup where the UI is not yet painting - it blocked there and the "
+                    "screen stayed black. It runs asynchronously from OnFinalizePaths now, "
+                    "which is the different insertion point it was waiting for.");
 
 REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
                       "Which custom content pack in Documents to stage this launch, by folder "
@@ -956,7 +960,17 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   // which is exactly the black screen it produced. Returning nullopt lets the
   // loop start and the dialog render; startup resumes from the callback, the
   // same shape the install wizards above use on Apple platforms.
-  if (REXCVAR_GET(skate3_content_pack).empty() && !chose_content_pack_) {
+  // Asking even when a pack is already named is the point of the _menu cvar.
+  // Without it the chooser was unreachable for good the moment the in-game
+  // level picker ran once: that path writes skate3_content_pack so its choice
+  // survives the relaunch it needs (see SetRestartCallback), and nothing ever
+  // put the value back. The startup chooser's own answer is deliberately NOT
+  // persisted - it lives in chosen_content_pack_ for this process only - so
+  // "asked every launch" is the behaviour this screen was always written for,
+  // and one write from somewhere else silently took it away. Reported as not
+  // being able to choose a map at startup, which was exact.
+  if ((REXCVAR_GET(skate3_content_pack).empty() || REXCVAR_GET(skate3_content_pack_menu)) &&
+      !chose_content_pack_) {
     const std::vector<std::string> packs =
         DiscoverContentPackNames(runtime_paths.user_data_root.parent_path());
     if (packs.size() > 1) {

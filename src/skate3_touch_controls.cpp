@@ -6,6 +6,7 @@
 #include <imgui.h>
 
 #include <rex/cvar.h>
+#include <rex/logging.h>
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -234,7 +235,7 @@ void DrawEditorChrome(ImGuiIO& io, const TouchVisualState& state) {
   ImGui::PushTextWrapPos(0.0f);
   ImGui::TextUnformatted("Drag any control to move it. Tap one to select it, then use the "
                          "size buttons - they work on the small buttons, which are too "
-                         "small to pinch.");
+                         "small to pinch. Done or the gear returns to the game.");
   ImGui::PopTextWrapPos();
   ImGui::Spacing();
 
@@ -302,6 +303,20 @@ void TouchControlsOverlay::OnDraw(ImGuiIO& io) {
 
   size_t count = 0;
   const TouchControl* layout = rex::input::touch::TouchLayout(&count);
+
+  // Everything the overlay decides from, once per change of the editing flag.
+  // WARN because Android ships at warn, and a report about the editor is
+  // exactly the report where this has to survive. Kept after the hunt it was
+  // added for: an editor that draws nothing while the controls still drag is
+  // not a state this code can reach on paper, so a report needs the values
+  // rather than another guess about them.
+  static int announced_editing = -1;
+  if (announced_editing != int(editing)) {
+    announced_editing = int(editing);
+    REXLOG_WARN("touch: overlay draw - editing={} active={} controls={} display={}x{}",
+                editing, state.active, count, io.DisplaySize.x, io.DisplaySize.y);
+  }
+
   if (layout == nullptr || count == 0) {
     return;
   }
