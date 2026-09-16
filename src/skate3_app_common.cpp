@@ -1035,7 +1035,11 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // underneath a settings screen nobody asked to keep open.
   level_select_dialog_->SetCloseMenusCallback([this] {
     if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
-      ToggleSimpleSettings();
+      // Hide, not RequestClose: picking a map relaunches the game, which
+      // applies every pending setting on the way. Stopping to ask whether to
+      // restart, immediately before restarting, would be a question with only
+      // one answer.
+      simple_settings_dialog_->Hide();
     }
   });
   // Without a launcher, the picker restarts us on the chosen pack itself. The
@@ -1292,7 +1296,11 @@ void Skate3BaseApp::OnShutdown() {
 
 void Skate3BaseApp::ToggleSimpleSettings() {
   if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
-    simple_settings_dialog_->Hide();
+    // RequestClose rather than Hide: leaving with a startup-only setting
+    // outstanding says so first. Closing by the chord or the gear is the same
+    // act as backing out with B and deserves the same notice - otherwise the
+    // warning would depend on which way you happened to leave.
+    simple_settings_dialog_->RequestClose();
     return;
   }
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
