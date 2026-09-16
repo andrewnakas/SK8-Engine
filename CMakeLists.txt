@@ -288,6 +288,9 @@ set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
     src/skate3_audio_fixes.cpp
+    src/skate3_audio_probe.cpp
+    src/skate3_audio_shadow.cpp
+    src/skate3_audio_native.cpp
     src/skate3_crash_report.cpp
     src/skate3_demo_path.cpp
     src/skate3_diagnostics.cpp
@@ -436,6 +439,15 @@ else()
 endif()
 
 target_link_libraries(skate3 PRIVATE rex::runtime)
+
+# Guest call tracing: compiled out unless asked for, because the hook costs two loads
+# and a not-taken branch at every one of ~47,889 guest function entries. Scoped to this
+# target deliberately -- putting it in CMAKE_CXX_FLAGS invalidates every third-party
+# library in the tree and turns a 200-file rebuild into a 700-file one.
+option(SKATE3_GUEST_TRACE "Record guest function entries (see src/skate3_guest_trace.cpp)" OFF)
+if(SKATE3_GUEST_TRACE)
+    target_compile_definitions(skate3 PRIVATE SKATE3_GUEST_TRACE=1)
+endif()
 
 # A static archive only yields the members that resolve an undefined symbol.
 # That is wrong for this library: REX_EXPORT expands to a
