@@ -92,18 +92,35 @@ class LevelSelectDialog final : public rex::ui::ImGuiDialog {
     visible_ = !visible_;
     LogToggle();
   }
+  // Opened from the settings menu, where it is a row rather than something
+  // that appears of its own accord. Always shows, even with no packs
+  // installed: the empty state is where the instructions live, and a row that
+  // silently does nothing when you press it is the complaint that got the
+  // picker looked at in the first place.
+  void Show() {
+    visible_ = true;
+    LogToggle();
+  }
   bool visible() const { return visible_; }
   // True only when a launcher passed a level list, i.e. this session is
   // launcher-driven and Escape should mean "change level".
   static bool available();
   // The picker also shows itself whenever this returns true -- used to pin it
-  // beside the Escape settings screen.
+  // beside the Escape settings screen in a launcher-driven session. Do NOT
+  // make this "the settings are open": without a launcher the picker then
+  // covers the graphics page every time it is opened.
   void SetCompanionPredicate(std::function<bool()> predicate) {
     companion_ = std::move(predicate);
   }
   void SetCloseMenusCallback(std::function<void()> callback) {
     close_menus_ = std::move(callback);
   }
+  // The folder map packs are looked for in, shown verbatim when there are
+  // none. Supplied rather than derived here because this class does not know
+  // the runtime paths, and a path guessed wrong is worse than none - it is
+  // under Android/data, which a file manager will not open, so nobody can
+  // check it by eye.
+  void SetPackRootHint(std::string path) { pack_root_hint_ = std::move(path); }
   // How to relaunch when there is no launcher process listening.
   //
   // The desktop route writes a request file and lets the launcher re-stage and
@@ -130,6 +147,10 @@ class LevelSelectDialog final : public rex::ui::ImGuiDialog {
   // picker rather than being left open over the new load.
   std::function<void()> close_menus_;
   std::function<void(const std::string&)> restart_with_pack_;
+  std::string pack_root_hint_;
+
+  // Drawn instead of the list when nothing is installed: says where packs go.
+  void DrawEmptyState(ImGuiIO& io);
 
   LoaderOverlay* overlay_ = nullptr;
   bool visible_ = false;

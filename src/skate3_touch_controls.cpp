@@ -166,31 +166,115 @@ void DrawGlyph(ImDrawList* dl, const rex::input::touch::TouchControl& c,
   dl->AddText(at, ink, c.label);
 }
 
-// A band across the top saying what this mode is and how to leave it.
+// The name a player would call a control, for the editor panel to say what is
+// selected. Distinct from the drawn label, which is a glyph for half of them.
+const char* ControlDisplayName(TouchControlId id) {
+  switch (id) {
+    case TouchControlId::kLeftStick: return "Left stick";
+    case TouchControlId::kRightStick: return "Right stick";
+    case TouchControlId::kA: return "A";
+    case TouchControlId::kB: return "B";
+    case TouchControlId::kX: return "X";
+    case TouchControlId::kY: return "Y";
+    case TouchControlId::kLeftShoulder: return "LB";
+    case TouchControlId::kRightShoulder: return "RB";
+    case TouchControlId::kLeftTrigger: return "LT";
+    case TouchControlId::kRightTrigger: return "RT";
+    case TouchControlId::kStart: return "Start";
+    case TouchControlId::kBack: return "Back";
+    case TouchControlId::kDPadUp: return "D-pad up";
+    case TouchControlId::kDPadDown: return "D-pad down";
+    case TouchControlId::kDPadLeft: return "D-pad left";
+    case TouchControlId::kDPadRight: return "D-pad right";
+    case TouchControlId::kMenu: return "Menu";
+    default: return "";
+  }
+}
+
+// The editor's panel: what is selected, how to resize it, and the way out.
 //
-// Worth the space: the mode takes the pad away from the game, and a player who
-// cannot work out how to get it back has lost their session. The controls
-// themselves become the instructions - drag one, pinch one - so this only has
-// to name the two things the controls cannot say.
-void DrawEditorChrome(ImDrawList* dl, ImGuiIO& io, const TouchVisualState& state) {
+// The first version of this was a caption saying "drag to move, two fingers to
+// resize, close the settings when you are done", and both halves of that
+// advice were wrong in practice. A d-pad key is about four percent of the
+// screen across - two fingers do not fit on it, so pinch could only ever
+// resize the sticks. And making "reopen the settings" the exit meant leaving
+// through a gear button that may itself have just been dragged somewhere
+// awkward, which is a poor way out of a mode that has taken the pad away from
+// the game.
+//
+// So: buttons. Real ImGui widgets, which take touch like any other menu, in a
+// region the driver is told to leave alone.
+void DrawEditorChrome(ImGuiIO& io, const TouchVisualState& state) {
   const float w = io.DisplaySize.x;
   const float h = io.DisplaySize.y;
-  const float band = std::max(52.0f, h * 0.11f);
-  dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(w, band), Black(0.72f));
-  dl->AddLine(ImVec2(0.0f, band), ImVec2(w, band), Accent(0.8f), 2.0f);
 
-  const char* title = "Arranging the on-screen controls";
-  const char* help =
-      "Drag a control to move it.  Two fingers on one control to resize it.  "
-      "Close the settings menu when you are done.";
-  const ImVec2 title_size = ImGui::CalcTextSize(title);
-  const ImVec2 help_size = ImGui::CalcTextSize(help);
-  dl->AddText(ImVec2((w - title_size.x) * 0.5f, band * 0.22f), Accent(0.95f), title);
-  dl->AddText(ImVec2((w - help_size.x) * 0.5f, band * 0.58f), White(0.8f), help);
+  // Dim the game: the controls are the subject now, not what is behind them.
+  ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize,
+                                                Black(0.45f));
 
-  // Dim the game so the controls read as the subject rather than as an
-  // overlay on top of something that is still being played.
-  dl->AddRectFilled(ImVec2(0.0f, band), ImVec2(w, h), Black(0.35f));
+  const TouchControlId selected = rex::input::touch::TouchLayoutSelectedControl();
+  const bool has_selection = size_t(selected) < size_t(TouchControlId::kCount);
+
+  // Centred: the one part of a landscape phone that no control occupies by
+  // default, and far from the screen edges a thumb sweeps.
+  const float panel_w = std::min(w * 0.52f, 560.0f);
+  ImGui::SetNextWindowPos(ImVec2(w * 0.5f, h * 0.42f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(panel_w, 0.0f), ImGuiCond_Always);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0f, 18.0f));
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.05f, 0.07f, 0.94f));
+  ImGui::Begin("##touch_layout_editor", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);
+
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.78f, 1.0f, 1.0f));
+  ImGui::TextUnformatted("Arranging the on-screen controls");
+  ImGui::PopStyleColor();
+  ImGui::Spacing();
+  ImGui::PushTextWrapPos(0.0f);
+  ImGui::TextUnformatted("Drag any control to move it. Tap one to select it, then use the "
+                         "size buttons - they work on the small buttons, which are too "
+                         "small to pinch.");
+  ImGui::PopTextWrapPos();
+  ImGui::Spacing();
+
+  ImGui::Text("Selected:  %s", has_selection ? ControlDisplayName(selected) : "nothing yet");
+  ImGui::Spacing();
+
+  // Big targets: this is a touchscreen and the thing being arranged is the
+  // reason the player is here.
+  const ImVec2 button(panel_w * 0.46f, 56.0f);
+  ImGui::BeginDisabled(!has_selection);
+  if (ImGui::Button("Smaller", button)) {
+    rex::input::touch::NudgeTouchControlSize(0.88f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Bigger", button)) {
+    rex::input::touch::NudgeTouchControlSize(1.14f);
+  }
+  ImGui::EndDisabled();
+  ImGui::Spacing();
+  if (ImGui::Button("Reset to Default Layout", ImVec2(panel_w, 52.0f))) {
+    rex::input::touch::ResetTouchLayout();
+  }
+  ImGui::Spacing();
+  if (ImGui::Button("Done", ImVec2(panel_w, 60.0f))) {
+    // Saves on the way out; see SetTouchLayoutEditing.
+    rex::input::touch::SetTouchLayoutEditing(false);
+  }
+
+  // Tell the driver where this is, so a control dragged underneath cannot
+  // swallow the presses meant for these buttons - Done included.
+  const ImVec2 pos = ImGui::GetWindowPos();
+  const ImVec2 size = ImGui::GetWindowSize();
+  if (w > 0.0f && h > 0.0f) {
+    rex::input::touch::SetTouchLayoutReservedRect(pos.x / w, pos.y / h,
+                                                  (pos.x + size.x) / w, (pos.y + size.y) / h);
+  }
+
+  ImGui::End();
+  ImGui::PopStyleColor();
+  ImGui::PopStyleVar(2);
   (void)state;
 }
 
@@ -235,7 +319,7 @@ void TouchControlsOverlay::OnDraw(ImGuiIO& io) {
   const float unit = std::min(w, h);
 
   if (editing) {
-    DrawEditorChrome(dl, io, state);
+    DrawEditorChrome(io, state);
   }
 
   for (size_t i = 0; i < count; ++i) {

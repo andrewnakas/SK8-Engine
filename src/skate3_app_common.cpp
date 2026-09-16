@@ -25,6 +25,15 @@
 // only pulls SDL_events.h.
 #include <SDL3/SDL_video.h>
 
+// Defined in skate3_loader_overlay.cpp: the file a desktop launcher watches
+// for a relaunch request. Empty means nobody is listening, which is how the
+// picker knows it is on its own and must not pin itself beside the settings.
+REXCVAR_DECLARE(std::string, skate3_loader_request_path);
+// Both defined in the SDK's input system; read here to rescue a saved chord
+// that cannot fire.
+REXCVAR_DECLARE(std::string, picker_chord);
+REXCVAR_DECLARE(bool, guide_button);
+
 REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, false, "Skate 3",
                     "Ask which content pack to load when several are installed. Off: the first "
                     "by name is staged. The chooser runs from OnPostSetup, where the UI is not "
@@ -992,10 +1001,22 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   // launcher passed a level list.
   level_select_dialog_ =
       std::make_unique<skate3::LevelSelectDialog>(drawer, loader_overlay_.get());
-  // Shown beside the normal Escape settings screen, so the system menu keeps
-  // everything it had and simply gains a map list.
-  level_select_dialog_->SetCompanionPredicate(
-      [this] { return simple_settings_dialog_ && simple_settings_dialog_->visible(); });
+  // Beside the settings screen ONLY in a launcher-driven session.
+  //
+  // That is what the companion behaviour was written for: the desktop launcher
+  // supplies a map list, and the settings screen gains it rather than hiding
+  // it behind another chord. On a phone there is no launcher, and the moment
+  // this port started publishing its own list - the installed map packs - the
+  // picker began appearing over the graphics settings uninvited, which is not
+  // a map list gained so much as a settings page lost.
+  //
+  // So it is a companion where a launcher is listening, and a row in the menu
+  // everywhere else. The condition is the launcher, not the platform: a
+  // desktop session without one behaves like the phone, which is right.
+  level_select_dialog_->SetCompanionPredicate([this] {
+    return !REXCVAR_GET(skate3_loader_request_path).empty() && simple_settings_dialog_ &&
+           simple_settings_dialog_->visible();
+  });
   // Choosing a map closes the whole system menu, so the new world is not loaded
   // underneath a settings screen nobody asked to keep open.
   level_select_dialog_->SetCloseMenusCallback([this] {
@@ -1144,9 +1165,29 @@ void Skate3BaseApp::OnPostSetup() {
     input_system->SetPerfChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() { TogglePerformanceMenu(); });
     });
-    // The middle Xbox button opens the level picker (cvar picker_chord). It
-    // only reaches the input system when guide_button is on, so a launcher that
-    // wants it must set both.
+    // Rescue a saved picker_chord that can never fire.
+    //
+    // The default was "guide", the middle Xbox button, which reaches the input
+    // system only when guide_button is true - and nothing sets both, so the
+    // level picker had never opened for anybody. Changing the compiled default
+    // fixes that for a fresh install and for nobody else: settings.toml is
+    // applied OVER the compiled default, and every existing player already has
+    // picker_chord = 'guide' written in theirs. Found on the dev phone, whose
+    // file still said 'guide' after the fix was in.
+    //
+    // So migrate it. Narrow on purpose: only the exact combination that is
+    // provably inert, and only onto the new default. Someone who deliberately
+    // chose the guide button AND turned guide_button on keeps it.
+    if (REXCVAR_GET(picker_chord) == "guide" && !REXCVAR_GET(guide_button)) {
+      rex::cvar::SetFlagByName("picker_chord", "lb+back");
+      REXLOG_WARN(
+          "picker_chord was 'guide', which cannot fire without guide_button; "
+          "migrated to 'lb+back'");
+      if (simple_settings_dialog_) {
+        simple_settings_dialog_->SaveSettingsNow();
+      }
+    }
+    // The chord that opens the level picker (cvar picker_chord).
     input_system->SetPickerChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() {
         if (level_select_dialog_) {
@@ -1402,6 +1443,17 @@ void Skate3BaseApp::EnsureSimpleSettingsDialog() {
           imgui_drawer(), user_settings_path_, std::move(load_profiles), std::move(save_profile),
           std::move(close_settings), std::move(close_game), std::move(restart_game),
           std::move(poll_gamepad), std::move(poll_perf_stats));
+  // Opening the picker from the menu, which is how it is reached without a
+  // launcher. Hides the settings first: the picker is a full-screen list and
+  // drawing it over the menu is the thing being fixed.
+  simple_settings_dialog_->SetOpenLevelPickerCallback([this] {
+    if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
+      ToggleSimpleSettings();
+    }
+    if (level_select_dialog_) {
+      level_select_dialog_->Show();
+    }
+  });
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
   simple_settings_dialog_->SetTouchLayoutCallbacks(
       [](bool editing) { rex::input::touch::SetTouchLayoutEditing(editing); },
@@ -1435,6 +1487,7 @@ void Skate3BaseApp::ApplyGameplayCursorMode() {
 }
 
 void Skate3BaseApp::RestartGame() {
+  REXLOG_WARN("[restart] requested");
   app_context().CallInUIThreadDeferred([this]() {
 #if defined(_WIN32)
     wchar_t executable_path[MAX_PATH] = {};
@@ -1492,10 +1545,14 @@ void Skate3BaseApp::RestartGame() {
     // An app process cannot exec itself either, but the activity can relaunch
     // the app: it starts a fresh task from a helper process and lets this one
     // exit. Settings are already on disk, so quitting below completes it.
+    // WARN, not INFO. The shipped Android log level is warn, so every line
+    // that said how far a restart got was invisible in exactly the reports
+    // that were about restarts not working. This is three lines in a session.
+    REXLOG_WARN("[restart] asking the activity to relaunch");
     if (skate3::android::RequestRestart()) {
-      REXLOG_INFO("Restart requested: relaunch scheduled through the activity");
+      REXLOG_WARN("[restart] the activity accepted; quitting now");
     } else {
-      REXLOG_WARN("Restart requested, but the activity declined; quitting for a manual relaunch");
+      REXLOG_WARN("[restart] the activity declined; quitting for a manual relaunch");
     }
 #else
     const std::string executable = rex::path_to_utf8(executable_path);
@@ -1883,6 +1940,15 @@ void Skate3BaseApp::StageContentPacks() {
   // The packs found here ARE the list: one is staged per launch, so picking a
   // different one means naming it and relaunching, which is what the picker's
   // no-launcher path now does.
+  // Where packs go, for the picker's empty state to print. Set from here
+  // rather than where the dialog is built: this is the scan that defines the
+  // answer, and at dialog-construction time the runtime paths are not
+  // reliably up yet. A path printed wrong would be worse than none - it is
+  // under Android/data, which no file manager will open, so nobody can check
+  // it by eye.
+  if (level_select_dialog_) {
+    level_select_dialog_->SetPackRootHint(rex::path_to_utf8(documents));
+  }
   {
     std::string levels;
     for (const auto& entry : candidates) {

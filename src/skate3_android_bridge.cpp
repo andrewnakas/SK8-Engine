@@ -118,6 +118,7 @@ bool DownloadFile(std::string_view url, const std::filesystem::path& destination
 bool RequestRestart() {
   ActivityMethod m;
   if (!Resolve(m, "requestRestart", "()Z")) {
+    REXLOG_WARN("[restart] could not resolve requestRestart on the activity");
     return false;
   }
   const jboolean accepted = m.env->CallStaticBooleanMethod(m.cls, m.method);

@@ -608,6 +608,59 @@ PadNav ReadPadNav(float delta_seconds) {
 
 }  // namespace
 
+void LevelSelectDialog::DrawEmptyState(ImGuiIO& io) {
+  ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                          ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x * 0.62f, io.DisplaySize.y * 0.60f),
+                           ImGuiCond_Always);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28.0f, 24.0f));
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.05f, 0.06f, 0.97f));
+  ImGui::Begin("No map packs", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+                   ImGuiWindowFlags_NoMove);
+
+  ImGui::SetWindowFontScale(1.5f);
+  ImGui::TextUnformatted("No map packs installed");
+  ImGui::SetWindowFontScale(1.0f);
+  ImGui::Dummy(ImVec2(0.0f, 16.0f));
+
+  ImGui::PushTextWrapPos(0.0f);
+  ImGui::TextUnformatted(
+      "A map pack is a folder holding a .big file and a .header file. Put the "
+      "folder here, at the top of the game's own storage - not inside game/ or "
+      "user/:");
+  ImGui::Dummy(ImVec2(0.0f, 10.0f));
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.82f, 1.0f, 1.0f));
+  // The real path, read back from where the packs are actually looked for,
+  // rather than a remembered one. Long, and worth the room: it is under
+  // Android/data, which a file manager will not open, and getting it wrong is
+  // the single most common way a pack fails to appear.
+  ImGui::TextUnformatted(pack_root_hint_.c_str());
+  ImGui::PopStyleColor();
+  ImGui::Dummy(ImVec2(0.0f, 16.0f));
+  ImGui::TextUnformatted(
+      "The easiest way is the launcher's own \"Map packs...\" button, which "
+      "copies the folder in for you. Files put there by a file manager usually "
+      "belong to that file manager, and the game is not allowed to read them.");
+  ImGui::Dummy(ImVec2(0.0f, 12.0f));
+  ImGui::TextUnformatted(
+      "Only one pack is loaded per session, so choosing one here restarts the "
+      "game onto it.");
+  ImGui::PopTextWrapPos();
+
+  ImGui::Dummy(ImVec2(0.0f, 20.0f));
+  if (ImGui::Button("Close", ImVec2(180.0f, 46.0f)) || ReadPadNav(io.DeltaTime).cancel ||
+      ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+    visible_ = false;
+  }
+
+  ImGui::End();
+  ImGui::PopStyleColor();
+  ImGui::PopStyleVar(3);
+}
+
 void LevelSelectDialog::OnDraw(ImGuiIO& io) {
   // Boot navigation: drive to the requested map once the world is up, using the
   // same feedback walk as a manual pick rather than a fixed-length macro.
@@ -631,7 +684,14 @@ void LevelSelectDialog::OnDraw(ImGuiIO& io) {
   }
   const std::vector<std::string> levels = SplitLevels(REXCVAR_GET(skate3_loader_levels));
   if (levels.empty()) {
-    visible_ = false;
+    // Nothing to pick is a state worth SAYING, not one to close on.
+    //
+    // This used to set visible_ = false and return, which from the menu looks
+    // exactly like a row that does nothing when pressed - and "doesn't seem to
+    // do anything, it's not clear what this is supposed to do" is the report
+    // that got the picker looked at. Whether anyone can put something here is
+    // the whole question, so answer it.
+    DrawEmptyState(io);
     return;
   }
 
