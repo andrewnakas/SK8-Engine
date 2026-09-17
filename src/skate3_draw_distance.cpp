@@ -68,14 +68,19 @@ REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 2.0, "Skate 3",
                       "Scale the distance at which small world meshes "
                       "(foliage, props, street furniture) stop being drawn. "
                       "1 = original console behavior. Larger values draw more "
-                      "of the world and cost proportionally more GPU/CPU.")
-    .range(0.25, 16.0)
+                      "of the world and cost proportionally more GPU/CPU. The "
+                      "floor is below the old 0.25 because on this port the "
+                      "static world is ~750 of the ~765 items in a frame - "
+                      "pedestrians, cars and other skaters together are about "
+                      "a dozen - so thinning props is the only content lever "
+                      "with any mass behind it.")
+    .range(0.05, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 2.0, "Skate 3",
                       "Scale the distances at which skaters, pedestrians and "
                       "vehicles switch to lower-detail models. 1 = original "
                       "console behavior.")
-    .range(0.25, 16.0)
+    .range(0.05, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_stream_probe, 0.0, "Skate 3",
                       "Pre-stream world detail cells this many metres ahead "
@@ -146,11 +151,27 @@ struct CullThresholdSlot {
   uint32_t written_bits = 0;
 };
 
+// SceneRenderView LOD distances: six squared floats at 23760..23780.
+constexpr uint32_t kLodDistanceFirst = 23760;
+constexpr uint32_t kLodDistanceCount = 6;
+
 std::mutex g_cull_slots_mutex;
 CullThresholdSlot g_cull_slots[16];
 size_t g_cull_slot_count = 0;
 
 uint32_t ScaledThresholdBits(uint32_t base_bits) {
+  // Only while actually skating.
+  //
+  // The front end and the location menus render through the same cull object,
+  // and the scale divides by its own square - so 0.25 makes the contribution
+  // threshold SIXTEEN times harsher and culls a menu's view to nothing. The
+  // menu still takes input and still scrolls, because only its drawing went
+  // away, which is exactly how it was reported. Returning the base here does
+  // not merely skip the scaling: the caller writes back whatever this returns,
+  // so the game's own threshold is restored on the first menu frame.
+  if (rex::kernel::guest_presence::GameplayContextValue() != 1) {
+    return base_bits;
+  }
   const double scale = REXCVAR_GET(skate3_draw_distance_scale);
   if (std::abs(scale - 1.0) <= kScaleEpsilon || scale <= 0.0) {
     return base_bits;
@@ -161,6 +182,68 @@ uint32_t ScaledThresholdBits(uint32_t base_bits) {
   uint32_t bits;
   std::memcpy(&bits, &value, 4);
   return bits;
+}
+
+// The six squared LOD switch distances on a SceneRenderView, held the same
+// way the cull threshold is: remember what the guest wrote, and derive our
+// value from THAT rather than from whatever is in memory now. A view that
+// stops being rewritten therefore holds steady instead of decaying, and
+// leaving gameplay puts the guest's own numbers back.
+struct LodDistanceSlot {
+  uint32_t view = 0;
+  float base_v[kLodDistanceCount] = {};
+  float written[kLodDistanceCount] = {};
+  bool valid = false;
+};
+std::mutex g_lod_slots_mutex;
+LodDistanceSlot g_lod_slots[8];
+size_t g_lod_slot_count = 0;
+
+void ScaleLodDistances(uint8_t* base, uint32_t view) {
+  const double lod_scale = REXCVAR_GET(skate3_lod_distance_scale);
+  const bool in_gameplay =
+      rex::kernel::guest_presence::GameplayContextValue() == 1;
+  const bool scaling =
+      in_gameplay && std::abs(lod_scale - 1.0) > kScaleEpsilon && lod_scale > 0.0;
+  std::lock_guard<std::mutex> lock(g_lod_slots_mutex);
+  LodDistanceSlot* slot = nullptr;
+  for (size_t i = 0; i < g_lod_slot_count; ++i) {
+    if (g_lod_slots[i].view == view) {
+      slot = &g_lod_slots[i];
+      break;
+    }
+  }
+  if (slot == nullptr) {
+    if (!scaling) {
+      // Nothing to do and nothing to remember: do not spend a slot on a view
+      // seen only while the scale is inactive.
+      return;
+    }
+    if (g_lod_slot_count >= sizeof(g_lod_slots) / sizeof(g_lod_slots[0])) {
+      return;
+    }
+    slot = &g_lod_slots[g_lod_slot_count++];
+    slot->view = view;
+    slot->valid = false;
+  }
+  const double squared = lod_scale * lod_scale;
+  for (uint32_t i = 0; i < kLodDistanceCount; ++i) {
+    const uint32_t addr = view + kLodDistanceFirst + i * 4;
+    const float current = LoadGuestF32(base, addr);
+    // A value we did not write is the guest's own: re-latch it. This is what
+    // makes the pass idempotent - our own output never becomes the next
+    // frame's input.
+    if (!slot->valid || current != slot->written[i]) {
+      slot->base_v[i] = current;
+    }
+    const float want =
+        scaling ? float(double(slot->base_v[i]) * squared) : slot->base_v[i];
+    if (want != current) {
+      StoreGuestF32(base, addr, want);
+    }
+    slot->written[i] = want;
+  }
+  slot->valid = true;
 }
 
 void EnsureCullThresholdScaled(uint8_t* base, uint32_t cull_object) {
@@ -735,14 +818,20 @@ extern "C" REX_FUNC(sub_827E1AD8) {
   if (!PlausibleGuestAddr(view)) {
     return;
   }
-  const double lod_scale = REXCVAR_GET(skate3_lod_distance_scale);
-  if (std::abs(lod_scale - 1.0) > kScaleEpsilon) {
-    const double squared = lod_scale * lod_scale;
-    for (uint32_t offset = 23760; offset <= 23780; offset += 4) {
-      const uint32_t addr = view + offset;
-      StoreGuestF32(base, addr,
-                    float(double(LoadGuestF32(base, addr)) * squared));
-    }
-  }
+  // Latch the guest's own value and always write base * k^2, exactly as
+  // EnsureCullThresholdScaled does for the threshold. This used to multiply
+  // IN PLACE with no record of the original, which is idempotent only while
+  // the game really does rewrite all six distances every frame - and the
+  // comment here already suspected the menus of being where that does not
+  // hold. It does not: at scale 0.25 each repeat multiplies by 0.0625, so a
+  // handful of frames where the guest skipped its own rewrite collapses the
+  // distances to zero, nothing draws, and the gameplay gate below cannot
+  // undo it because there was nothing left to restore. That is the menu
+  // that "still scrolls but draws nothing", and it is why it started when
+  // draw distance and LOD went to 0.25.
+  //
+  // With the base latched the write is idempotent and self-healing: leaving
+  // gameplay restores the game's own numbers on the first menu frame.
+  ScaleLodDistances(base, view);
   EnsureCullThresholdScaled(base, LoadGuestU32(base, view + 8));
 }

@@ -10,6 +10,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <cstring>
 #else
 #include <pthread.h>
 #include <signal.h>
@@ -63,6 +65,21 @@ __declspec(noinline) bool GuestTryCopy(void* dst, const void* src, size_t size) 
     return false;
   }
 }
+#elif defined(__SWITCH__)
+// No guard is needed, and none is possible. The other platforms protect this
+// copy because a read can race the host decommitting the page underneath it;
+// the Horizon backend never unmaps a committed page for exactly that reason,
+// so the read cannot fault. A fault here would be a genuine bug, and this
+// platform cannot resume from one anyway - it would be reported by the
+// exception handler rather than swallowed.
+bool GuestTryCopy(void* dst, const void* src, size_t size) {
+  std::memcpy(dst, src, size);
+  return true;
+}
+
+// ArmGuestReadRecoveryForThread and GuestReadRecoveryCount are already inline
+// no-ops in the header for this branch, so there is nothing to define here.
+
 #else
 // POSIX guard with the same clean-failure semantics as the SEH path: a
 // handler registered in the runtime's exception chain (SIGSEGV/SIGBUS both

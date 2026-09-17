@@ -45,6 +45,7 @@
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -68,6 +69,7 @@
 #include "skate3_native_scene_state.h"
 #include "skate3_crash_report.h"
 #include "skate3_image_watch.h"
+#include "skate3_alloc_counter.h"
 #include "skate3_native_scene_gpu_internal.h"
 
 // Cvars defined in skate3_native_scene.cpp (and SDK cvars re-declared there).
@@ -83,6 +85,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_char_shadow_exact);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_decals);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynamic_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynobj_v2);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_empty_hold_frames);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_entity_fade);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_yield);
@@ -125,6 +128,8 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size_max);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
+REXCVAR_DECLARE(double, skate3_native_render_scene_scale);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_scale_sweep_s);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shafts);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_haze);
@@ -158,6 +163,7 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_ssr_thickness);
 REXCVAR_DECLARE(double, skate3_native_render_scene_world_v2_tan_sign);
 REXCVAR_DECLARE(int32_t, native_render_force_resolve_readback_max_length);
 REXCVAR_DECLARE(int32_t, native_render_suppress_mode);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_suppress_gameplay);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_2d_async_px);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_detail_hold);
@@ -4150,13 +4156,19 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
   // deriving from its height follows the Resolution Scale setting, including
   // any device-limit clamping the texture cache applied, and gives the same
   // effective shadow raster the emulated GPU renders at that scale.
+  //
+  // It follows the SCENE height, not the output height: the shadow map is
+  // sampled by the 3D pass, so its useful resolution is set by the raster
+  // that pass renders at (see skate3_native_render_scene_scale). Falls back
+  // to the output before the scene targets have been sized once.
+  const uint32_t shadow_ref_height =
+      g_r.scene_height != 0 ? g_r.scene_height : context.guest_output_height;
   const int32_t tile_cfg = REXCVAR_GET(skate3_native_render_scene_shadow_tile);
   const uint32_t want_tile = ClampShadowTileSize(
       device,
       tile_cfg > 0
           ? uint32_t(tile_cfg)
-          : std::min(512u * std::max(1u, (context.guest_output_height + 719u) /
-                                             720u),
+          : std::min(512u * std::max(1u, (shadow_ref_height + 719u) / 720u),
                      4096u),
       "the dynamic shadow atlas");
   if (g_r.shadow_raw != nullptr && g_r.shadow_tile != want_tile) {
@@ -4575,17 +4587,187 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Scene render resolution (skate3_native_render_scene_scale).
+//
+// The scene raster is the guest output scaled down; the finished gamma-space
+// image is stretched back over the full output by one bilinear fullscreen
+// pass. Only the SHADED pixels get cheaper - the HUD, the 2D replay and the
+// menu backdrops are composited after the stretch and stay at output
+// resolution.
+//
+// The effective scale is latched once per frame by TickScaleSweep, called
+// from RenderScene before EnsurePipeline: EnsureOutputSizedTargets and the
+// pass viewports both read the latch, so they can never disagree inside a
+// frame even while the sweep is stepping.
+namespace {
+
+// The sweep's ladder. 1.0 first so every run carries its own baseline.
+constexpr double kScaleSweepSteps[] = {1.0, 0.75, 0.6, 0.5, 0.4};
+constexpr size_t kScaleSweepStepCount =
+    sizeof(kScaleSweepSteps) / sizeof(kScaleSweepSteps[0]);
+// Discarded after each change while the targets are recreated and the
+// pipelines warm; the measured window is what is left of the step. In
+// seconds of gameplay, like the step itself.
+constexpr double kScaleSweepSettleSecs = 1.0;
+
+struct ScaleSweepState {
+  bool active = false;
+  bool done = false;
+  size_t step = 0;
+  bool measuring = false;
+  uint64_t frames = 0;
+  // Seconds of GAMEPLAY accumulated in this step, and in its measured
+  // window. Wall time is the wrong clock: the first run spent the whole
+  // 1.00 step loading into the world and the step expired anyway, with one
+  // frame measured and a meaningless 8.1 fps for the baseline rung.
+  double step_secs = 0.0;
+  double measured_secs = 0.0;
+  PerfClock::time_point last_tick{};
+};
+ScaleSweepState g_scale_sweep;
+// The scale in force for the current frame. Written only by TickScaleSweep.
+double g_scene_scale_latched = 1.0;
+
+}  // namespace
+
+// Advance the sweep and latch this frame's scale. `gameplay_frame` is true
+// only when the native renderer is about to draw a real scene, so time spent
+// in menus, loads and yielded frames does not burn a step - a hardware run
+// costs real minutes and every step has to be spent on the thing being
+// measured.
+void TickScaleSweep(bool gameplay_frame) {
+  const int32_t period_s = REXCVAR_GET(skate3_native_render_scene_scale_sweep_s);
+  if (period_s <= 0) {
+    if (g_scale_sweep.active) {
+      g_scale_sweep = ScaleSweepState{};
+    }
+    g_scene_scale_latched = REXCVAR_GET(skate3_native_render_scene_scale);
+    return;
+  }
+  if (g_scale_sweep.done) {
+    // Finished: hold the last rung so the frame stays where the sweep left
+    // it rather than snapping back to the cvar.
+    g_scene_scale_latched = kScaleSweepSteps[kScaleSweepStepCount - 1];
+    return;
+  }
+  const auto now = PerfClock::now();
+  if (!g_scale_sweep.active) {
+    g_scale_sweep.active = true;
+    g_scale_sweep.step = 0;
+    g_scale_sweep.last_tick = now;
+    REXLOG_WARN(
+        "[scene-scale] sweep armed: {} steps of {}s of gameplay each, "
+        "first second of each discarded",
+        kScaleSweepStepCount, period_s);
+  }
+  g_scene_scale_latched = kScaleSweepSteps[g_scale_sweep.step];
+  // The step's clock only advances on frames that actually drew a scene, so
+  // a load or a spell in the menus costs the sweep nothing. The gap across
+  // such a spell is clamped rather than added: the frame either side of it
+  // is real, the hour between them is not.
+  const double dt =
+      std::chrono::duration<double>(now - g_scale_sweep.last_tick).count();
+  g_scale_sweep.last_tick = now;
+  if (!gameplay_frame) {
+    return;
+  }
+  g_scale_sweep.step_secs += std::min(dt, 0.5);
+  if (!g_scale_sweep.measuring) {
+    if (g_scale_sweep.step_secs >= kScaleSweepSettleSecs) {
+      g_scale_sweep.measuring = true;
+      g_scale_sweep.measured_secs = 0.0;
+      g_scale_sweep.frames = 0;
+    }
+    return;
+  }
+  ++g_scale_sweep.frames;
+  g_scale_sweep.measured_secs += std::min(dt, 0.5);
+  if (g_scale_sweep.step_secs < double(period_s)) {
+    return;
+  }
+  const double secs = g_scale_sweep.measured_secs;
+  REXLOG_WARN("[scene-scale] {:.2f}  {}x{}  frames={}  gameplay={:.1f}s  fps={:.1f}",
+              kScaleSweepSteps[g_scale_sweep.step], g_r.scene_width,
+              g_r.scene_height, g_scale_sweep.frames, secs,
+              secs > 0.0 ? double(g_scale_sweep.frames) / secs : 0.0);
+  if (++g_scale_sweep.step >= kScaleSweepStepCount) {
+    g_scale_sweep.done = true;
+    REXLOG_WARN(
+        "[scene-scale] sweep complete; holding {:.2f}. Set "
+        "skate3_native_render_scene_scale to the winner and "
+        "skate3_native_render_scene_scale_sweep_s=0.",
+        kScaleSweepSteps[kScaleSweepStepCount - 1]);
+    return;
+  }
+  g_scale_sweep.step_secs = 0.0;
+  g_scale_sweep.measuring = false;
+  g_scale_sweep.frames = 0;
+}
+
+// The height the 3D pass is actually shading at, for anything expressed
+// against the render resolution - today the texture LOD bias (the game's
+// "console 640p gradient" mip choice) and the shadow cascade tile. Falls
+// back to the output before the scene targets have been sized once.
+uint32_t SceneRefHeight(const NativeGuestOutputRenderContext& context) {
+  return g_r.scene_height != 0 ? g_r.scene_height : context.guest_output_height;
+}
+
+void ComputeSceneExtent(const NativeGuestOutputRenderContext& context,
+                        uint32_t& out_width, uint32_t& out_height) {
+  const double scale = g_scene_scale_latched;
+  if (g_r.scene_scale_failed || !(scale > 0.0) || scale >= 0.999) {
+    out_width = context.guest_output_width;
+    out_height = context.guest_output_height;
+    return;
+  }
+  // Even dimensions keep every derived half/quarter target an exact divide
+  // (bloom, SSAO, SSR, the menu blur); the 64 floor is what a sampler can
+  // still work with, and a zero here would take the swapchain down. Same
+  // rounding as the presenter-side scale_dim, deliberately.
+  const auto scale_dim = [scale](uint32_t v) {
+    uint32_t out = uint32_t(double(v) * scale + 0.5);
+    out &= ~1u;
+    return std::max(64u, out);
+  };
+  out_width = scale_dim(context.guest_output_width);
+  out_height = scale_dim(context.guest_output_height);
+}
+
 // Depth buffer + MSAA color target, rebuilt on output-size change.
 bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
-  const uint32_t width = context.guest_output_width;
-  const uint32_t height = context.guest_output_height;
+  // The SCENE raster, not the output raster: everything created here is
+  // consumed by the 3D pass and the screen-space post chain, and a single
+  // fullscreen stretch afterwards carries the result to the guest output.
+  uint32_t width = 0;
+  uint32_t height = 0;
+  ComputeSceneExtent(context, width, height);
+  // Nothing is scaled without the pass that carries the result back. The
+  // scene depth buffer is sized here and the scene renders against it, so
+  // "the targets are scaled" and "the frame will be upscaled" have to be the
+  // SAME decision - if they could disagree, the scene would render into the
+  // full-size guest output with a scene-sized depth buffer attached.
+  // pso_blur_blit is built by EnsureBlurPsos, which EnsurePipeline runs
+  // before it gets here.
+  bool scaled = (width != context.guest_output_width ||
+                 height != context.guest_output_height) &&
+                g_r.pso_blur_blit != nullptr;
+  if (!scaled) {
+    width = context.guest_output_width;
+    height = context.guest_output_height;
+  }
   const nrhi::Format want_scene_fmt =
       g_r.hdr_active ? g_r.hdr_scene_format : nrhi::Format::kUnknown;
   if (!g_r.depth || g_r.depth_width != width || g_r.depth_height != height ||
       g_r.targets_hdr != g_r.hdr_active ||
       g_r.targets_scene_fmt != want_scene_fmt ||
-      g_r.targets_msaa != g_r.msaa) {
+      g_r.targets_msaa != g_r.msaa ||
+      (scaled != (g_r.scene_ldr != nullptr)) ||
+      (g_r.scene_ldr != nullptr && g_r.scene_ldr_fmt != context.guest_output->format())) {
+    // Leaving here, scene_ldr != nullptr means and only means "the scene
+    // raster is smaller than the output, and the blit that fixes that
+    // exists". RenderScene's scale_on gate reads exactly that.
     if (g_r.depth) {
       // The AO/SSR/volumetric scene-depth SRVs alias this texture and
       // re-point on pointer identity; heap reuse can hand the NEW depth
@@ -4597,6 +4779,16 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
           &g_r.ao_depth_srv, &g_r.ssr_depth_srv, &g_r.vol_depth_srv};
       nrhi::Texture** depth_views_of[3] = {
           &g_r.ao_depth_srv_of, &g_r.ssr_depth_srv_of, &g_r.vol_depth_srv_of};
+      // The photo chain's depth view (pfx_srv[7]) aliases this texture too,
+      // and it re-points on pointer identity alone - the exact comparison
+      // the paragraph above says must never be the only invalidation. It was
+      // survivable while depth was only ever rebuilt on a resize or an MSAA
+      // change; the render-scale sweep rebuilds it on demand, so retire it
+      // here with the buffer it views. The photo chain recreates it lazily.
+      if (g_r.pfx_srv[7] != nullptr) {
+        g_r.device->DestroyDeferred(g_r.pfx_srv[7]);
+        g_r.pfx_srv[7] = nullptr;
+      }
       for (int v = 0; v < 3; ++v) {
         if (*depth_views[v] != nullptr) {
           g_r.device->DestroyDeferred(*depth_views[v]);
@@ -4630,6 +4822,8 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
     }
     g_r.depth_width = width;
     g_r.depth_height = height;
+    g_r.scene_width = width;
+    g_r.scene_height = height;
 
     if (g_r.msaa > 1) {
       // MSAA color target + its Texture2DMS view for the fullscreen resolve
@@ -4721,9 +4915,69 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
         return false;
       }
     }
+    // Scene-resolution gamma-space plane. Exists only while the scene
+    // raster differs from the output: at 1.0 the scene renders straight
+    // into the guest output exactly as it always has, and this whole path
+    // is inert. The format matches the guest output so the scene, resolve
+    // and tonemap PSOs - all built against that format - need no variant.
+    if (g_r.scene_ldr_srv != nullptr) {
+      g_r.device->DestroyDeferred(g_r.scene_ldr_srv);
+      g_r.scene_ldr_srv = nullptr;
+    }
+    if (g_r.scene_ldr != nullptr) {
+      g_r.device->DestroyDeferred(g_r.scene_ldr);
+      g_r.scene_ldr = nullptr;
+    }
+    g_r.scene_ldr_fmt = nrhi::Format::kUnknown;
+    if (scaled) {
+      nrhi::TextureDesc sdesc;
+      sdesc.width = width;
+      sdesc.height = height;
+      sdesc.mip_levels = 1;
+      sdesc.format = context.guest_output->format();
+      sdesc.usage = nrhi::kTextureUsageRenderTarget;
+      sdesc.initial_state = nrhi::ResourceState::kRenderTarget;
+      sdesc.clear_color[0] = 0.0f;
+      sdesc.clear_color[1] = 0.0f;
+      sdesc.clear_color[2] = 0.0f;
+      sdesc.clear_color[3] = 1.0f;
+      g_r.scene_ldr = g_r.device->CreateTexture(sdesc);
+      if (g_r.scene_ldr != nullptr) {
+        nrhi::TextureViewDesc vd;
+        vd.mip_levels = 1;
+        g_r.scene_ldr_srv = g_r.device->CreateTextureView(g_r.scene_ldr, vd);
+      }
+      if (g_r.scene_ldr == nullptr || g_r.scene_ldr_srv == nullptr) {
+        // Fall back to full resolution rather than losing the renderer: the
+        // scale is a performance lever, not a correctness requirement. The
+        // depth_width sentinel forces the whole block to rerun next frame,
+        // and with scene_ldr null the caller's scale_on gate is false, so
+        // the frame in flight simply renders at the output size.
+        REXLOG_WARN(
+            "native-scene: scene plane {}x{} allocation failed; "
+            "rendering at full output resolution",
+            width, height);
+        if (g_r.scene_ldr_srv != nullptr) {
+          g_r.device->DestroyDeferred(g_r.scene_ldr_srv);
+          g_r.scene_ldr_srv = nullptr;
+        }
+        if (g_r.scene_ldr != nullptr) {
+          g_r.device->DestroyDeferred(g_r.scene_ldr);
+          g_r.scene_ldr = nullptr;
+        }
+        g_r.scene_scale_failed = true;
+        g_r.depth_width = 0;
+        return false;
+      }
+      g_r.scene_ldr_fmt = context.guest_output->format();
+    }
     g_r.targets_hdr = g_r.hdr_active;
     g_r.targets_scene_fmt = want_scene_fmt;
     g_r.targets_msaa = g_r.msaa;
+    REXLOG_WARN(
+        "native-scene: scene raster {}x{} -> output {}x{} (scale {:.2f})",
+        width, height, context.guest_output_width, context.guest_output_height,
+        g_scene_scale_latched);
   }
   return true;
 }
@@ -5258,7 +5512,14 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
 }
 
 void PrewarmWorkerLoop() {
-#if defined(_WIN32)
+#if defined(__SWITCH__)
+  // Horizon has no nice(), and no priority lever an unprivileged process can
+  // use downward - everything below the preemptive level runs until it blocks,
+  // which is the opposite of what these workers want. Naming them is what
+  // matters instead: the placement map is matched by name, and without one they
+  // are stuck on the core they were created on, at the guest's own priority.
+  rex::thread::set_current_thread_name("decode_worker");
+#elif defined(_WIN32)
   // Below-normal priority: the workers flood in exactly when the guest's
   // single-threaded world ACTIVATION runs (registration is the final load
   // phase), and at normal priority they stretch the game's own black
@@ -5701,6 +5962,61 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   static bool s_seen_gameplay = false;
   static bool s_pause_native = false;
   const bool in_menus = rex::kernel::guest_presence::GameplayContextValue() == 0;
+
+  // Suppress harder while actually skating than while loading.
+  //
+  // Mode 1 suppresses every emulated draw and resolve, which on this port is
+  // worth about fourteen frames a second - but the passes it stops include the
+  // memory composition a map LOAD waits to finish, so holding it across a load
+  // leaves the title waiting for something that will never happen. Leaving it
+  // at the safe mode for loading and menus and switching to the aggressive one
+  // once the guest reports gameplay gets both.
+  //
+  // This runs BEFORE the portrait-window block below, which saves and restores
+  // the same cvar: that one only engages while in_menus and this one only while
+  // not, so the value it saves is always the configured base rather than
+  // something this left behind.
+  // ONE source of truth for the suppression mode. Two overrides want to move
+  // it - the gameplay one just below and the portrait-window one further down
+  // - and they each used to SAVE the live cvar and restore it later. That
+  // clobbers: entering gameplay saved the 3 the portrait block had written,
+  // leaving gameplay restored that 3 as if it were configured, and after one
+  // menu -> gameplay -> menu cycle the configured base was gone for the rest
+  // of the session. The log said "suppress mode 3 -> 1" on a card configured
+  // for 2, every single time.
+  //
+  // So neither override saves or restores any more. The base is latched
+  // before anything writes it, each override only states what it WANTS, and
+  // the value is derived and applied once at the end. A write we did not make
+  // (a hot cvar reload) re-latches the base.
+  static int32_t s_suppress_base = -1;
+  static int32_t s_suppress_written = -1;
+  const int32_t suppress_now = REXCVAR_GET(native_render_suppress_mode);
+  if (s_suppress_base < 0 || suppress_now != s_suppress_written) {
+    s_suppress_base = suppress_now;
+  }
+  int32_t suppress_want = s_suppress_base;
+  {
+    const int32_t play_mode = REXCVAR_GET(skate3_native_render_scene_suppress_gameplay);
+    static bool s_play_forced = false;
+    const bool want_play = play_mode >= 0 && !in_menus;
+    if (want_play) {
+      suppress_want = play_mode;
+    }
+    if (want_play && !s_play_forced) {
+      if (s_suppress_base != play_mode) {
+        REXLOG_WARN("native-scene: gameplay - suppress mode {} -> {}",
+                    s_suppress_base, play_mode);
+      }
+      s_play_forced = true;
+    } else if (!want_play && s_play_forced) {
+      if (s_suppress_base != play_mode) {
+        REXLOG_WARN("native-scene: left gameplay - suppress mode {} restored",
+                    s_suppress_base);
+      }
+      s_play_forced = false;
+    }
+  }
   // Render-thread mirror for the 2D texture resolver: menu screens shorten
   // the content-liveness recheck cadence (see resolve_2d_texture) so
   // in-place rewrites of UI textures (the one-shot skater-portrait resolves)
@@ -5810,7 +6126,6 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   // active in menus the boxes stayed empty).
   {
     static bool s_mode_forced = false;
-    static int32_t s_mode_saved = 0;
     // menu_rtt_scope 1: only hold mode 0 inside the portrait window
     // (screen-transition grace / not-known-steady screens / CAS); outside
     // it, menus keep the gameplay-proven mode-2 suppression instead of
@@ -5820,32 +6135,39 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
         in_menus && REXCVAR_GET(skate3_native_render_scene_menu_rtt_passes) &&
         (REXCVAR_GET(skate3_native_render_scene_menu_rtt_scope) == 0 ||
          PortraitRttWindowActive());
+    // Mode 3, not 0: the portrait-class RTTs (census 560-1200 during the
+    // window) execute, but the 1152-wide main scene + postfx band stays
+    // suppressed; mode 0 ran the game's whole pipeline at scaled
+    // resolution for the window's duration, dropping the pause menu to
+    // ~60 fps whenever a screen push (or its 3 s transition grace)
+    // opened the window.
+    if (want) {
+      suppress_want = 3;
+    }
     if (want && !s_mode_forced) {
-      s_mode_saved = REXCVAR_GET(native_render_suppress_mode);
-      // Mode 3, not 0: the portrait-class RTTs (census 560-1200 during the
-      // window) execute, but the 1152-wide main scene + postfx band stays
-      // suppressed; mode 0 ran the game's whole pipeline at scaled
-      // resolution for the window's duration, dropping the pause menu to
-      // ~60 fps whenever a screen push (or its 3 s transition grace)
-      // opened the window.
-      if (s_mode_saved != 3) {
-        REXCVAR_SET(native_render_suppress_mode, 3);
+      if (s_suppress_base != 3) {
         REXLOG_INFO(
             "native-scene: portrait window - suppress mode {} -> 3 (portrait "
             "RTT passes execute, scene/postfx band stays suppressed; "
             "restored when the window closes)",
-            s_mode_saved);
+            s_suppress_base);
       }
       s_mode_forced = true;
     } else if (!want && s_mode_forced) {
-      if (s_mode_saved != 3) {
-        REXCVAR_SET(native_render_suppress_mode, s_mode_saved);
+      if (s_suppress_base != 3) {
         REXLOG_INFO(
             "native-scene: portrait window closed - suppress mode {} restored",
-            s_mode_saved);
+            s_suppress_base);
       }
       s_mode_forced = false;
     }
+    // The single write. Both overrides above have had their say; gameplay
+    // wins over the portrait window, which is moot in practice because one
+    // needs in_menus and the other needs !in_menus.
+    if (suppress_now != suppress_want) {
+      REXCVAR_SET(native_render_suppress_mode, suppress_want);
+    }
+    s_suppress_written = suppress_want;
     // Same menu window: shader compilation goes SYNCHRONOUS. With
     // async_shader_compilation on, the d3d12 command processor SKIPS any
     // draw whose pipeline is still compiling (command_processor.cpp
@@ -7729,15 +8051,45 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
   {
     static uint64_t s_beat_frame = 0;
     static uint64_t s_beat_draws_all = 0;
-    if (frames - s_beat_frame >= 1800) {  // ~30 s at 60 fps
+    static std::chrono::steady_clock::time_point s_beat_at{};
+    // Every ten seconds of wall clock, not every 1800 frames. A frame count is
+    // the wrong unit for a heartbeat whose whole job is to describe a device
+    // that is running slowly: 1800 frames is thirty seconds at sixty and six
+    // MINUTES at five, so the one report from a thirteen minute Switch run
+    // landed before the world had even loaded and said, accurately and
+    // uselessly, that nothing was being drawn yet.
+    const auto beat_now = std::chrono::steady_clock::now();
+    if (s_beat_at.time_since_epoch().count() == 0) {
+      s_beat_at = beat_now;
+    }
+    if (beat_now - s_beat_at >= std::chrono::seconds(10)) {
+      s_beat_at = beat_now;
       s_beat_frame = frames;
       const uint64_t draws_all_now = g_draws_all.load(std::memory_order_relaxed);
+      // Why the scene is empty, not just that it is. items=0 has three quite
+      // different causes and they need different fixes: the game is genuinely
+      // in a menu, the guest capture published nothing, or it published plenty
+      // and the takeover gate has not opened. So report the presence context
+      // the menu decision is made from, whether this frame is being drawn as a
+      // native loading frame, and how many items the LAST publish carried -
+      // which is a different number from the one being drawn.
+      size_t published_items = 0;
+      uint64_t published_gen = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_scene_mutex);
+        if (g_scene) {
+          published_items = g_scene->items.size();
+          published_gen = g_scene->generation;
+        }
+      }
       REXLOG_WARN(
           "native-scene: alive frame={} items={} draws={} draws_2d={} "
-          "draws_since_last={}",
+          "draws_since_last={} | presence={} loading_native={} published_items={} gen={}",
           frames, scene.items.size(), drawn,
           g_draws_2d.load(std::memory_order_relaxed),
-          draws_all_now - s_beat_draws_all);
+          draws_all_now - s_beat_draws_all,
+          rex::kernel::guest_presence::GameplayContextValue(), g_loading_native_frame ? 1 : 0,
+          published_items, published_gen);
       s_beat_draws_all = draws_all_now;
       // Same cadence: does the static image still match what was loaded?
       skate3::image_watch::Tick(frames);
@@ -7752,7 +8104,31 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
     // the command processor thread, decode inline on the render thread
     // (count = decodes this window; max = the worst single decode).
     const double guest_dt_ms = g_pw_guest_dt.AvgMs();
-    REXLOG_INFO(
+    // Warn, not info. This is the only breakdown of where the frame goes, and
+    // it is already behind a cvar that is off by default - so the log level is
+    // a second lock on a door that is locked. Worse, reading it meant raising
+    // the whole process to info, which on this port turns on the guest
+    // driver's own printing and changes the timing being measured.
+    // Allocations per frame. Every one of these costs ~6.7 us on this arena
+    // (measured: removing ~750 a frame bought ~5 ms), so this number is a
+    // direct budget, not a curiosity.
+    static skate3::alloc_counter::AllocSnapshot s_alloc_prev{};
+    const auto alloc_now = skate3::alloc_counter::Read();
+    const skate3::alloc_counter::AllocSnapshot alloc_delta{
+        alloc_now.allocs - s_alloc_prev.allocs, alloc_now.frees - s_alloc_prev.frees,
+        alloc_now.bytes - s_alloc_prev.bytes};
+    s_alloc_prev = alloc_now;
+    // Per-phase, same window. A big number in "other" means the allocations
+    // are on a thread nothing has scoped yet, which is itself the answer.
+    static uint64_t s_ph_prev[size_t(skate3::alloc_counter::Phase::kCount)] = {};
+    uint64_t ph_delta[size_t(skate3::alloc_counter::Phase::kCount)] = {};
+    for (size_t i = 0; i < size_t(skate3::alloc_counter::Phase::kCount); ++i) {
+      const uint64_t now_i =
+          skate3::alloc_counter::PhaseAllocs(skate3::alloc_counter::Phase(i));
+      ph_delta[i] = now_i - s_ph_prev[i];
+      s_ph_prev[i] = now_i;
+    }
+    REXLOG_WARN(
         "native-scene perf: guest_fps={:.0f} guest_dt_max={:.1f}ms "
         "capture={:.2f}/{:.2f}ms build={:.2f}/{:.2f}ms "
         "bld[2d={:.2f}/{:.2f} spl={:.2f}/{:.2f} pal={:.2f}/{:.2f}]ms "
@@ -7761,7 +8137,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "pre={:.2f}/{:.2f}ms settle[{:.2f}/{:.2f}ms n={} dec={} def={}] "
         "tail={:.2f}/{:.2f}ms twod={:.2f}/{:.2f}ms "
         "decode[mesh n={} avg={:.2f} max={:.2f}ms tex n={} avg={:.2f} max={:.2f}ms] "
-        "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}]",
+        "commit={:.2f}/{:.2f}ms itemcache[hit={} build={}] cam[chg={} rep={} maxstreak={}] "
+        "alloc[{}/frame {}KB/frame live={} | build={} render={} decode={} 2d={} "
+        "guest={} cp={} other={}]",
         guest_dt_ms > 0.0 ? 1000.0 / guest_dt_ms : 0.0, g_pw_guest_dt.MaxMs(),
         g_pw_capture.AvgMs(), g_pw_capture.MaxMs(), g_pw_build.AvgMs(),
         g_pw_build.MaxMs(), g_pw_b2d.AvgMs(), g_pw_b2d.MaxMs(), g_pw_bspl.AvgMs(),
@@ -7788,14 +8166,23 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_item_cache_builds.exchange(0, std::memory_order_relaxed),
         g_cam_changes.exchange(0, std::memory_order_relaxed),
         g_cam_repeats.exchange(0, std::memory_order_relaxed),
-        g_cam_max_streak.exchange(0, std::memory_order_relaxed));
+        g_cam_max_streak.exchange(0, std::memory_order_relaxed),
+        alloc_delta.allocs / interval, alloc_delta.bytes / interval / 1024,
+        int64_t(alloc_now.allocs) - int64_t(alloc_now.frees),
+        ph_delta[1] / interval, ph_delta[2] / interval, ph_delta[3] / interval,
+        ph_delta[4] / interval, ph_delta[5] / interval, ph_delta[6] / interval,
+        ph_delta[0] / interval);
     // Deep per-item attribution (see the perf-items cvar): visibility-class
     // draw costs, completed-draw stage split, build-walk decomposition, and
     // the off-screen retention pass. Averages are per item (the windows Add
     // once per item), so av= is the per-item unit cost in microseconds.
     if (REXCVAR_GET(skate3_native_render_scene_perf_items)) {
       const auto avg_us = [](const PerfWindow& w) { return w.AvgMs() * 1000.0; };
-      REXLOG_INFO(
+      // Warn, like the perf line it hangs off: this is already behind a cvar
+      // that defaults OFF, so the log level was a second lock on a locked
+      // door - and it kept this attribution out of every Switch log, which
+      // runs at warn because info changes the timing it reports.
+      REXLOG_WARN(
           "native-scene perf-items: draw[vis n={} av={:.2f}us mx={:.2f}ms | "
           "occ n={} av={:.2f}us mx={:.2f}ms | out n={} av={:.2f}us "
           "mx={:.2f}ms ret_out={}] idx_k[vis={} occ={} out={}] "
@@ -7856,7 +8243,12 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
   if (frames % interval == 0 && REXCVAR_GET(skate3_native_render_scene_perf_log)) {
     uint32_t lw_ctxs = 0, lw_ents = 0;
     skate3::native_lw::QueryLwStats(&lw_ctxs, &lw_ents);
-    REXLOG_INFO(
+    // Warn, not info. This is the only breakdown of where the frame goes, and
+    // it is already behind a cvar that is off by default - so the log level is
+    // a second lock on a door that is locked. Worse, reading it meant raising
+    // the whole process to info, which on this port turns on the guest
+    // driver's own printing and changes the timing being measured.
+    REXLOG_WARN(
         "native-scene: frame {} items={} draws={} draws_2d={} drawn_2d={} "
         "splines[{}/{}] "
         "2d[other={} dropped={} askip={} astale={} pending={} badfmt={} stride={} notex={} textures={}] "
@@ -8243,6 +8635,13 @@ void AddGuestOcclSkipped(uint32_t n) {
 namespace {
 
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
+  // Same reason as the guest thread's: what the command processor allocates
+  // around the scene render is the emulated pipeline, and it was invisible.
+  // Set before the scope, so the scope restores to it rather than to kOther.
+  skate3::alloc_counter::SetThreadDefaultPhase(
+      skate3::alloc_counter::Phase::kCommandProcessor);
+  const skate3::alloc_counter::ScopedPhase alloc_phase(
+      skate3::alloc_counter::Phase::kRenderScene);
   if (!SceneEnabled() ||
       (context.backend != NativeGuestOutputBackend::kD3D12 &&
        context.backend != NativeGuestOutputBackend::kVulkan)) {
@@ -8325,6 +8724,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     loading_native = !ready;
   }
   g_loading_hold = loading_native;
+  // Last scene the guest actually published, and how many consecutive frames
+  // it has published nothing since. See the hold below.
+  static std::shared_ptr<const FrameScene> s_last_world_scene;
+  static uint32_t s_empty_scene_frames = 0;
+  if (loading_native) {
+    // A load discards the held scene: it belongs to the previous map.
+    s_last_world_scene = nullptr;
+    s_empty_scene_frames = 0;
+  }
   std::shared_ptr<const FrameScene> scene_ptr;
   if (loading_native) {
     // Native loading screen: there is no current world scene (g_scene holds
@@ -8337,12 +8745,38 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     scene_ptr = s_loading_scene;
   } else {
     std::lock_guard<std::mutex> lock(g_scene_mutex);
-    if (!g_scene || g_scene->items.empty()) {
-      return false;
+    if (g_scene && !g_scene->items.empty()) {
+      scene_ptr = g_scene;
+      s_last_world_scene = g_scene;
+      s_empty_scene_frames = 0;
+    } else {
+      // The guest published nothing this frame. Returning false here hands
+      // the WHOLE frame to the emulated path, and because that path draws a
+      // different picture - in menus, with the 1152 band suppressed, barely
+      // any picture - the two renderers alternate frame by frame and the
+      // screen flickers, HUD and all. That is the "menu flashes on and off"
+      // report, and it is a gap of a frame or two, not a real handover.
+      //
+      // Hold the last world scene across the gap instead. Bounded, so a
+      // genuine transition to the emulated path still happens: after the
+      // budget the frame is yielded exactly as before.
+      const int32_t hold =
+          REXCVAR_GET(skate3_native_render_scene_empty_hold_frames);
+      if (s_last_world_scene == nullptr || hold <= 0 ||
+          ++s_empty_scene_frames > uint32_t(hold)) {
+        s_last_world_scene = nullptr;
+        return false;
+      }
+      scene_ptr = s_last_world_scene;
     }
-    scene_ptr = g_scene;
   }
   const FrameScene& scene = *scene_ptr;
+
+  // Latch this frame's scene scale before anything sizes a target or builds
+  // a viewport from it. A gameplay frame is one where the renderer is about
+  // to draw a real scene; loading frames and the empty scenes behind them
+  // must not advance the measurement sweep.
+  TickScaleSweep(!loading_native && !scene.items.empty());
 
   if (!EnsurePipeline(context)) {
     return false;
@@ -8590,14 +9024,34 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // The scene draws into the MSAA target when enabled (resolved into the 1x
   // scene plane at the end of the pass), or straight into the 1x plane. The
   // 1x plane is the float HDR intermediate when the HDR post chain is live
-  // (ps_tonemap then writes the guest output), else the guest output itself.
+  // (ps_tonemap then writes the gamma-space result), else that result
+  // directly.
+  //
+  // Where the gamma-space result LANDS is what the render-scale refactor
+  // changes. At scale 1.0 it is context.guest_output, exactly as it always
+  // has been. Below 1.0 it is g_r.scene_ldr, a scene-resolution plane in
+  // the same format, and one bilinear fullscreen pass stretches that over
+  // the guest output after the post chain - so every pass from the outline
+  // composite onwards (photo chain, popup blur, the 2D/HUD replay, the menu
+  // backdrop) still runs at the full output resolution and the HUD stays
+  // sharp while only the shaded pixels get cheaper.
   const bool hdr_on = g_r.hdr_active && g_r.hdr_resolved != nullptr &&
                       g_r.hdr_srv != nullptr && g_r.pso_tonemap != nullptr;
   const bool msaa_on = g_r.msaa > 1 && g_r.msaa_color != nullptr && g_r.resolve_pso != nullptr;
-  nrhi::Texture* scene_color =
-      msaa_on ? g_r.msaa_color
-              : (hdr_on ? g_r.hdr_resolved : context.guest_output);
-  if (!msaa_on && !hdr_on) {
+  // The plane's existence IS the gate. EnsureOutputSizedTargets creates it
+  // only when it has also sized the depth buffer down AND confirmed the blit
+  // that carries the result back exists, so this cannot disagree with what
+  // the targets actually are - and a disagreement would mean rendering into
+  // the full-size output with a scene-sized depth buffer attached.
+  const bool scale_on =
+      g_r.scene_ldr != nullptr && g_r.scene_ldr_srv != nullptr;
+  // The scene's finished gamma-space image, at the scene raster.
+  nrhi::Texture* scene_ldr_dest =
+      scale_on ? g_r.scene_ldr : context.guest_output;
+  // The 1x plane the scene resolves into (float under HDR, else the above).
+  nrhi::Texture* scene_plane = hdr_on ? g_r.hdr_resolved : scene_ldr_dest;
+  nrhi::Texture* scene_color = msaa_on ? g_r.msaa_color : scene_plane;
+  if (scene_color == context.guest_output) {
     cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
                  nrhi::ResourceState::kRenderTarget);
     cmd->FlushBarriers();
@@ -8631,16 +9085,34 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cmd->SetRenderTargets(scene_color, nullptr);
   }
 
+  // TWO rects, and which one a pass takes is the whole refactor.
+  //
+  //   viewport / scissor    - the full guest output. Everything composited
+  //                           onto the finished frame: the outline, the
+  //                           photo chain, the photo grab, the popup blur,
+  //                           the 2D/HUD replay, the menu backdrop.
+  //   scene_vp / scene_sc   - the scene raster. The 3D pass itself, the MSAA
+  //                           resolve, and every screen-space post pass that
+  //                           reads the scene depth or the scene plane
+  //                           (SSAO, the occlusion grid, SSR, volumetrics,
+  //                           the HDR tonemap, the photo depth pack).
+  //
+  // They are identical at scale 1.0, which is why this file could get away
+  // with one rect until now.
   const nrhi::Viewport viewport{0.0f,
                                 0.0f,
                                 float(context.guest_output_width),
                                 float(context.guest_output_height),
                                 0.0f,
                                 1.0f};
-  cmd->SetViewport(viewport);
   const nrhi::Rect scissor{0, 0, int32_t(context.guest_output_width),
                            int32_t(context.guest_output_height)};
-  cmd->SetScissor(scissor);
+  const nrhi::Viewport scene_vp{
+      0.0f, 0.0f, float(g_r.scene_width), float(g_r.scene_height), 0.0f, 1.0f};
+  const nrhi::Rect scene_sc{0, 0, int32_t(g_r.scene_width),
+                            int32_t(g_r.scene_height)};
+  cmd->SetViewport(scene_vp);
+  cmd->SetScissor(scene_sc);
   cmd->SetBindingLayout(g_r.layout);
   cmd->SetPipeline(use_depth ? g_r.pso : g_r.pso_nodepth);
   // Per-item PSO tracking for the opaque pass: two_sided_sheet meshes swap
@@ -8769,10 +9241,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     // World-shading v2 row (sh_v2, cb[60..63]): x = stored-tangent
     // polarity, yzw = the build-up showcase split state (stage left/right
-    // of the split + its position in output pixels; zeros = showcase off).
+    // of the split + its position in SCENE pixels; zeros = showcase off).
     cb[60] =
         float(REXCVAR_GET(skate3_native_render_scene_world_v2_tan_sign));
-    TickShowcase(context.guest_output_width, hdr_on);
+    // Scene raster, not output: rows[2] is a screen-space x in pixels and
+    // the shaders that gate on it (the scene family and the spline pass)
+    // run at the scene resolution.
+    TickShowcase(g_r.scene_width, hdr_on);
     cb[61] = g_r.showcase_rows[0];
     cb[62] = g_r.showcase_rows[1];
     cb[63] = g_r.showcase_rows[2];
@@ -9957,7 +10432,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // - the authored garment folds read weaker than the emulated
       // reference without this.
       constants[49] =
-          log2f(std::max(1.0f, float(context.guest_output_height) / 640.0f));
+          log2f(std::max(1.0f, float(SceneRefHeight(context)) / 640.0f));
     }
     // Exact flowingwateralpha branch (cam_pos.w = -30): the canal/waterfall
     // shader hand-ported from the game's own PS and verified per-pixel
@@ -10034,7 +10509,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // fog comes from the shared b1 rows; misc.zw stay free. misc.x keeps
       // the water marker for the SSR G-buffer restage.
       constants[49] =
-          log2f(std::max(1.0f, float(context.guest_output_height) / 640.0f));
+          log2f(std::max(1.0f, float(SceneRefHeight(context)) / 640.0f));
       constants[50] = 0.0f;
       constants[51] = 0.0f;
     } else if (item.transparent || item.water) {
@@ -10070,7 +10545,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // refl_mode cvar; both spare on opaque items; the fog packing only
       // uses these slots on transparent/water).
       constants[49] =
-          log2f(std::max(1.0f, float(context.guest_output_height) / 640.0f));
+          log2f(std::max(1.0f, float(SceneRefHeight(context)) / 640.0f));
       constants[50] = float(REXCVAR_GET(skate3_native_render_scene_refl_mode));
       constants[51] = float(REXCVAR_GET(skate3_native_render_scene_refl_lod));
       // misc.x (spare on opaque fam 5/6): both constant normal-tilt trims,
@@ -11098,8 +11573,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   }
 
   const bool outline_ready =
-      RenderOutlineMask(context, scene, viewport, scissor, msaa_on, scene_color,
-                        g_r.depth, use_depth);
+      RenderOutlineMask(context, scene, scene_vp, scene_sc, msaa_on,
+                        scene_color, g_r.depth, use_depth);
 
   // ---- SSR reflection G-buffer (scene.hlsl ps_refl_gbuf) ----
   // Re-render the frame's reflective items (captured with their main-pass
@@ -11157,8 +11632,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
     }
     // Restore the pass state the resolve/post paths rely on.
-    cmd->SetViewport(viewport);
-    cmd->SetScissor(scissor);
+    cmd->SetViewport(scene_vp);
+    cmd->SetScissor(scene_sc);
     if (!msaa_on) {
       cmd->SetRenderTargets(scene_color, use_depth ? g_r.depth : nullptr);
     }
@@ -11176,13 +11651,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // pass, then restore steady-state resource states.
     cmd->Barrier(g_r.msaa_color, nrhi::ResourceState::kRenderTarget,
                  nrhi::ResourceState::kPixelShaderResource);
-    if (!hdr_on) {
+    if (scene_plane == context.guest_output) {
       cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
                    nrhi::ResourceState::kRenderTarget);
     }
     cmd->FlushBarriers();
-    cmd->SetRenderTargets(hdr_on ? g_r.hdr_resolved : context.guest_output,
-                          nullptr);
+    cmd->SetRenderTargets(scene_plane, nullptr);
+    // Explicit: the resolve used to inherit whatever rect the last pass
+    // left bound, which was harmless only while every rect was the same.
+    // ps_main Loads by pixel index, so it must run at the scene raster.
+    cmd->SetViewport(scene_vp);
+    cmd->SetScissor(scene_sc);
     cmd->SetPipeline(g_r.resolve_pso);
     cmd->SetTexture(1, g_r.msaa_srv_slot);
     cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
@@ -11191,10 +11670,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                  nrhi::ResourceState::kRenderTarget);
   }
 
-  // Classic path: the outline composites straight onto the resolved guest
-  // output. Under HDR it runs after the tonemap below (a gamma-space
-  // screen overlay, not scene lighting).
-  if (outline_ready && !hdr_on) {
+  // Classic path at full resolution: the scene has already landed in the
+  // guest output, so the outline composites straight onto it. Under HDR it
+  // runs after the tonemap, and on the scaled path after the upscale - it
+  // is a gamma-space screen overlay, not scene lighting.
+  if (outline_ready && !hdr_on && !scale_on) {
     RenderOutlineComposite(context, scene, context.guest_output, viewport,
                            scissor);
   }
@@ -11209,7 +11689,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   cmd->ProfileRegion(nrhi::ProfileStage::kAmbientOcclusion);
   if (use_depth && !loading_native &&
       REXCVAR_GET(skate3_native_render_scene_ssao) &&
-      ApplySsaoPass(context, cmd, scene, viewport, scissor)) {
+      ApplySsaoPass(context, cmd, scene, scene_vp, scene_sc)) {
     post_ran = true;
     ssao_ran = true;
   }
@@ -11221,7 +11701,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       (REXCVAR_GET(skate3_native_render_scene_occlusion_cull) ||
        REXCVAR_GET(skate3_native_render_scene_perf_items)) &&
       REXCVAR_GET(skate3_native_render_scene_occlusion_grid_standalone)) {
-    ApplyOcclusionGridPass(context, cmd, scene, viewport, scissor);
+    ApplyOcclusionGridPass(context, cmd, scene, scene_vp, scene_sc);
   }
 
   // ---- Screen-space reflections (ssr.hlsl) ----
@@ -11232,7 +11712,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // AO ran this frame.
   cmd->ProfileRegion(nrhi::ProfileStage::kSsr);
   if (g_r.ssr_gbuf_ready &&
-      ApplySsrPass(context, cmd, scene, viewport, scissor, ssao_ran)) {
+      ApplySsrPass(context, cmd, scene, scene_vp, scene_sc, ssao_ran)) {
     post_ran = true;
   }
 
@@ -11243,7 +11723,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // so they bloom and tonemap like scene light.
   cmd->ProfileRegion(nrhi::ProfileStage::kVolumetrics);
   if (hdr_on && use_depth && !loading_native &&
-      ApplyVolumetricPass(context, cmd, scene, viewport, scissor, ssao_ran,
+      ApplyVolumetricPass(context, cmd, scene, scene_vp, scene_sc, ssao_ran,
                           frame_number)) {
     post_ran = true;
   }
@@ -11255,17 +11735,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // classic path.
   cmd->ProfileRegion(nrhi::ProfileStage::kBloom);
   if (hdr_on) {
-    ApplyHdrPost(context, cmd, viewport, scissor, loading_native,
-                 frame_number);
+    ApplyHdrPost(context, cmd, scene_ldr_dest, scene_vp, scene_sc,
+                 loading_native, frame_number);
     post_ran = true;
   }
 
   if (post_ran) {
     // The AO/HDR chains switched binding layouts; restore the main-pass
     // root bindings the later passes latch (same restore as the photo
-    // chain's).
-    cmd->SetViewport(viewport);
-    cmd->SetScissor(scissor);
+    // chain's). The rect stays SCENE space - the last pass may still have a
+    // scene-sized target bound, and every consumer below sets its own rect
+    // before it draws. At scale 1.0 the two are the same rect anyway.
+    cmd->SetViewport(scene_vp);
+    cmd->SetScissor(scene_sc);
     cmd->SetBindingLayout(g_r.layout);
     if (g_r.shadow_cb != nullptr) {
       const uint32_t cb_offset =
@@ -11276,7 +11758,42 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   }
 
-  if (outline_ready && hdr_on) {
+  // ---- The upscale: scene raster -> guest output ----
+  // The one pass that crosses from scene space to output space. It reuses
+  // pso_blur_blit (blur.hlsl ps_blit, a plain fullscreen REPLACE) exactly as
+  // the popup blur's stretch-back below does, and samples through s1 of the
+  // main layout, which is bilinear clamp - so the filtering is free and no
+  // new shader is needed. Nothing runs here at scale 1.0.
+  if (scale_on) {
+    cmd->Barrier(g_r.scene_ldr, nrhi::ResourceState::kRenderTarget,
+                 nrhi::ResourceState::kPixelShaderResource);
+    cmd->Barrier(context.guest_output, nrhi::ResourceState::kGuestOutput,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->FlushBarriers();
+    cmd->SetRenderTargets(context.guest_output, nullptr);
+    cmd->SetViewport(viewport);
+    cmd->SetScissor(scissor);
+    // No SetBindingLayout: g_r.layout is already bound (the scene pass left
+    // it, or the post_ran restore put it back), and re-binding it would drop
+    // the b1/b2 descriptors that restore had just re-attached. The popup
+    // blur's stretch-back below binds nothing but the pipeline either.
+    cmd->SetPipeline(g_r.pso_blur_blit);
+    // ps_blit reads neither constant row (it is a plain REPLACE), but the
+    // b0 descriptor must hold something valid: zero axis, white tint.
+    const float upscale_consts[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                                     1.0f, 1.0f, 1.0f, 1.0f};
+    cmd->SetRootConstants(0, 8, upscale_consts, 0);
+    cmd->SetTexture(1, g_r.scene_ldr_srv);
+    cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+    cmd->Draw(3, 0);
+    cmd->Barrier(g_r.scene_ldr, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+  }
+
+  // The outline is a gamma-space screen overlay, so it composites onto the
+  // finished OUTPUT: after the tonemap on the HDR path, and after the
+  // upscale on the scaled one (before it, the stretch would erase it).
+  if (outline_ready && (hdr_on || scale_on)) {
     RenderOutlineComposite(context, scene, context.guest_output, viewport,
                            scissor);
   }
@@ -11298,45 +11815,59 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                    nrhi::ResourceState::kRenderTarget);
     };
     const auto pfx_flush = [&] { cmd->FlushBarriers(); };
-    // Output-sized targets (visualfx out, uber out, packed depth).
+    // Output-sized targets (visualfx out, uber out), and the packed-depth
+    // plane, which is NOT output-sized: ps_depthpack reads the native depth
+    // buffer with Load(int2(pos.xy)), so it has to run at the scene raster.
+    // Everything downstream samples the packed plane by UV through the point
+    // sampler, so only this one target and its pass move.
     bool pfx_ok = true;
-    if (g_r.pfx_width != context.guest_output_width ||
-        g_r.pfx_height != context.guest_output_height || g_r.pfx_full[0] == nullptr) {
-      nrhi::Texture** res[3] = {&g_r.pfx_full[0], &g_r.pfx_full[1], &g_r.pfx_depth};
-      nrhi::TextureView** views[3] = {&g_r.pfx_srv[0], &g_r.pfx_srv[1],
-                                      &g_r.pfx_srv[5]};
+    const auto pfx_make = [&](nrhi::Texture** res, nrhi::TextureView** view,
+                              uint32_t w, uint32_t h) {
+      if (*view != nullptr) {
+        g_r.device->DestroyDeferred(*view);
+        *view = nullptr;
+      }
+      if (*res != nullptr) {
+        g_r.device->DestroyDeferred(*res);
+        *res = nullptr;
+      }
       nrhi::TextureDesc desc;
-      desc.width = context.guest_output_width;
-      desc.height = context.guest_output_height;
+      desc.width = w;
+      desc.height = h;
       desc.mip_levels = 1;
       desc.format = nrhi::Format::kR8G8B8A8_UNORM;
       desc.usage = nrhi::kTextureUsageRenderTarget;
       desc.initial_state = nrhi::ResourceState::kRenderTarget;
-      for (int i = 0; i < 3 && pfx_ok; ++i) {
-        if (*views[i] != nullptr) {
-          g_r.device->DestroyDeferred(*views[i]);
-          *views[i] = nullptr;
-        }
-        if (*res[i] != nullptr) {
-          g_r.device->DestroyDeferred(*res[i]);
-          *res[i] = nullptr;
-        }
-        *res[i] = context.device->CreateTexture(desc);
-        if (*res[i] == nullptr) {
-          pfx_ok = false;
-          break;
-        }
-        nrhi::TextureViewDesc vd;
-        vd.mip_levels = 1;
-        *views[i] = context.device->CreateTextureView(*res[i], vd);
-        if (*views[i] == nullptr) {
-          pfx_ok = false;
-          break;
-        }
+      *res = context.device->CreateTexture(desc);
+      if (*res == nullptr) {
+        return false;
       }
+      nrhi::TextureViewDesc vd;
+      vd.mip_levels = 1;
+      *view = context.device->CreateTextureView(*res, vd);
+      return *view != nullptr;
+    };
+    if (g_r.pfx_width != context.guest_output_width ||
+        g_r.pfx_height != context.guest_output_height || g_r.pfx_full[0] == nullptr) {
+      pfx_ok = pfx_make(&g_r.pfx_full[0], &g_r.pfx_srv[0],
+                        context.guest_output_width,
+                        context.guest_output_height) &&
+               pfx_make(&g_r.pfx_full[1], &g_r.pfx_srv[1],
+                        context.guest_output_width,
+                        context.guest_output_height);
       if (pfx_ok) {
         g_r.pfx_width = context.guest_output_width;
         g_r.pfx_height = context.guest_output_height;
+      }
+    }
+    if (pfx_ok && (g_r.pfx_depth_width != g_r.scene_width ||
+                   g_r.pfx_depth_height != g_r.scene_height ||
+                   g_r.pfx_depth == nullptr)) {
+      pfx_ok = pfx_make(&g_r.pfx_depth, &g_r.pfx_srv[5], g_r.scene_width,
+                        g_r.scene_height);
+      if (pfx_ok) {
+        g_r.pfx_depth_width = g_r.scene_width;
+        g_r.pfx_depth_height = g_r.scene_height;
       }
     }
     if (pfx_ok) {
@@ -11527,13 +12058,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
 
       // 1) Depth pack: native depth (sample 0) -> the console D24-as-8888
-      //    layout at output res.
+      //    layout, at the SCENE raster (ps_depthpack Loads by pixel index,
+      //    and the depth buffer is scene-sized).
       cmd->Barrier(g_r.depth, nrhi::ResourceState::kDepthWrite,
                    nrhi::ResourceState::kPixelShaderResource);
       pfx_flush();
       set_rtv(g_r.pfx_depth);
-      cmd->SetViewport(viewport);
-      cmd->SetScissor(scissor);
+      cmd->SetViewport(scene_vp);
+      cmd->SetScissor(scene_sc);
       cmd->SetPipeline(g_r.pfx_pso[0]);
       cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(-1));
       pfx_bind_all(W, W, W, W, g_r.pfx_srv[6], W, W, g_r.pfx_srv[7]);

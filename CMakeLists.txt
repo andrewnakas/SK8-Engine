@@ -112,6 +112,13 @@ set(REXSDK_DIR
 set(SKATE3_GAME_DATA_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/game"
     CACHE PATH "Path to an extracted Skate 3 retail game dump")
+# The recompiled PowerPC is architecture independent - it is C++ that every
+# target compiles for itself - and regenerating it takes hours and a game dump.
+# Pointing this at the tree the phone ports already generated lets a second
+# platform build without a second copy of 290 MB.
+set(SKATE3_GENERATED_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/generated"
+    CACHE PATH "Path to the architecture-independent rexglue generated sources")
 set(SKATE3_TITLE_UPDATE_PACKAGE
     ""
     CACHE FILEPATH "Optional Skate 3 title update STFS package used for codegen")
@@ -287,12 +294,14 @@ include(cmake/CodegenTargets.cmake)
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
+    src/skate3_frame_advance.cpp
     src/skate3_audio_fixes.cpp
     src/skate3_audio_probe.cpp
     src/skate3_audio_shadow.cpp
     src/skate3_audio_native.cpp
     src/skate3_crash_report.cpp
     src/skate3_demo_path.cpp
+    src/skate3_alloc_counter.cpp
     src/skate3_diagnostics.cpp
     src/skate3_draw_distance.cpp
     src/skate3_fov.cpp
@@ -332,6 +341,14 @@ if(NOT REXGLUE_RUNTIME_STATIC)
     list(APPEND SKATE3_COMMON_SOURCES
          third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp)
 endif()
+# elf2nro supplies its own placeholder when no icon is given, so a missing one
+# is not worth failing over - but it must then contribute no argument at all.
+if(SKATE3_SWITCH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/switch/icon.jpg")
+    set(SKATE3_ICON_ARG "--icon=${CMAKE_CURRENT_SOURCE_DIR}/cmake/switch/icon.jpg")
+else()
+    set(SKATE3_ICON_ARG "")
+endif()
+
 if(SKATE3_IOS)
     # UIDocumentPickerViewController, so the disc can be chosen from Files.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_ios.mm)
@@ -343,6 +360,20 @@ elseif(ANDROID)
     # on the activity class the app registered with SDL.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_android_bridge.cpp)
 endif()
+
+# Clocks, the memory line, and the applet transitions. There is no file picker
+# on Horizon: the game is copied to the SD card before the first launch, and
+# there is no relaunch either, because it has no process-spawn API.
+#
+# Built on EVERY platform, not only under SKATE3_SWITCH. The whole file is
+# wrapped in `#if defined(__SWITCH__)` with an `#else` that defines the same
+# three entry points as no-ops - its own comment says it is "kept compilable
+# off-console so the header can be included unconditionally" - and
+# Skate3BaseApp::OnPostSetup now calls ApplyClocks() from common code. Gating
+# the file here as well left that call with no definition to bind to and the
+# Android link failed on `undefined symbol: skate3::switch_bridge::ApplyClocks`.
+# Off-console this compiles to three empty functions.
+list(APPEND SKATE3_COMMON_SOURCES src/skate3_switch_bridge.cpp)
 
 set(SKATE3_SOURCES
     src/main.cpp
@@ -419,19 +450,23 @@ else()
     target_compile_definitions(skate3 PRIVATE SKATE3_HAS_TITLE_UPDATE=0)
 endif()
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/sources.cmake")
-    include(generated/sources.cmake)
+if(EXISTS "${SKATE3_GENERATED_ROOT}/sources.cmake")
+    include("${SKATE3_GENERATED_ROOT}/sources.cmake")
     target_sources(skate3 PRIVATE ${GENERATED_SOURCES})
-    target_include_directories(skate3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/generated)
+    # Both: sources reach the recompiled headers as <generated/skate3_init.h>
+    # as well as by bare name, so the directory and its parent are needed.
+    target_include_directories(skate3 PRIVATE
+        "${SKATE3_GENERATED_ROOT}"
+        "${SKATE3_GENERATED_ROOT}/..")
 else()
     message(STATUS "generated/sources.cmake not found; run the generate-all target before building skate3")
 endif()
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/eawebkit/sources.cmake")
+if(EXISTS "${SKATE3_GENERATED_ROOT}/eawebkit/sources.cmake")
     set(_SKATE3_SAVED_GENERATED_SOURCES ${GENERATED_SOURCES})
-    include(generated/eawebkit/sources.cmake)
+    include("${SKATE3_GENERATED_ROOT}/eawebkit/sources.cmake")
     target_sources(skate3 PRIVATE ${GENERATED_SOURCES})
-    target_include_directories(skate3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/generated/eawebkit)
+    target_include_directories(skate3 PRIVATE "${SKATE3_GENERATED_ROOT}/eawebkit")
     set(GENERATED_SOURCES ${_SKATE3_SAVED_GENERATED_SOURCES})
     unset(_SKATE3_SAVED_GENERATED_SOURCES)
 else()
@@ -463,7 +498,27 @@ endif()
 # archive. The normal link above stays: after force_load nothing from it is
 # still undefined, so it contributes no duplicates.
 if(REXGLUE_RUNTIME_STATIC)
-    if(ANDROID)
+    if(SKATE3_SWITCH)
+        # Same rule as Android, different linker. Every kernel export registers
+        # itself from a static initialiser, so a member no symbol refers to must
+        # still be pulled in or the guest hits InvalidFunctionTrap at runtime.
+        target_link_options(skate3 PRIVATE
+            "LINKER:--whole-archive,$<TARGET_FILE:rexruntime>,--no-whole-archive")
+
+        # Pack the hot guest functions together. The reasoning is the Android
+        # comment below; only the spelling differs. GNU ld takes a list of
+        # sections rather than symbols, so the profile's symbol names are
+        # turned into .text.<symbol> lines by scripts/order_file.sh.
+        # --section-ordering-file arrived in binutils 2.43; without it, or
+        # without a profile, the link is unchanged.
+        if(REXGLUE_SECTION_ORDER_FILE AND EXISTS "${REXGLUE_SECTION_ORDER_FILE}")
+            message(STATUS "skate3: ordering text by ${REXGLUE_SECTION_ORDER_FILE}")
+            target_link_options(skate3 PRIVATE
+                "LINKER:--section-ordering-file=${REXGLUE_SECTION_ORDER_FILE}")
+            set_property(TARGET skate3 APPEND PROPERTY LINK_DEPENDS
+                         "${REXGLUE_SECTION_ORDER_FILE}")
+        endif()
+    elseif(ANDROID)
         # lld's spelling of the same rule. --whole-archive applies to the
         # archives that follow it, so the runtime is named explicitly between
         # the two flags; the ordinary rex::runtime link above then contributes
@@ -502,6 +557,109 @@ if(REXGLUE_RUNTIME_STATIC)
 endif()
 
 rexglue_configure_target(skate3)
+
+# The guest call trace hooks every one of the 47,889 recompiled functions, so it
+# is a build-time choice rather than a cvar: --skate3_trace does nothing without
+# it. Off by default; worth the rebuild when the question is "which guest code is
+# running", which no other tool on this platform can answer - the sampling
+# profiler reads another thread's registers and Horizon does not allow that.
+option(SKATE3_ENABLE_GUEST_TRACE "Compile the guest call-trace hook into the recompiled code" OFF)
+if(SKATE3_ENABLE_GUEST_TRACE)
+    target_compile_definitions(skate3 PRIVATE SKATE3_GUEST_TRACE=1)
+endif()
+
+if(SKATE3_SWITCH)
+    # The recompiled code polls guest memory in plain busy-wait loops - a word
+    # written by another thread, read until it changes, no call and no fence in
+    # the loop body. SDK commit f27dfa8 made those loads non-volatile, and GCC
+    # (this is the only GCC target; the phones are Clang) hoists such a load out
+    # of the loop and emits an unconditional self-branch: 22 guest functions in
+    # the D3D and audio drivers became `b .`, which is the freeze after the intro
+    # movie. The generated header restores the qualifier when this is defined.
+    # scripts/scan_spin_loops.sh on skate3.debug.elf must report 0 afterwards.
+    option(SKATE3_GUEST_MEM_VOLATILE
+        "Volatile guest loads/stores in the recompiled code (GCC hoists polls out of loops otherwise)" ON)
+    if(SKATE3_GUEST_MEM_VOLATILE)
+        target_compile_definitions(skate3 PRIVATE REX_GUEST_MEM_VOLATILE=1)
+    endif()
+
+    # The narrow form of the same guarantee. Volatile everywhere stops a poll
+    # spinning on a stale register, and also stops the compiler keeping ANY
+    # guest value in a register at any of 964,158 sites - which measured as
+    # roughly a second of guest time per menu frame on this console. A barrier
+    # emitted only where a loop closes forces the re-read that a poll needs and
+    # leaves every straight-line path free to optimise.
+    option(SKATE3_GUEST_LOOP_BARRIER "Compiler barrier at guest loop back edges" ON)
+    if(SKATE3_GUEST_LOOP_BARRIER)
+        target_compile_definitions(skate3 PRIVATE REX_GUEST_LOOP_BARRIER=1)
+    endif()
+
+    # Let the title advance more than one refresh period of simulation in a
+    # frame. It measures real elapsed time and then clamps it at one period,
+    # which is why the game runs at period/frame_time speed - half speed at
+    # 33 ms a frame. The generated tree is shared with the phone builds and
+    # compiles a plain 100u unless this is defined; the guest-side edit is
+    # scripts/patch_frame_advance_cap.py and the cap itself is the cvar
+    # skate3_frame_advance_cap. See src/skate3_frame_advance.cpp.
+    option(SKATE3_GUEST_FRAME_ADVANCE_CAP "Let the guest advance past one refresh period per frame" ON)
+    if(SKATE3_GUEST_FRAME_ADVANCE_CAP)
+        target_compile_definitions(skate3 PRIVATE REX_GUEST_FRAME_ADVANCE_CAP_HOOK=1)
+    endif()
+
+    # GCC in gnu++ mode defaults to -ffp-contract=fast and fuses a multiply and
+    # an add across statements. The recompiler emits one PowerPC instruction per
+    # statement and a real fmadd as std::fma, so Clang's default (contract only
+    # within an expression) never fuses anything; match that so float results
+    # agree with the phone builds. The SDK applies the same flag to its own
+    # sources, but that scope does not reach this target.
+    target_compile_options(skate3 PRIVATE $<$<CXX_COMPILER_ID:GNU>:-ffp-contract=off>)
+
+    # NVK's two Rust archives each bundle their own copy of the Rust runtime
+    # (rust_eh_personality and friends), which Mesa's own link absorbs
+    # internally and a downstream consumer cannot. Scoped to this target rather
+    # than the toolchain so a genuine duplicate anywhere else still fails.
+    target_link_options(skate3 PRIVATE "LINKER:--allow-multiple-definition")
+
+    # Sends every pthread_create through pthread_stack_switch.cpp, which raises
+    # the default stack from libnx's 128 KB. std::thread has no way to ask for a
+    # bigger stack, and 128 KB is far below what this engine's worker threads
+    # use on the platforms it was written for.
+    target_link_options(skate3 PRIVATE "LINKER:--wrap=pthread_create")
+
+    # pthread_detach is not implemented by libnx at all and returns ENOSYS,
+    # which std::thread::detach() turns into a thrown exception. See
+    # pthread_stack_switch.cpp.
+    target_link_options(skate3 PRIVATE "LINKER:--wrap=pthread_detach")
+
+    find_program(SKATE3_ELF2NRO elf2nro HINTS "${DEVKITPRO}/tools/bin" REQUIRED)
+    find_program(SKATE3_NACPTOOL nacptool HINTS "${DEVKITPRO}/tools/bin" REQUIRED)
+
+    set(SKATE3_NRO "${CMAKE_CURRENT_BINARY_DIR}/skate3.nro")
+    set(SKATE3_NACP "${CMAKE_CURRENT_BINARY_DIR}/skate3.nacp")
+    set(SKATE3_DEBUG_ELF "${CMAKE_CURRENT_BINARY_DIR}/skate3.debug.elf")
+    set(SKATE3_ICON "${CMAKE_CURRENT_SOURCE_DIR}/cmake/switch/icon.jpg")
+
+    # The NRO carries no symbols, and a hundred megabytes of them would not fit
+    # in the homebrew menu's patience anyway. The unstripped ELF is kept beside
+    # it so that a crash report's offsets can be resolved with addr2line; see
+    # scripts/symbolize.sh.
+    add_custom_command(
+        OUTPUT "${SKATE3_NRO}"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:skate3>" "${SKATE3_DEBUG_ELF}"
+        COMMAND "${SKATE3_NACPTOOL}" --create "Skate 3" "EA / recompiled"
+                "${SKATE3_FULL_VERSION}" "${SKATE3_NACP}"
+        # Each argument is one quoted string. Writing --nacp="${...}" instead
+        # puts literal quote characters into the argument, and elf2nro then
+        # looks for a file whose name begins with one. The icon is appended to
+        # a list rather than through a generator expression, which would leave
+        # an empty argument behind when there is no icon.
+        COMMAND "${SKATE3_ELF2NRO}" "$<TARGET_FILE:skate3>" "${SKATE3_NRO}"
+                "--nacp=${SKATE3_NACP}" ${SKATE3_ICON_ARG}
+        DEPENDS skate3
+        COMMENT "Packaging skate3.nro"
+        VERBATIM)
+    add_custom_target(skate3_nro ALL DEPENDS "${SKATE3_NRO}")
+endif()
 
 if(APPLE)
     if(SKATE3_IOS)

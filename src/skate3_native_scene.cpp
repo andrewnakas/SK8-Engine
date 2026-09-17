@@ -4,6 +4,7 @@
 // skate3_native_scene_gpu.cpp; state shared between the two is in
 // skate3_native_scene_state.h.
 
+#include "skate3_alloc_counter.h"
 #include "skate3_native_scene.h"
 
 #include "generated/skate3_init.h"
@@ -35,6 +36,7 @@
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -208,6 +210,31 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_ssr_debug, 0, "Skate 3",
                      "too-thick crossings, white = hit x confidence).")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_suppress_gameplay, -1, "Skate 3",
+    "Emulated-draw suppression mode to use WHILE SKATING, with "
+    "native_render_suppress_mode applying everywhere else. -1 leaves the one "
+    "mode in force throughout. This exists because the two situations want "
+    "different answers: mode 1 suppresses everything the emulated path would "
+    "draw and resolve, which is worth a lot of frames in gameplay, but it also "
+    "suppresses the memory-composition passes a map LOAD waits on - so held "
+    "across a load the title simply never finishes one. Set the base mode to 2 "
+    "and this to 1 to get both.")
+    .range(-1, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_empty_hold_frames, 30, "Skate 3",
+    "How many consecutive frames the native renderer keeps drawing the last "
+    "world scene the guest published, when the guest publishes nothing. A gap "
+    "of a frame or two is normal - menus and transitions stop submitting the "
+    "world - and yielding the frame to the emulated path for each of them is "
+    "what makes the screen, and the HUD with it, flicker: the two renderers "
+    "draw different pictures on alternate frames. Past the budget the frame "
+    "is yielded as before, so a real handover still happens. 0 = old "
+    "behaviour, yield on the first empty frame.")
+    .range(0, 600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr, true, "Skate 3",
                     "Render the 3D scene into a float (HDR) intermediate and apply the "
                     "game's shared tone chain once in a host post pass, the basis for "
@@ -238,6 +265,41 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_bloom_intensity, 0.025, "Skate 
                       "pre-tonemap scene (0 = off; the pyramid accumulates ~5 levels, "
                       "so small values are already visible around bright lights).")
     .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// --- Scene render resolution -------------------------------------------------
+// The 3D scene is rendered into its own raster and a single bilinear
+// fullscreen pass stretches it into the full-size guest output. Everything
+// composited AFTER that pass - the selection outline, the photo chain, the
+// popup blur, the 2D/HUD overlay replay and the settings-menu backdrop -
+// still runs at the output resolution, so the HUD and menu text stay sharp
+// while only the shaded pixels get cheaper. Half in each axis is a quarter of
+// the fill.
+//
+// This is NOT native_render_output_scale, which shrinks the guest output
+// itself: that surface is shared with the emulated path, whose swap gamma
+// pass is a compute shader dispatched by pixel index, and shrinking it wrote
+// out of bounds and lost the graphics device at boot. That cvar must stay 1.0.
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_scale, 1.0, "Skate 3",
+                      "Render the native 3D scene at this fraction of the guest output "
+                      "in each axis and upscale it bilinearly into the full-size "
+                      "output (1.0 = native; 0.5 is a quarter of the pixels). The HUD, "
+                      "2D overlay and menu backdrops still draw at full resolution. "
+                      "This is the lever that matters when the frame is fill-bound; it "
+                      "costs sharpness in the 3D image and nothing else. Unrelated to "
+                      "native_render_output_scale, which shrinks the shared guest "
+                      "output and must stay 1.0.")
+    .range(0.25, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_scale_sweep_s, 0, "Skate 3",
+                     "Auto-sweep the scene scale for measurement: hold each of 1.00, "
+                     "0.75, 0.60, 0.50, 0.40 for this many seconds of GAMEPLAY and log "
+                     "a [scene-scale] line with the raster and the measured frame rate "
+                     "for each, then stop on the last step. The clock only advances on "
+                     "frames the native renderer actually drew a scene for, so time in "
+                     "menus and loads does not burn a step, and the first second after "
+                     "each change is discarded while the targets rebuild. 0 = off, use "
+                     "skate3_native_render_scene_scale.")
+    .range(0, 600)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_hdr_packed, true, "Skate 3",
                     "Use the packed R11G11B10 float format for the HDR scene targets "
@@ -1290,6 +1352,25 @@ REXCVAR_DEFINE_INT32(
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(
+    skate3_map_erase_fix, true, "Skate 3",
+    "Neutralise the hash erase at sub_82C95E18+0xB4 when the key is not in "
+    "the map. Erasing an absent key is a no-op by definition, but this caller "
+    "does not check the find's result: it takes the -1 marker as a node and "
+    "dereferences it, which is the deterministic fault returning from a DLC "
+    "map. The fix hands back the map's own end sentinel plus a scratch pair "
+    "below the guest stack, so the unlink writes only to scratch and the "
+    "free-list push is skipped; the erase hook then restores the size the "
+    "tail decremented. Requires skate3_map_erase_probe to see the miss.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_map_erase_probe, false, "Skate 3",
+    "Log the key and map whenever the hash erase at sub_82C95E18+0xB4 looks up "
+    "a key that is NOT present. That erase dereferences the find's end "
+    "sentinel unchecked and then walks the bucket array 4 bytes at a time "
+    "until it leaves mapped memory, which is the deterministic fault returning "
+    "from a DLC map. This does not fix it; it names what is being erased.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
     skate3_guest_spin_measure, false, "Skate 3",
     "Time the guest's wait loop (sub_82B755C0) and report how many milliseconds "
     "per second the render thread spends in it. A profiler share is not a "
@@ -1304,8 +1385,54 @@ REXCVAR_DEFINE_INT32(
     "recompilation, so it spins flat out and starves the threads it is waiting "
     "for. 0 = today's behaviour, 1 = ARM yield hints (approximates db16cyc), "
     "2 = sched_yield (which does NOT idle the core), 3 = sleep 100us "
-    "(which does).")
+    "(which does), 4 = yield WITH core migration (Horizon only: lets the "
+    "kernel pull the thread this one waits for onto this core).")
+    .range(0, 4)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// The job manager's scan is the busiest thing the guest does, and on this
+// console it is the frame. Three of the game's threads wait for a job by
+// calling the scan in a loop with nothing else in the loop body: no sleep, no
+// yield, no kernel wait. On a 360 that is free - six hardware threads, and a
+// waiting one costs its sibling little. Here it means the two threads that are
+// the frame hold their timeslices against the workers they are waiting for, and
+// the front end falls from 30 fps to 1 as more waiters pile in.
+//
+// The scan answers "no work" 99.9% of the time, so backing off when it does is
+// the whole fix: the same loop, minus the part where the waiter refuses to give
+// up the core.
+REXCVAR_DEFINE_INT32(
+    skate3_job_scan_backoff, 3, "Skate 3",
+    "Back off when the guest's job scan (sub_8290AFA0) finds nothing, for every "
+    "caller except the worker loop, which already takes a real 1 ms wait. "
+    "0 = off, 1 = yield without core migration, 2 = yield with core migration, "
+    "3 = migrate for the first N misses then sleep (see the _yields and "
+    "_sleep_us settings).")
     .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_job_scan_backoff_yields, 32, "Skate 3",
+    "How many consecutive empty scans to answer with a yield before sleeping "
+    "instead, in job scan backoff mode 3. Low sleeps sooner and frees the core "
+    "harder; high stays more responsive to a job that is about to arrive.")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_job_scan_backoff_sleep_us, 50, "Skate 3",
+    "How long to sleep once a waiter has yielded its way past the threshold "
+    "above. This is the only thing that actually idles the core, and idling it "
+    "is what lets a worker on another core be migrated here.")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    skate3_job_scan_stats, false, "Skate 3",
+    "Record which guest addresses call the job scan, and walk the back chain "
+    "once to name the first caller. Answered the question of where the time was "
+    "going; at 140,000 calls a second it is not free, so it is off unless asked "
+    "for.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(
@@ -6444,6 +6571,13 @@ std::atomic<bool> g_cam_sampler_started{false};
 std::atomic<uint64_t> g_cam_sampler_pushes{0};  // telemetry
 
 void CamSamplerLoop() {
+#if defined(__SWITCH__)
+  // Naming is what places a thread on Horizon: the placement map is matched
+  // against the name, and a thread that never names itself is left at the
+  // priority and single-core mask it was created with. This one sampled at
+  // 1 kHz on whichever core the guest's main thread was already using.
+  rex::thread::set_current_thread_name("cam_sampler");
+#endif
   float last_view[16] = {};
   double syn_next_emit = 0.0;
   int syn_cadence_i = 0;
@@ -8241,7 +8375,42 @@ void Publish2dDraws(uint8_t* base) {
       g_draws_2d_dropped.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
+    // RING REUSE DETECTOR.
+    //
+    // d.addr is the pointer D3DDevice_BeginVertices handed the CPU to write
+    // into, and the bytes are only read back here, at frame end - which is
+    // correct, because the guest writes them AFTER that call returns. But the
+    // ring is circular. If it wraps inside one frame, an early draw's window
+    // has been handed out again to a later draw, and the replay draws element
+    // A with element B's geometry: the HUD doubled at each other's positions
+    // with one quad stretched across the screen.
+    //
+    // Overlapping [addr, addr+bytes) ranges within a single frame is exactly
+    // that condition, and nothing currently looks. This is a probe, not a
+    // fix; the fix is to copy at EndVertices, which needs a hook that does
+    // not exist yet.
     const uint32_t bytes = d.count * d.stride;
+    {
+      static thread_local std::vector<std::pair<uint32_t, uint32_t>> seen_ranges;
+      if (&d == &frame_2d.front()) {
+        seen_ranges.clear();
+      }
+      for (const auto& r : seen_ranges) {
+        if (d.addr < r.second && r.first < d.addr + bytes) {
+          static std::atomic<uint32_t> s_overlaps{0};
+          const uint32_t n = s_overlaps.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (n <= 4 || (n % 256) == 0) {
+            REXLOG_WARN(
+                "[2d-ring] REUSE #{}: this draw [{:08X}+{}] overlaps an earlier "
+                "one [{:08X}+{}] in the same frame - its vertices have been "
+                "overwritten and it will draw the wrong geometry",
+                n, d.addr, bytes, r.first, r.second - r.first);
+          }
+          break;
+        }
+      }
+      seen_ranges.emplace_back(d.addr, d.addr + bytes);
+    }
     scratch_2d.resize(bytes);
     if (!GuestTryCopy(scratch_2d.data(), base + d.addr, bytes)) {
       g_2d_copyfail.fetch_add(1, std::memory_order_relaxed);
@@ -8768,10 +8937,63 @@ void CensusReport(uint32_t records, uint32_t views, uint32_t cam_ok, uint32_t pe
       records, views, cam_ok, persp, aux, persp_w, m00, m11);
 }
 
+// Open-addressed uint32 set over a buffer that is allocated once and reused.
+//
+// Same reason as DrawItem::draws: std::unordered_set allocates a node per
+// element, this one is filled with ~750 guest addresses every frame, and on
+// this port a malloc costs microseconds because the arena carries tens of
+// thousands of free chunks. Replacing the draw-list vector alone took the
+// hook cost from ~10 ms a frame to ~5.
+//
+// Guest addresses are 4-aligned and cluster, so the key is mixed before
+// probing. 0 is the empty sentinel; it is never a valid item address here,
+// and Insert rejects it rather than pretend.
+class FlatU32Set {
+ public:
+  void Reset(size_t expected) {
+    size_t want = 16;
+    while (want < expected * 2) want *= 2;
+    if (slots_.size() < want) {
+      slots_.assign(want, 0u);
+    } else {
+      std::fill(slots_.begin(), slots_.end(), 0u);
+    }
+    mask_ = uint32_t(slots_.size() - 1);
+  }
+  // True when `key` was not already present.
+  bool Insert(uint32_t key) {
+    if (key == 0 || slots_.empty()) return true;
+    uint32_t i = Mix(key) & mask_;
+    for (;;) {
+      const uint32_t slot = slots_[i];
+      if (slot == 0) {
+        slots_[i] = key;
+        return true;
+      }
+      if (slot == key) return false;
+      i = (i + 1) & mask_;
+    }
+  }
+
+ private:
+  static uint32_t Mix(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    return x;
+  }
+  std::vector<uint32_t> slots_;
+  uint32_t mask_ = 0;
+};
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
   }
+  // Attribute this thread's allocations to the scene build for as long as we
+  // are inside it (see skate3_alloc_counter.h).
+  const skate3::alloc_counter::ScopedPhase alloc_phase(
+      skate3::alloc_counter::Phase::kSceneBuild);
   // The frame-end walks below chase captured pointers whose ranges world
   // streaming may have revoked during the frame; recover raw-load read
   // faults for the whole build (POSIX; no-op on Windows).
@@ -8805,11 +9027,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         g_slow_frame_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
       const double ours_ms =
           double(s_prev_build_ns + s_prev_cap_ns) * 1e-6;
-      // INFO, not DEBUG: iOS never raises log_level, so at DEBUG this line -
-      // the only per-frame attribution of a dip - has never once reached a
-      // device log. g_slow_frame_log_budget already bounds it to 3 per perf
-      // window, so the volume is a few lines a minute, not a flood.
-      REXLOG_INFO(
+      // WARN, not INFO, for the same reason the perf line above is warn: this
+      // is the only per-frame attribution of a dip, g_slow_frame_log_budget
+      // already bounds it to 3 per perf window, and every level below warn is
+      // a second lock on a door that is already locked. It was moved DEBUG ->
+      // INFO because iOS never raises the level; the Switch runs at warn and
+      // raising it there turns on the guest driver's own printing, which
+      // changes the very timing this line reports. So: warn.
+      REXLOG_WARN(
           "native-scene: slow guest frame dt={:.2f}ms prev[cap={:.2f} build={:.2f} "
           "(2d={:.2f} spl={:.2f} pal={:.2f} ptail={:.2f} walk={:.2f}) rest={:.2f}]ms",
           dt_ms, double(s_prev_cap_ns) * 1e-6, double(s_prev_build_ns) * 1e-6,
@@ -8889,8 +9114,22 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // Take this frame's hook-time dynamic items regardless of how we exit,
   // leaving them in place across an early return (no perspective view, empty
   // frame) would desynchronize the indices stored in the records.
-  std::vector<DrawItem> dynitems;
-  std::unordered_set<uint32_t> ortho_ctx;
+  // Static, and cleared here rather than destroyed at the end of the frame:
+  // these are swapped with the globals the capture hook fills, so a fresh
+  // local handed its empty buffer to the global and the hook then regrew it
+  // from nothing every single frame. Clearing first and swapping second
+  // hands the global back a buffer that still has its capacity, so the
+  // steady state stops allocating - which also stops it fragmenting an arena
+  // that is already down to its last few megabytes. Guest render thread
+  // only, like s_build_culled below, and BuildFrameScene is not reentrant.
+  // The early returns further down are why this is cleared on ENTRY: the
+  // globals are still emptied on every exit path, exactly as before.
+  static std::vector<DrawItem> s_dynitems;
+  static std::unordered_set<uint32_t> s_ortho_ctx;
+  s_dynitems.clear();
+  s_ortho_ctx.clear();
+  std::vector<DrawItem>& dynitems = s_dynitems;
+  std::unordered_set<uint32_t>& ortho_ctx = s_ortho_ctx;
   {
     std::lock_guard<std::mutex> lock(g_palette_mutex);
     dynitems.swap(g_frame_dynitems);
@@ -8900,7 +9139,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
   // Take this frame's selection re-draw captures and re-arm the post-sky
   // window (must happen on every exit path, like the dynitems swap).
-  std::vector<SelectedDrawKey> frame_selected;
+  static std::vector<SelectedDrawKey> s_frame_selected;
+  s_frame_selected.clear();
+  std::vector<SelectedDrawKey>& frame_selected = s_frame_selected;
   frame_selected.swap(g_frame_selected);
   g_sky_seen_this_frame = false;
   const bool outline_edge_seen = g_outline_edge_seen;
@@ -8989,10 +9230,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
 
   FrameScene scene;
   scene.items.reserve(count);
-  std::unordered_set<uint32_t> seen;
+  // Reused across frames: the buffer is allocated once and refilled, so the
+  // per-item node allocations std::unordered_set would make never happen.
+  // BuildFrameScene runs only on the guest render thread.
+  static FlatU32Set seen;
   // Pre-size the per-frame bookkeeping: these fill with thousands of
   // entries every frame, and growing from empty rehashes repeatedly.
-  seen.reserve(count);
+  seen.Reset(count);
   // Dynamic contexts are submitted several times per frame (once per pass);
   // each submission carries that pass's culled island list. Keep the fullest
   // one; a shadow-pass list can be missing body parts the main view needs.
@@ -9049,13 +9293,13 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     if (r.kind == 2 && r.b != view) {
       // World-path capture from another view (shadow cascade): rendering it
       // duplicates the entity as a ghost.
-      seen.insert(r.a);
+      seen.Insert(r.a);
       continue;
     }
     if (r.kind == 0 || r.kind == 2 || r.kind == 3) {
       // Dynamic entity (kind 0), main-view world-path capture (kind 2) or
       // quad-list capture (kind 3): the complete item was built at hook time.
-      seen.insert(r.a);
+      seen.Insert(r.a);
       if (r.c == 0) {
         g_rej_no_dynstate.fetch_add(1, std::memory_order_relaxed);
         continue;
@@ -9144,7 +9388,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
       continue;
     }
-    if (!seen.insert(r.a).second) {
+    if (!seen.Insert(r.a)) {
       continue;
     }
     if (!s_build_culled.empty() &&
@@ -10317,9 +10561,16 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       g_dyn_retained.clear();
     }
     const uint64_t now = g_guest_frame;
-    std::unordered_set<uint64_t> submitted;
+    // "Was this key submitted this frame" is already recorded: every
+    // submitted key that is in the map below gets last_seen = now, and a
+    // submitted key that is NOT in the map is one the sweep never iterates.
+    // So the set that used to answer it was pure duplication - and an
+    // expensive one, because it was built and thrown away every frame with
+    // one node allocation per published static item. At the measured ~6.7 us
+    // a malloc/free pair on this arena, the ~700 items a frame carries were
+    // most of the scene build's entire allocation count and very nearly all
+    // of this block's 3.5 ms.
     const size_t published = scene.items.size();
-    submitted.reserve(published);
     for (size_t i = 0; i < published; ++i) {
       const DrawItem& it = scene.items[i];
       if (it.skinned || it.cloth_quads || it.ropa || it.pending ||
@@ -10327,7 +10578,6 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;
       }
       const uint64_t key = SynPanItemKey(it);
-      submitted.insert(key);
       if (g_retained_items.size() >= 20000 &&
           g_retained_items.find(key) == g_retained_items.end()) {
         continue;  // growth backstop
@@ -10350,7 +10600,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // far beyond the smoothing lag it needs to cover.
     constexpr uint64_t kRetainTtlFrames = 90;
     for (auto rit = g_retained_items.begin(); rit != g_retained_items.end();) {
-      if (submitted.find(rit->first) != submitted.end()) {
+      // Submitted this frame (see above): leave it alone.
+      if (rit->second.last_seen == now) {
         ++rit;
         continue;
       }

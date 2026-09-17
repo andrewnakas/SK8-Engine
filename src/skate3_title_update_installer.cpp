@@ -44,6 +44,9 @@
 #include <sys/wait.h>
 // The system document picker, through the activity; see skate3_android_bridge.
 #include "skate3_android_bridge.h"
+#elif defined(__SWITCH__)
+// No file chooser and no process spawning on a console: the package is copied
+// to the SD card before the first launch and found by scanning.
 #else
 #include <sys/wait.h>
 
@@ -580,6 +583,20 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
   return skate3::android::DownloadFile(url, destination, error);
 }
 
+#elif defined(__SWITCH__)
+
+// The desktop branch shells out to curl, and Horizon cannot spawn a process at
+// all. Rather than fail somewhere deep in a transfer, say plainly what to do:
+// the package is a single small file the player copies to the SD card.
+bool DownloadToFile(const std::string& /*url*/, const std::filesystem::path& /*destination*/,
+                    std::atomic<uint64_t>& /*copied_bytes*/,
+                    std::atomic<uint64_t>& /*total_bytes*/, std::string& error) {
+  error =
+      "Downloading is not available on this console. Copy the title update package to "
+      "sdmc:/switch/skate3/install/ and start the game again.";
+  return false;
+}
+
 #else
 
 bool DownloadToFile(const std::string& url, const std::filesystem::path& destination,
@@ -661,6 +678,12 @@ std::filesystem::path PickTitleUpdateFile() {
 std::filesystem::path PickTitleUpdateFile() {
   // ACTION_OPEN_DOCUMENT in the activity, as for the disc image.
   return skate3::android::PickDocument("Select the Skate 3 Title Update (TU_12K2276...)");
+}
+#elif defined(__SWITCH__)
+std::filesystem::path PickTitleUpdateFile() {
+  // No file chooser on a console; the caller scans the install directory when
+  // this returns empty, exactly as it does when a player cancels elsewhere.
+  return {};
 }
 #else
 std::filesystem::path PickTitleUpdateFile() {
@@ -1015,7 +1038,7 @@ bool RunTitleUpdateInstallWizardBlocking(rex::ui::WindowedAppContext& app_contex
     if (window) {
       window->RequestPaint();
     }
-#if !defined(__APPLE__) && !defined(__ANDROID__)
+#if !defined(__APPLE__) && !defined(__ANDROID__) && !defined(__SWITCH__)
     while (gtk_events_pending()) {
       gtk_main_iteration_do(FALSE);
     }

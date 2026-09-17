@@ -1,18 +1,45 @@
 // See the header for why this exists.
 
 #include "skate3_crash_report.h"
+#include "skate3_guest_trace.h"
+#include "skate3_native_render.h"
+
+#include <rex/thread/timer_queue.h>
+
+// Timer delivery counters, defined in the runtime's Switch threading and timer
+// queue. Declared here rather than in a shared header: those headers reach most
+// of the tree and a change to one costs a twenty minute rebuild.
+extern "C" {
+extern std::atomic<uint64_t> rex_diag_timer_setonce;
+extern std::atomic<uint64_t> rex_diag_timer_setonce_armed;
+extern std::atomic<uint64_t> rex_diag_timer_completion;
+extern std::atomic<uint64_t> rex_diag_timer_signal;
+extern std::atomic<uint64_t> rex_diag_disarm_blocked;
+extern std::atomic<uint64_t> rex_diag_disarm_woke;
+extern std::atomic<uint64_t> rex_diag_timer_cancel;
+extern std::atomic<uint64_t> rex_diag_tq_dropped;
+extern std::atomic<uint32_t> rex_diag_tq_drop_state;
+extern std::atomic<int64_t> rex_diag_timer_last_due_ms;
+extern std::atomic<int64_t> rex_diag_timer_max_due_ms;
+extern std::atomic<uint64_t> rex_diag_shmem_upload_pages;
+extern std::atomic<uint64_t> rex_diag_shmem_upload_calls;
+extern std::atomic<uint32_t> rex_diag_shmem_page_size;
+}
 
 #include "skate3_native_scene.h"
 
 // For the guest X_KTHREAD pointer, which is the number
 // RtlEnterCriticalSection reports as owner_thread=.
+#include <rex/system/kernel_state.h>
+#include <rex/system/xobject.h>
 #include <rex/system/xthread.h>
 
 #if !defined(_WIN32)
 
 #include <dirent.h>
-#if defined(__ANDROID__)
-// bionic has no <execinfo.h>; this supplies backtrace* over the unwinder.
+#if defined(__ANDROID__) || defined(__SWITCH__)
+// Neither bionic nor newlib has <execinfo.h>; this supplies backtrace* over
+// the unwinder for both.
 #include <rex/execinfo_android.h>
 #else
 #include <execinfo.h>
@@ -26,15 +53,24 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <pthread/pthread.h>
+#elif defined(__SWITCH__)
+// No prctl and no syscall table: thread names live on the thread object here,
+// and the reporter reads them from the kernel state rather than from the OS.
+#include <unistd.h>
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 #else
 #include <sys/prctl.h>
-#endif
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <malloc.h>
+#include <vector>
 #include <ctime>
 #include <mutex>
 #include <string>
@@ -126,6 +162,10 @@ uint64_t HostTid() {
   uint64_t tid = 0;
   pthread_threadid_np(nullptr, &tid);
   return tid;
+#elif defined(__SWITCH__)
+  u64 tid = 0;
+  svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+  return tid;
 #else
   return uint64_t(syscall(SYS_gettid));
 #endif
@@ -134,6 +174,13 @@ uint64_t HostTid() {
 bool HostThreadName(char* name, size_t len) {
 #if defined(__APPLE__)
   return pthread_getname_np(pthread_self(), name, len) == 0 && name[0] != 0;
+#elif defined(__SWITCH__)
+  // Horizon threads carry no name the OS will hand back; the engine keeps its
+  // own on the thread object. Reporting failure lets the caller fall back to
+  // that rather than print something invented here.
+  (void)name;
+  (void)len;
+  return false;
 #else
   (void)len;
   return prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) == 0;
@@ -473,6 +520,176 @@ void DumpAllThreads() {
   mach_port_deallocate(mach_task_self(), self_thread);
   vm_deallocate(mach_task_self(), vm_address_t(threads),
                 vm_size_t(thread_count * sizeof(thread_t)));
+#elif defined(__SWITCH__)
+  // Horizon has neither signals nor a way to read another thread's registers
+  // from inside the same process, so the two approaches above are both out: a
+  // process cannot debug itself, and backtrace() only ever walks the calling
+  // thread. What is still reachable is the guest side, which is the half that
+  // matters for a hang - a deadlock here is guest threads waiting on each
+  // other, and every one of them has a PPC context the runtime keeps updated.
+  //
+  // The contexts are read while their threads are running, so a value can be
+  // caught mid-update. That is acceptable for a report whose purpose is to say
+  // which thread is parked where; a torn register is obvious when it appears.
+  r.Str("  guest threads and where each one is parked. lr names the caller:\n");
+  r.Str("    grep -n 'DEFINE_REX_FUNC' generated/*.cpp and take the nearest\n");
+  r.Str("    definition below the address.\n");
+  r.Flush();
+
+  auto* ks = rex::system::kernel_state();
+  if (ks == nullptr) {
+    r.Str("  no kernel state - the guest never started\n");
+    r.Flush();
+  } else {
+    const std::vector<rex::system::object_ref<rex::system::XThread>> threads =
+        ks->object_table()->GetObjectsByType<rex::system::XThread>();
+    r.Str("  ");
+    r.Dec(uint64_t(threads.size()));
+    r.Str(" guest thread(s)\n");
+    r.Flush();
+
+    for (const auto& thread : threads) {
+      if (!thread) {
+        continue;
+      }
+      r.Str("\n  [");
+      const std::string name = thread->thread_name();
+      r.Str(name.empty() ? "(unnamed)" : name.c_str());
+      r.Str("] thid=");
+      r.Dec(thread->thread_id());
+      r.Str(" guest_obj=0x");
+      r.Hex(thread->guest_object(), 8);
+      r.Str(thread->is_running() ? " running" : " NOT running");
+      // Which cores this thread may actually run on, and at what priority.
+      // Placement decides the frame rate on a three core machine and there was
+      // no way to check it after the fact: the map says what was asked for,
+      // this says what the kernel gave. Read through the raw handle rather than
+      // Thread::affinity_mask(), which waits for the thread to have started and
+      // would hang a report whose whole purpose is to describe a hang.
+      if (auto* host = thread->thread()) {
+        const Handle h = Handle(uintptr_t(host->native_handle()));
+        s32 ideal = 0;
+        u64 mask = 0;
+        s32 prio = 0;
+        if (R_SUCCEEDED(svcGetThreadCoreMask(&ideal, &mask, h))) {
+          r.Str(" cores=0x");
+          r.Hex(uint32_t(mask), 1);
+          r.Str(" ideal=");
+          r.Dec(uint64_t(uint32_t(ideal)));
+        }
+        if (R_SUCCEEDED(svcGetThreadPriority(&prio, h))) {
+          r.Str(" prio=");
+          r.Dec(uint64_t(uint32_t(prio)));
+        }
+      }
+      r.Str("\n");
+
+      auto* ts = thread->thread_state();
+      const ::PPCContext* c = ts ? ts->context() : nullptr;
+      if (c == nullptr) {
+        r.Str("      no guest context bound\n");
+        r.Flush();
+        continue;
+      }
+      r.Str("      lr=0x");
+      r.Hex(c->lr, 8);
+      r.Str("  ctr=0x");
+      r.Hex(c->ctr.u64 & 0xFFFFFFFFull, 8);
+      r.Str("  r1=0x");
+      r.Hex(c->r1.u64 & 0xFFFFFFFFull, 8);
+      // r3 is the handle argument at every NtWaitForSingleObjectEx call site,
+      // and "thread 6 is waiting on F8000054" is only useful once F8000054 has
+      // a name. Resolving it says what kind of object the guest is parked on
+      // and, where the title named it, which one.
+      const uint32_t maybe_handle = uint32_t(c->r3.u64 & 0xFFFFFFFFull);
+      if ((maybe_handle & 0xFF000000u) == 0xF8000000u) {
+        auto object = ks->object_table()->LookupObject<rex::system::XObject>(maybe_handle);
+        if (object) {
+          static const char* kTypeNames[] = {
+              "Undefined", "Enumerator", "Event",   "File",  "IOCompletion",
+              "Module",    "Mutant",     "Notify",  "Semaphore", "Session",
+              "Socket",    "SymLink",    "Thread",  "Timer"};
+          const uint32_t type_index = uint32_t(object->type());
+          r.Str("\n      waiting on ");
+          r.Str(type_index < (sizeof(kTypeNames) / sizeof(kTypeNames[0])) ? kTypeNames[type_index]
+                                                                          : "?");
+          const std::string& object_name = object->name();
+          if (!object_name.empty()) {
+            r.Str(" '");
+            r.Str(object_name.c_str());
+            r.Str("'");
+          }
+        }
+      }
+
+      r.Str("\n      r3=0x");
+      r.Hex(c->r3.u64 & 0xFFFFFFFFull, 8);
+      r.Str("  r4=0x");
+      r.Hex(c->r4.u64 & 0xFFFFFFFFull, 8);
+      r.Str("  r5=0x");
+      r.Hex(c->r5.u64 & 0xFFFFFFFFull, 8);
+      r.Str("\n");
+      r.Flush();
+
+      // Guest call stack from the PowerPC back chain. Registers alone say every
+      // thread is in NtWaitForSingleObjectEx, which is true and useless; what
+      // matters is who called it.
+      //
+      // [r1] holds the caller's frame pointer, and a function saves its return
+      // address into its CALLER's frame, at [caller + 4] - not into its own. So
+      // the link for a frame is read one frame up the chain. Reading [r1 + 4]
+      // instead lands on the slot this frame's own callee would use, which is
+      // uninitialised here and comes back as stack fill.
+      auto* memory = ks->memory();
+      if (memory != nullptr && c->lr != 0) {
+        r.Str("      guest stack:\n");
+        r.Str("        0x");
+        r.Hex(c->lr, 8);
+        r.Str("\n");
+        uint32_t frame = uint32_t(c->r1.u64 & 0xFFFFFFFFull);
+        for (int depth = 0; depth < 16; ++depth) {
+          if (frame == 0 || (frame & 3) != 0 || frame < 0x10000) {
+            break;
+          }
+          auto* next_ptr = memory->TranslateVirtual<const uint32_t*>(frame);
+          if (next_ptr == nullptr) {
+            break;
+          }
+          const uint32_t next = __builtin_bswap32(*next_ptr);  // guest is big-endian
+          // Stacks grow down, so the chain must ascend; anything else is a
+          // corrupt or uninitialised frame and would loop forever.
+          if (next <= frame || (next & 3) != 0) {
+            break;
+          }
+          // Where the return address lives, from the recompiler's own output:
+          // __savegprlr_N does "stw r12,-8(r1)" with r12 holding the link
+          // register, and that store happens before "stwu" allocates the frame.
+          // So the saved address sits 8 bytes below the frame this one chains
+          // to. Functions that save the link inline use the SysV slot at +4
+          // instead, so both are tried and whichever lands inside the title's
+          // image is the real one.
+          const uint32_t candidates[] = {next - 8, next + 4};
+          for (uint32_t at : candidates) {
+            auto* link_ptr = memory->TranslateVirtual<const uint32_t*>(at);
+            if (link_ptr == nullptr) {
+              continue;
+            }
+            const uint32_t link = __builtin_bswap32(*link_ptr);
+            // The title is loaded at 0x82000000; anything outside it is fill or
+            // a frame that was never written.
+            if (link >= 0x82000000u && link < 0x84000000u) {
+              r.Str("        0x");
+              r.Hex(link, 8);
+              r.Str("\n");
+              break;
+            }
+          }
+          frame = next;
+        }
+        r.Flush();
+      }
+    }
+  }
 #endif
   Report tail;
   tail.Str("=== end hang report ===\n");
@@ -481,17 +698,131 @@ void DumpAllThreads() {
 
 // How long the guest may take to produce its first frame before the watchdog
 // calls it a hang. Boot to gameplay measures ~25s on an iPhone 13 mini.
+#if defined(__SWITCH__)
+// Shorter here while the port is being brought up. The watchdog only writes a
+// report and lets the process carry on, so calling a slow load a hang costs
+// nothing but a diagnostic, whereas waiting 75 seconds for every attempt costs
+// a real one. Worth raising once the game boots.
+constexpr int kPreFirstFrameGraceSeconds = 30;
+#else
 constexpr int kPreFirstFrameGraceSeconds = 75;
+#endif
 
 void WatchdogMain() {
   uint64_t last_seen = 0;
   int stalled_ticks = 0;
   uint64_t last_work = 0;
   int idle_ticks = 0;
+  // Uptime comes from the clock, not from counting how many times we meant to
+  // sleep for a second. The count was wrong because two watchdogs were running
+  // and both incremented it (see StartWatchdog); asking the clock is right
+  // regardless of how many threads ask, and does not drift if a sleep runs
+  // long. Every rate derived from uptime was reported at half its true value
+  // while this was broken, and the trace window and thread dumps fired at half
+  // the uptime they were aimed at.
+  const auto started = std::chrono::steady_clock::now();
   for (;;) {
     struct timespec ts = {1, 0};
     nanosleep(&ts, nullptr);
-    g_uptime_seconds.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t uptime = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::steady_clock::now() - started)
+                                         .count());
+    // The short sleep means this loop now runs about twice a second, so skip
+    // the ticks where the second has not actually changed.
+    if (uptime == g_uptime_seconds.load(std::memory_order_relaxed)) {
+      continue;
+    }
+    g_uptime_seconds.store(uptime, std::memory_order_relaxed);
+
+#if defined(__SWITCH__)
+    // A periodic sign of life. The watchdog only speaks up when it decides
+    // something is wrong, which leaves "booting slowly" and "stopped dead"
+    // looking identical from the outside - and turning on debug logging to tell
+    // them apart is slow enough to change the behaviour being measured. Frames
+    // and guest work are the two counters that answer it directly.
+    if ((uptime % 5) == 0) {
+      // Memory belongs on this line: the process was killed outright with the
+      // log still flowing - no fault, no terminate, no crash file - and running
+      // out of a 3189 MB pool is the way that happens on Horizon. The guest
+      // memory backend only reports at commit time, which is all in the first
+      // few seconds and says nothing about a death eight minutes in.
+      const struct mallinfo mi = mallinfo();
+      // Fragmentation, not just size. Frame time on this port grows steadily
+      // from the moment the front end appears, and an allocator walking an
+      // ever-longer free list inside a 2 GB arena degrades exactly that way.
+      // in-use vs free-chunk-count separates "we are simply out of room" from
+      // "every allocation now costs a search".
+      REXSYS_WARN("[heap] in-use={}MB free-chunks={} free={}MB mmapped={}MB",
+                  size_t(mi.uordblks) >> 20, size_t(mi.ordblks), size_t(mi.fordblks) >> 20,
+                  size_t(mi.hblkhd) >> 20);
+      REXSYS_WARN("[progress] uptime={}s frames={} guest_work={} heap={}MB free={}MB", uptime,
+                  g_heartbeat.load(std::memory_order_relaxed),
+                  g_guest_work.load(std::memory_order_relaxed),
+                  size_t(mi.arena) >> 20, size_t(mi.fordblks) >> 20);
+      // Frames and guest work say the guest is running. They do not say it is
+      // getting anywhere, and this title renders perfectly happily while its
+      // screen manager waits for something that never arrives.
+      skate3::native_render::LogScreenManagerState();
+      skate3::native_render::LogFrameBudget();
+      skate3::native_render::LogJobScan();
+      // The guest's timer thread is what drains the queue the main loop needs
+      // drained, so a timer that stops arriving stops the whole title. These
+      // counters say whether the dispatch thread is alive, stuck inside a
+      // callback, or unable to accept new timers at all.
+      REXSYS_WARN("[timerd] set={} armed={} fired={} signalled={} disarm-blocked={} woke={}",
+                  rex_diag_timer_setonce.load(std::memory_order_relaxed),
+                  rex_diag_timer_setonce_armed.load(std::memory_order_relaxed),
+                  rex_diag_timer_completion.load(std::memory_order_relaxed),
+                  rex_diag_timer_signal.load(std::memory_order_relaxed),
+                  rex_diag_disarm_blocked.load(std::memory_order_relaxed),
+                  rex_diag_disarm_woke.load(std::memory_order_relaxed));
+      REXSYS_WARN("[timerd] cancels={} dropped={} last-drop-state={}",
+                  rex_diag_timer_cancel.load(std::memory_order_relaxed),
+                  rex_diag_tq_dropped.load(std::memory_order_relaxed),
+                  rex_diag_tq_drop_state.load(std::memory_order_relaxed));
+      REXSYS_WARN("[timerd] last-arm-due={}ms max-arm-due={}ms",
+                  rex_diag_timer_last_due_ms.load(std::memory_order_relaxed),
+                  rex_diag_timer_max_due_ms.load(std::memory_order_relaxed));
+      {
+        const uint64_t pages = rex_diag_shmem_upload_pages.load(std::memory_order_relaxed);
+        const uint32_t psz = rex_diag_shmem_page_size.load(std::memory_order_relaxed);
+        REXSYS_WARN("[shmem] uploads={} pages={} ({} MB total, page {} B)",
+                    rex_diag_shmem_upload_calls.load(std::memory_order_relaxed), pages,
+                    (pages * uint64_t(psz ? psz : 4096)) >> 20, psz);
+      }
+      const auto tq = rex::thread::GetTimerQueueDiagnostics();
+      REXSYS_WARN("[timerq] loops={} dispatched={} completed={} queued={} claim-waits={} "
+                  "pending={}{}",
+                  tq.iterations, tq.dispatched, tq.completed, tq.queued, tq.claim_waits,
+                  tq.pending, tq.in_callback ? "  IN CALLBACK" : "");
+    }
+
+    // Two unconditional thread dumps while the port is being brought up. The
+    // hang watchdog below only fires when frames stop, which does not cover a
+    // title that renders and plays audio quite happily but never advances - and
+    // that is exactly where this one sits. Taken a minute apart so they can be
+    // compared: identical stacks mean the guest is parked, different ones mean
+    // it is working and waiting on something that never completes.
+    // The trace answers "which guest functions ran in this window". Armed
+    // once the title has settled into the freeze, dumped 30s later, so the
+    // recorded set is the code that keeps running while nothing advances.
+    // Armed late enough to catch the front end rather than the intro movie:
+    // the slow part starts once menus appear, well past a minute in.
+    if (uptime == 120) {
+      REXSYS_WARN("[trace] arming guest call trace");
+      skate3::guest_trace::Arm("switch-freeze");
+    }
+    if (uptime == 150) {
+      REXSYS_WARN("[trace] dumping guest call trace");
+      skate3::guest_trace::Dump("switch-freeze");
+    }
+
+    if (uptime == 60 || uptime == 120 || uptime == 240) {
+      REXSYS_WARN("[dump] periodic thread dump at {}s (not a hang report)", uptime);
+      DumpAllThreads();
+    }
+#endif
+
     const int limit = REXCVAR_GET(skate3_hang_watchdog_seconds);
     if (limit <= 0) {
       continue;
@@ -552,6 +883,18 @@ void WatchdogMain() {
 }
 
 void StartWatchdog() {
+  // Once, however many times it is asked for. There are two independent entry
+  // points - StartWatchdogEarly before the guest starts, and EnsureInstalled
+  // from the first guest swap - and each had its own std::once_flag, so each
+  // started a watchdog and BOTH ran for the whole session. Every periodic line
+  // was therefore printed twice (which is why [progress], [heap], [frame] and
+  // [jobs] all appeared in alternating pairs from two thread ids), every
+  // mallinfo() walk was done twice on a heap with 37,000 free chunks, and
+  // uptime - a counter each thread incremented once a second - advanced at two
+  // seconds per second. That last one was measured as a 1.97x clock error and
+  // very nearly blamed on nanosleep.
+  static std::once_flag once;
+  std::call_once(once, [] {
 #if defined(__linux__)
   struct sigaction sa = {};
   sa.sa_sigaction = ThreadDumpHandler;
@@ -561,7 +904,8 @@ void StartWatchdog() {
     return;
   }
 #endif
-  std::thread(WatchdogMain).detach();
+    std::thread(WatchdogMain).detach();
+  });
 }
 
 // REX_FATAL (a guest call through a null/unregistered function pointer, among
@@ -570,6 +914,7 @@ void StartWatchdog() {
 // signature that actually reproduces on map transitions, so it needs the same
 // register dump: ctr names the bogus call target and lr names the guest caller
 // that loaded it.
+#if !defined(__SWITCH__)
 struct sigaction g_prev_sigabrt;
 
 void AbortHandler(int sig, siginfo_t* info, void* uctx) {
@@ -590,6 +935,7 @@ void AbortHandler(int sig, siginfo_t* info, void* uctx) {
     g_prev_sigabrt.sa_handler(sig);
   }
 }
+#endif  // !__SWITCH__
 
 bool CrashReportHandler(rex::arch::Exception* ex, void* /*data*/) {
   if (ex->code() != rex::arch::Exception::Code::kAccessViolation &&
@@ -685,11 +1031,20 @@ void EnsureInstalled(uint8_t* guest_base) {
     rex::arch::ExceptionHandler::Install(CrashReportHandler, nullptr);
     StartWatchdog();
 
+#if !defined(__SWITCH__)
     struct sigaction sa = {};
     sa.sa_sigaction = AbortHandler;
     sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, &g_prev_sigabrt);
+#else
+    // Horizon has no signals, so a guest abort cannot be intercepted this way
+    // and that one report is not produced here. Faults still are: the kernel
+    // hands them to __libnx_exception_handler, which runs CrashReportHandler
+    // installed just above, so an access violation reports exactly as it does
+    // everywhere else. What is lost is the REX_FATAL path, where the runtime
+    // has already logged the reason before calling abort.
+#endif
 
     REXLOG_INFO("skate3 crash reporter installed (guest faults report to stderr and '{}')", path);
   });

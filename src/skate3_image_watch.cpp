@@ -1,6 +1,30 @@
 // See skate3_image_watch.h for what this is and why it exists.
 #include "skate3_image_watch.h"
 
+#if defined(__SWITCH__)
+
+// The whole point of this watch is to make the static image's pages read-only
+// and catch whoever writes to them in the resulting fault. Horizon offers
+// neither: userspace cannot change the protection of a mapping, and a faulting
+// thread cannot be resumed. There is nothing here to reimplement, so the
+// feature reports itself as absent and every entry point does nothing.
+//
+// RestoreFromSnapshot returning 0 is already the documented answer for "the
+// watch is not installed", so callers need no change.
+
+namespace skate3::image_watch {
+
+void Install() {}
+bool Installed() { return false; }
+void FlushPending() {}
+void Tick(uint64_t /*frames*/) {}
+void DiffNow(const char* /*why*/) {}
+uint32_t RestoreFromSnapshot(uint32_t /*guest*/, uint32_t /*len*/) { return 0; }
+
+}  // namespace skate3::image_watch
+
+#else
+
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -875,3 +899,5 @@ uint32_t RestoreFromSnapshot(uint32_t guest, uint32_t len) {
 }
 
 }  // namespace skate3::image_watch
+
+#endif  // __SWITCH__

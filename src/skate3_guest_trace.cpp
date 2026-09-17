@@ -1014,9 +1014,25 @@ void skate3_trace_enter(const char* fn, const PPCContext& ctx, uint8_t* base) {
   e.stamp = Stamp();
   e.thread = uint32_t(ThreadIndex());
   // Resolved here rather than at dump time: by then the pointer is stale.
+  //
+  // Not on Switch. These registers are whatever the guest function was called
+  // with, so most of them are not pointers at all, and reading one speculatively
+  // only works where the whole guest window is mapped and a stray address
+  // quietly reads back rubbish. Horizon has no such luxury: this backend commits
+  // guest memory in chunks and maps nothing else, so the first argument that
+  // merely looked like a pointer took the process down with a translation fault
+  // at guest 0x04000194. The function names are what the trace is for; the
+  // argument strings are a convenience worth losing here.
+#if !defined(__SWITCH__)
   ReadGuestString(base, e.r3, e.text[0], kStringPreview);
   ReadGuestString(base, e.r4, e.text[1], kStringPreview);
   ReadGuestString(base, e.r5, e.text[2], kStringPreview);
+#else
+  (void)base;
+  e.text[0][0] = '\0';
+  e.text[1][0] = '\0';
+  e.text[2][0] = '\0';
+#endif
 }
 
 }  // extern "C"
