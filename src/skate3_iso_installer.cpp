@@ -610,6 +610,14 @@ std::filesystem::path FindPlacedIso() { return {}; }
 
 }  // namespace
 
+std::vector<std::filesystem::path> PlacedFileSearchDirectories() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  return IsoSearchDirectories();
+#else
+  return {};
+#endif
+}
+
 const char* FileTransferStepsTitle() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
   return "GETTING THE FILE ONTO THIS DEVICE";

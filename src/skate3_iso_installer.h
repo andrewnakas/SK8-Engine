@@ -20,6 +20,15 @@ std::vector<std::string> FileTransferSteps(const char* what, const char* action)
 
 bool IsGameInstalled(const std::filesystem::path& game_root);
 
+// Directories a file the player has already copied onto the device can be
+// found in, best first. Empty off iOS, where a working document picker makes
+// guessing at locations unnecessary.
+//
+// Shared with the title update installer rather than duplicated: both face the
+// same broken picker on TrollStore and jailbreak installs, and two lists would
+// drift the moment one gained a directory.
+std::vector<std::filesystem::path> PlacedFileSearchDirectories();
+
 // game_root itself, or the single folder inside it that holds default.xex when
 // game_root does not. Copying an extracted disc across as a folder is the
 // usual way people end up one level too deep; this finds that case and nothing

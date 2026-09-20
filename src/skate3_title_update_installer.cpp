@@ -651,6 +651,120 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
 #endif  // defined(_WIN32)
 
 // ----------------------------------------------------------------------------
+// Already-placed package
+// ----------------------------------------------------------------------------
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+// True when this file really is Skate 3 Title Update 3. The same checks
+// staging applies, minus the writing, so the scan below cannot offer something
+// that fails moments later inside the wizard.
+//
+// Only a full STFS container counts. StageTitleUpdateFromFile also accepts a
+// bare xexp payload, but a payload is one of the two files the update needs,
+// and staging it alone leaves IsTitleUpdateInstalled false - the wizard would
+// report "could not be verified after installation" having apparently just
+// succeeded. The picker still takes bare payloads for anyone who has them
+// separately; guessing one off a directory listing is what is unwise.
+bool IsTitleUpdatePackage(const std::filesystem::path& path) {
+  std::vector<uint8_t> data;
+  std::string error;
+  if (!ReadWholeFile(path, data, error)) {
+    return false;
+  }
+  if (!StfsPackageReader::LooksLikeStfs(data)) {
+    return false;
+  }
+  StfsPackageReader package;
+  if (!package.Open(std::move(data), error)) {
+    return false;
+  }
+  std::vector<StfsPackageReader::Entry> entries;
+  if (!package.ListEntries(entries, error)) {
+    return false;
+  }
+  for (const auto& payload : kPayloads) {
+    const auto wanted = ToLowerCopy(std::string(payload.container_path));
+    const auto it = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
+      return !entry.is_dir && ToLowerCopy(entry.path) == wanted;
+    });
+    if (it == entries.end()) {
+      return false;
+    }
+    std::vector<uint8_t> file_data;
+    if (!package.ReadFile(*it, file_data, error)) {
+      return false;
+    }
+    if (file_data.size() != payload.size ||
+        Sha256OfData(file_data.data(), file_data.size()) != payload.sha256) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A title update package already sitting on the device, or an empty path.
+//
+// The same answer to the same problem as FindPlacedIso, which this should have
+// shipped beside. The document picker is not reachable for TrollStore and
+// jailbreak installs, so a player who copied the file across by hand had no
+// way to point the game at it - and only the disc half of that was ever fixed,
+// which left exactly those players able to install the game and then unable to
+// install the update the build requires. Reported as "I cannot install or
+// select my title update", from people who had just installed from an ISO.
+//
+// Validating every candidate in full is cheap here in a way it is not for a
+// disc: the package is about 1.7 MB, and ReadWholeFile refuses anything over
+// kMaxPackageSize on a file_size() call, so a 7 GB ISO in the same folder is
+// rejected without being opened. Smallest first, because the real package is
+// far smaller than most of what shares those directories.
+std::filesystem::path FindPlacedTitleUpdate() {
+  std::vector<std::pair<uint64_t, std::filesystem::path>> candidates;
+  std::error_code ec;
+  for (const std::filesystem::path& dir : PlacedFileSearchDirectories()) {
+    if (!std::filesystem::is_directory(dir, ec)) {
+      continue;
+    }
+    for (std::filesystem::directory_iterator it(dir, ec), end; it != end; it.increment(ec)) {
+      if (ec) {
+        break;
+      }
+      if (!it->is_regular_file(ec)) {
+        continue;
+      }
+      const uint64_t size = std::filesystem::file_size(it->path(), ec);
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      if (size == 0 || size > kMaxPackageSize) {
+        continue;
+      }
+      candidates.emplace_back(size, it->path());
+    }
+    ec.clear();
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  for (const auto& [size, path] : candidates) {
+    if (!IsTitleUpdatePackage(path)) {
+      continue;
+    }
+    // WARN, like the rest of the install path: the phone builds ship at
+    // log_level=warn, and "did it find the file I put there" is the whole
+    // question a report about this arrives asking.
+    REXLOG_WARN("title-update: using the package already on the device at {} ({} bytes)",
+                path.string(), size);
+    return path;
+  }
+  return {};
+}
+#else
+std::filesystem::path FindPlacedTitleUpdate() {
+  return {};
+}
+#endif
+
+// ----------------------------------------------------------------------------
 // File picker
 // ----------------------------------------------------------------------------
 
@@ -890,18 +1004,16 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
       "This build of Skate 3 requires Title Update 3, a free update originally published on "
       "Xbox Live. It is not part of the game disc.";
   options.target_directory = game_root.string();
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-  // iOS cannot spawn a subprocess, so DownloadToFile is a stub that only ever
-  // reports failure. Offering the button anyway would be a button that cannot
-  // work - the file has to come in over file sharing, which is what the steps
-  // below explain.
-  options.initial_status =
-      "Copy the title update onto this device, then select it here.";
-#else
+  // iOS used to get neither the button nor this label, on the grounds that it
+  // cannot spawn a subprocess and so could not download at all. It can now -
+  // DownloadToFile goes through NSURLSession there - and leaving the label
+  // unset kept the button hidden, because the wizard only draws it when the
+  // label is non-empty. That combination left iOS with no working route to the
+  // update at all once the picker had failed, which is the bug this pairs with
+  // the placed-package scan to fix.
   options.initial_status =
       "Download it automatically, or select a title update package you already have.";
   options.fetch_button_label = "Download (1.7 MB)";
-#endif
   options.pick_button_label = "Select file...";
   options.fetch_connecting_status =
       "Connecting to the download server... (this can take a moment)";
@@ -910,6 +1022,18 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
   options.done_status = "Title Update 3 installed.";
   options.done_button_label = "Start Game";
   options.launching_status = "Starting the game...";
+
+  // Prefer a package the player has already put on the device over asking the
+  // system for one, exactly as the disc installer does. On iOS the picker is
+  // the step that fails for TrollStore and jailbreak installs; everywhere else
+  // the scan finds nothing and this is the old behaviour unchanged.
+  auto pick_source = []() {
+    std::filesystem::path placed = FindPlacedTitleUpdate();
+    if (!placed.empty()) {
+      return placed;
+    }
+    return PickTitleUpdateFile();
+  };
 
   auto fetch = [game_root](std::atomic<uint64_t>& copied_bytes, std::atomic<uint64_t>& total_bytes,
                            std::string& error) {
@@ -938,15 +1062,14 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
   };
 
   auto* dialog = new rex::ui::AcquireWizardDialog(
-      drawer, std::move(options), std::move(fetch), []() { return PickTitleUpdateFile(); },
+      drawer, std::move(options), std::move(fetch), std::move(pick_source),
       std::move(install),
       [runtime_paths = std::move(runtime_paths), complete = std::move(complete)]() mutable {
         if (complete) {
           complete(std::move(runtime_paths));
         }
       });
-  // Only relevant to the "select a file" route - downloading needs none of it,
-  // and on iOS that route is the only one there is.
+  // Only relevant to the "select a file" route - downloading needs none of it.
   {
     auto steps = FileTransferSteps("the title update package", "Select file...");
     steps.insert(steps.begin(),
