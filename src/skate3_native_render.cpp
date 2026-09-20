@@ -431,11 +431,15 @@ void PaceGuestFrame() {
     if (cap != s_logged_cap) {
       s_logged_cap = cap;
       const float refresh_hz = rex::ui::Window::CachedDisplayRefreshHz();
+      // WARN, not INFO. The phone builds ship at log_level=warn, and this is
+      // the only line that says whether the Framerate Cap row did anything at
+      // all - which is the first question asked of every report about it. It
+      // fires once per change, so it costs nothing to leave visible.
       if (cap >= 1.0) {
-        REXLOG_INFO("[pace] guest frame cap is now {:.0f} fps (auto={}, display presents at {:.0f} Hz)",
+        REXLOG_WARN("[pace] guest frame cap is now {:.0f} fps (auto={}, display presents at {:.0f} Hz)",
                     cap, REXCVAR_GET(skate3_guest_fps_cap_auto) ? "on" : "off", refresh_hz);
       } else {
-        REXLOG_INFO("[pace] guest frame cap is now OFF (auto={}, display presents at {:.0f} Hz)",
+        REXLOG_WARN("[pace] guest frame cap is now OFF (auto={}, display presents at {:.0f} Hz)",
                     REXCVAR_GET(skate3_guest_fps_cap_auto) ? "on" : "off", refresh_hz);
       }
     }
