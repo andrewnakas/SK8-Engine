@@ -53,6 +53,11 @@ extern std::atomic<uint32_t> rex_diag_shmem_page_size;
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <pthread/pthread.h>
+// write() and STDERR_FILENO, used by the async-signal-safe fault path. Every
+// other arm of this chain includes it; Apple got it transitively from the
+// macOS SDK's headers and not from the iOS SDK's, so it only surfaced the
+// first time this was built for a phone.
+#include <unistd.h>
 #elif defined(__SWITCH__)
 // No prctl and no syscall table: thread names live on the thread object here,
 // and the reporter reads them from the kernel state rather than from the OS.
@@ -69,7 +74,15 @@ extern std::atomic<uint32_t> rex_diag_shmem_page_size;
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#if !defined(__APPLE__)
+// Darwin has no <malloc.h> - the equivalent is <malloc/malloc.h>, and it does
+// not declare mallinfo() at all. The only caller here is the Horizon heartbeat
+// below, which is already inside #if defined(__SWITCH__), so excluding Apple
+// costs nothing. Added unguarded by c071953 while bringing up the Switch port,
+// which broke the macOS and iOS builds silently: macOS had not rebuilt this
+// translation unit since, and iOS had not been built at all.
 #include <malloc.h>
+#endif
 #include <vector>
 #include <ctime>
 #include <mutex>
