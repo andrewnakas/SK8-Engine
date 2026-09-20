@@ -18,6 +18,7 @@
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
+#include "skate3_launcher.h"
 #include "skate3_pack_select.h"
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
 #include <rex/input/touch_input_driver.h>
@@ -42,6 +43,22 @@ REXCVAR_DECLARE(std::string, skate3_loader_request_path);
 // that cannot fire.
 REXCVAR_DECLARE(std::string, picker_chord);
 REXCVAR_DECLARE(bool, guide_button);
+
+// Default on for the platforms with no app shell of their own. Android has a
+// real launcher Activity in front of the game and does not want a second one;
+// desktop has a file manager, a terminal and somewhere to put a log, so the
+// screen would only be in the way. iOS has none of those - no adb, and no way
+// for a player to see whether the disc staged or to get a log off the phone -
+// which is the whole reason this exists.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+REXCVAR_DEFINE_BOOL(skate3_launcher, true, "Skate 3",
+#else
+REXCVAR_DEFINE_BOOL(skate3_launcher, false, "Skate 3",
+#endif
+                    "Show the launcher before the game starts: Play, install the disc image or "
+                    "the title update, choose a map pack, and save a diagnostic report. Off: the "
+                    "game boots straight into the guest, and the installers still appear on their "
+                    "own when something they need is missing.");
 
 REXCVAR_DEFINE_BOOL(skate3_content_pack_menu, true, "Skate 3",
                     "Ask which content pack to load when several are installed, even if one is "
@@ -993,6 +1010,20 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
       runtime_paths.game_data_root,
       window() ? window()->GetNativeWindowHandle() : nullptr);
 #endif
+  // The launcher, before the pack chooser rather than after it.
+  //
+  // After was wrong and silently unreachable: the chooser returns nullopt to
+  // defer startup and then resumes from its own callback, so OnFinalizePaths
+  // is never entered a second time and the launcher below it never ran on any
+  // device with two packs installed - which is every device this was tested
+  // on. The launcher is the home screen; choosing a pack is one of its rows,
+  // and Play goes through the same chooser by way of ResumeWithPackChoice.
+  if (REXCVAR_GET(skate3_launcher) && !launcher_shown_) {
+    launcher_shown_ = true;
+    ShowLauncherScreen(std::move(runtime_paths), std::move(resume));
+    return std::nullopt;
+  }
+
   // Ask which pack to load, before anything of the game starts. Asynchronous:
   // this runs from OnFinalizePaths, before OnInitialize has returned, so the
   // event loop is not pumping yet and a blocking wait would draw nothing -
@@ -1024,6 +1055,82 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   }
 
   return runtime_paths;
+}
+
+// Starts the guest, asking which content pack to stage first when that
+// question is still open.
+//
+// The same test the startup path applies, factored out so the launcher's Play
+// row cannot skip it: only one pack can be staged per launch, because the
+// title's boot content scan does not cope with several at once.
+void Skate3BaseApp::ResumeWithPackChoice(rex::PathConfig paths,
+                                         std::function<void(rex::PathConfig)> resume) {
+  if ((REXCVAR_GET(skate3_content_pack).empty() || REXCVAR_GET(skate3_content_pack_menu)) &&
+      !chose_content_pack_) {
+    const std::vector<std::string> packs =
+        DiscoverContentPackNames(paths.user_data_root.parent_path());
+    if (packs.size() > 1) {
+      skate3::ShowPackSelect(app_context(), imgui_drawer(), packs,
+                             [this, paths, resume](std::string choice) mutable {
+                               chosen_content_pack_ = std::move(choice);
+                               chose_content_pack_ = true;
+                               resume(std::move(paths));
+                             });
+      return;
+    }
+  }
+  resume(std::move(paths));
+}
+
+// Shows the launcher, and comes back to it after any wizard it opens.
+//
+// Recursive by design: every row except Play returns here, so the player can
+// install a disc, then the title update, then pick a pack, without the app
+// deciding on their behalf that it is time to start. Play is the only exit.
+void Skate3BaseApp::ShowLauncherScreen(rex::PathConfig paths,
+                                       std::function<void(rex::PathConfig)> resume) {
+  skate3::LauncherActions actions;
+  actions.game_root = paths.game_data_root;
+  actions.user_root = paths.user_data_root;
+  actions.packs = DiscoverContentPackNames(paths.user_data_root.parent_path());
+
+  // Not resume() directly: only one content pack can be staged per launch, so
+  // with several installed the choice still has to be made before the guest
+  // starts. Same chooser, reached on purpose instead of unavoidably.
+  actions.play = [this, paths, resume]() mutable {
+    ResumeWithPackChoice(std::move(paths), std::move(resume));
+  };
+
+  actions.install_disc = [this, paths, resume]() mutable {
+    skate3::ShowRexglueIsoInstallWizard(
+        imgui_drawer(), std::move(paths),
+        [this, resume](rex::PathConfig installed) mutable {
+          ShowLauncherScreen(std::move(installed), std::move(resume));
+        });
+  };
+
+  actions.install_title_update = [this, paths, resume]() mutable {
+    skate3::ShowTitleUpdateInstallWizard(
+        imgui_drawer(), std::move(paths),
+        [this, resume](rex::PathConfig installed) mutable {
+          ShowLauncherScreen(std::move(installed), std::move(resume));
+        });
+  };
+
+  if (actions.packs.size() > 1) {
+    actions.choose_pack = [this, paths, resume]() mutable {
+      const std::vector<std::string> packs =
+          DiscoverContentPackNames(paths.user_data_root.parent_path());
+      skate3::ShowPackSelect(app_context(), imgui_drawer(), packs,
+                             [this, paths, resume](std::string choice) mutable {
+                               chosen_content_pack_ = std::move(choice);
+                               chose_content_pack_ = true;
+                               ShowLauncherScreen(std::move(paths), std::move(resume));
+                             });
+    };
+  }
+
+  skate3::ShowLauncher(app_context(), imgui_drawer(), std::move(actions));
 }
 
 void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
@@ -1658,7 +1765,12 @@ void Skate3BaseApp::RestartGame() {
     // ApplyAndRestart's SaveVideo() before this runs, so quitting IS applying
     // them; the player just relaunches by hand. Falls through to the quit
     // below rather than trying and failing first.
-    REXLOG_INFO("Restart requested: settings saved, quitting for a manual relaunch (iOS "
+    //
+    // WARN, not INFO, exactly as the Android lines below: iOS ships at
+    // log_level=warn too, and this is the platform where a restart is most
+    // confusing - the app simply closes - so this line is precisely what a
+    // report saying "Apply & Quit did nothing" needs to contain.
+    REXLOG_WARN("Restart requested: settings saved, quitting for a manual relaunch (iOS "
                 "cannot restart itself)");
 #elif REX_PLATFORM_ANDROID
     // An app process cannot exec itself either, but the activity can relaunch

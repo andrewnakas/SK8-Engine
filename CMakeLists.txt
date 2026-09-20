@@ -303,12 +303,14 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_demo_path.cpp
     src/skate3_alloc_counter.cpp
     src/skate3_diagnostics.cpp
+    src/skate3_diagnostics_report.cpp
     src/skate3_draw_distance.cpp
     src/skate3_fov.cpp
     src/skate3_guest_trace.cpp
     src/skate3_heap_check.cpp
     src/skate3_image_watch.cpp
     src/skate3_iso_installer.cpp
+    src/skate3_launcher.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
@@ -352,6 +354,10 @@ endif()
 if(SKATE3_IOS)
     # UIDocumentPickerViewController, so the disc can be chosen from Files.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_ios.mm)
+    # UIDevice/Metal/sysctl half of the diagnostic report, and the NSURLSession
+    # downloader the title update row needs.
+    list(APPEND SKATE3_COMMON_SOURCES src/skate3_diagnostics_report_ios.mm)
+    list(APPEND SKATE3_COMMON_SOURCES src/skate3_ios_download.mm)
 elseif(APPLE)
     # NSOpenPanel.
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_macos.mm)

@@ -27,6 +27,14 @@ class Skate3BaseApp : public rex::ReXApp {
   ~Skate3BaseApp() override;
 
  protected:
+  // Starts the guest, asking which content pack to stage first when several
+  // are installed and the question is still open.
+  void ResumeWithPackChoice(rex::PathConfig paths, std::function<void(rex::PathConfig)> resume);
+
+  // Shows the launcher and returns to it after any wizard it opens; Play is
+  // the only row that continues into the guest. See the definition.
+  void ShowLauncherScreen(rex::PathConfig paths, std::function<void(rex::PathConfig)> resume);
+
   std::optional<rex::PathConfig> OnFinalizePaths(
       const rex::PathConfig& defaults,
       std::function<void(rex::PathConfig)> resume) override;
@@ -84,6 +92,10 @@ class Skate3BaseApp : public rex::ReXApp {
   // Answered while the UI was still painting; consumed when staging runs.
   std::string chosen_content_pack_;
   bool chose_content_pack_ = false;
+  // The launcher is shown once per process. OnFinalizePaths runs again after
+  // every wizard resumes it, and without this the launcher would reappear
+  // after Play and the game would never start.
+  bool launcher_shown_ = false;
   // Full-screen "loading <map>" cover for launcher-driven map selection.
   std::unique_ptr<skate3::LoaderOverlay> loader_overlay_;
   std::unique_ptr<skate3::LevelSelectDialog> level_select_dialog_;

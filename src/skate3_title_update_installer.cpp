@@ -27,6 +27,12 @@
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+// Must follow TargetConditionals.h: TARGET_OS_IPHONE is undefined before it,
+// so a test placed above would quietly read as false and leave
+// IosDownloadToFile undeclared at its call site.
+#include "skate3_ios_download.h"
+#endif
 #endif
 
 #if defined(_WIN32)
@@ -560,15 +566,14 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
 #elif defined(__APPLE__) && TARGET_OS_IPHONE
 
 // iOS apps cannot spawn subprocesses at all, so the curl path below is not
-// available. The title update is applied at build time (the generated code is
-// produced with it), and the disc is staged into Documents by hand, so there is
-// nothing for a runtime downloader to do here except say so.
-bool DownloadToFile(const std::string& /*url*/, const std::filesystem::path& /*destination*/,
-                    std::atomic<uint64_t>& /*copied_bytes*/, std::atomic<uint64_t>& /*total_bytes*/,
+// available and this used to refuse outright, telling the player to copy the
+// package in over file sharing. NSURLSession can do the transfer in-process,
+// which is what the launcher's "Download title update" row needs - having a
+// row that always fails is worse than having no row.
+bool DownloadToFile(const std::string& url, const std::filesystem::path& destination,
+                    std::atomic<uint64_t>& copied_bytes, std::atomic<uint64_t>& total_bytes,
                     std::string& error) {
-  error = "Downloading is not supported on iOS. Copy the title update into the app's Documents "
-          "folder over file sharing instead.";
-  return false;
+  return skate3::IosDownloadToFile(url, destination, copied_bytes, total_bytes, error);
 }
 
 #elif defined(__ANDROID__)
