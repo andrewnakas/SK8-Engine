@@ -6204,7 +6204,12 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
       s_async_saved = REXCVAR_GET(async_shader_compilation);
       if (s_async_saved) {
         REXCVAR_SET(async_shader_compilation, false);
-        REXLOG_INFO(
+        // WARN, not INFO: the phone builds ship at log_level=warn, so at INFO
+        // this line is invisible on the only devices the bug happens on - and
+        // its absence then reads as "the window never opened" rather than
+        // "you cannot see it", which is exactly the wrong conclusion to hand
+        // someone reading a diagnostic report. It fires twice a boot.
+        REXLOG_WARN(
             "native-scene: {} - shader compilation synchronous "
             "(one-shot renders can't skip still-compiling pieces)",
             want ? "menu context" : "cold boot frontend");
