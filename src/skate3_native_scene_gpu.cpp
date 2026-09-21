@@ -6177,18 +6177,40 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
     // skaters; later runs are fine because the
     // shader/pipeline disk storage is warm). Menus tolerate the one-time
     // compile stalls invisibly.
+    //
+    // The same hazard reaches further back than the portrait window, and the
+    // reason above says why without quite drawing the conclusion: "later runs
+    // are fine because the shader/pipeline disk storage is warm". A FIRST
+    // launch has no storage at all, so the whole boot frontend compiles as it
+    // draws - and those screens are one-shot too. A draw skipped there is not
+    // a flicker; it is a widget that never appears.
+    //
+    // That is the blank difficulty dialog on first launch: the panel, the
+    // banner and the prompt survive and the options list is an empty box.
+    // It looked intermittent and unreproducible for exactly the reason this
+    // comment already gives - run it twice and the cache is warm - which is
+    // also why it reaches players as "it glitched out on startup" and never
+    // again.
+    //
+    // So hold compilation synchronous across the pre-gameplay frontend as
+    // well. It ends at the first gameplay frame, it only ever bites on a cold
+    // cache, and menus absorb the stalls invisibly (the same trade this block
+    // already makes).
+    const bool cold_frontend = in_menus && !s_seen_gameplay;
+    const bool want_sync = want || cold_frontend;
     static bool s_async_forced = false;
     static bool s_async_saved = false;
-    if (want && !s_async_forced) {
+    if (want_sync && !s_async_forced) {
       s_async_saved = REXCVAR_GET(async_shader_compilation);
       if (s_async_saved) {
         REXCVAR_SET(async_shader_compilation, false);
         REXLOG_INFO(
-            "native-scene: menu context - shader compilation synchronous "
-            "(one-shot portrait renders can't skip still-compiling pieces)");
+            "native-scene: {} - shader compilation synchronous "
+            "(one-shot renders can't skip still-compiling pieces)",
+            want ? "menu context" : "cold boot frontend");
       }
       s_async_forced = true;
-    } else if (!want && s_async_forced) {
+    } else if (!want_sync && s_async_forced) {
       if (s_async_saved) {
         REXCVAR_SET(async_shader_compilation, true);
       }
