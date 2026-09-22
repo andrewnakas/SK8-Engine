@@ -976,6 +976,21 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
 // disagreeing about what exists. Existing entities are not despawned - they
 // walk off on their own.
 REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_hair_single_pass, false, "Skate 3",
+    "Draw hair in one coverage pass instead of the game's two cull passes. "
+    "Halves hair draw cost; far strands can show through near ones, which is "
+    "what the second pass exists to prevent.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_water_effects, true, "Skate 3",
+    "Capture water, ocean, ocean-reflection and scrolling materials for the "
+    "native water paths. Off leaves those capture probes disarmed for the "
+    "whole frame, which costs nothing to check and removes the reflection "
+    "work; water surfaces fall back to their flat appearance.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_vegetation, true, "Skate 3",
     "Draw grass, shrubs and tree/leaf cards. Off drops them at scene capture, "
     "which removes a large share of the draw calls and the shimmer they cause "
@@ -11107,13 +11122,19 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_fog_frame_done = false;
   g_shadow_frame_done = false;
   g_sky_frame_done = false;
-  g_tree_frame_done = false;
+  // A family switched off keeps its capture probe DISARMED for the frame
+  // rather than being filtered later. Re-arming it and rejecting afterwards
+  // made every guest draw re-read and strstr the shader debug paths looking
+  // for a family that was not in the view at all - most expensive for
+  // ocean/water, which is absent from most of the map.
+  const bool water_skip = !REXCVAR_GET(skate3_native_render_scene_water_effects);
+  g_tree_frame_done = !REXCVAR_GET(skate3_native_render_scene_vegetation);
   g_proxy_frame_done = false;
-  g_dynobj_frame_done = false;
-  g_water_frame_done = false;
-  g_ocean_frame_done = false;
-  g_oceanrefl_frame_done = false;
-  g_scroll_frame_done = false;
+  g_dynobj_frame_done = !skate3::native_scene::MovablePropsAtBoot();
+  g_water_frame_done = water_skip;
+  g_ocean_frame_done = water_skip;
+  g_oceanrefl_frame_done = water_skip;
+  g_scroll_frame_done = water_skip;
 
 
   // Draw-time STRETCH VETO: the last line of defense, judging what the GPU

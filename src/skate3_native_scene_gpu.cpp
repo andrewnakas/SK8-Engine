@@ -103,6 +103,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_perf_interval);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_hair_single_pass);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_grid_standalone);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_display_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_grab_native);
@@ -11325,6 +11326,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       const bool hair = item->char_family >= 4 && item->char_family <= 5 &&
                         item->char_rows[14 * 4 + 1] > 0.0f;
       if (hair && use_depth && g_r.pso_hair_a != nullptr && g_r.pso_hair_b != nullptr) {
+        if (REXCVAR_GET(skate3_native_render_scene_hair_single_pass)) {
+          // One coverage pass instead of the two cull passes below: halves
+          // hair draw cost, and far strands can show through near ones.
+          cmd->SetPipeline(g_r.pso_hair_a);
+          timed_draw(*item);
+          cmd->SetPipeline(blend_bound);
+          continue;
+        }
         // The game's two hair passes: cull BACK then cull FRONT with the
         // same shader: keeps far-side strands from compositing over
         // near-side ones (one uncull(ed) pass reads as crunchy noise).
