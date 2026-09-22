@@ -93,6 +93,7 @@ extern std::atomic<uint32_t> rex_diag_shmem_page_size;
 
 #include <rex/cvar.h>
 #include <rex/exception_handler.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/logging.h>
 #include <rex/logging/api.h>
 #include <rex/ppc/context.h>
@@ -835,6 +836,22 @@ void WatchdogMain() {
       DumpAllThreads();
     }
 #endif
+
+    // A backgrounded app is supposed to look exactly like a hang: the guest is
+    // parked on purpose, no frames are being produced, and no work is being
+    // submitted. Reporting that would turn every ordinary suspend into a hang
+    // report with a full thread dump - expensive, and it would bury the real
+    // ones in the diagnostics the reports are read from.
+    //
+    // The tick counters are reset, so the seconds spent in the background are
+    // not counted toward a hang on the way back in. last_seen and last_work are
+    // deliberately left alone: they are compared against monotonic counters,
+    // and clearing them would fake a heartbeat on the first tick after resume.
+    if (!rex::graphics::IsAppForeground()) {
+      stalled_ticks = 0;
+      idle_ticks = 0;
+      continue;
+    }
 
     const int limit = REXCVAR_GET(skate3_hang_watchdog_seconds);
     if (limit <= 0) {

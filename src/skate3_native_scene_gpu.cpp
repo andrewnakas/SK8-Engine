@@ -449,6 +449,56 @@ uint32_t GuestTextureGpuBytes(const GuestTexture& t, uint32_t faces = 1) {
   return bytes > UINT32_MAX ? UINT32_MAX : uint32_t(bytes);
 }
 
+// What one entry costs the texture budget. One definition, used by the
+// periodic rescan, by insertion and by eviction, so the running total cannot
+// drift from the number a rescan would produce. (It could before: eviction
+// subtracted gpu_bytes alone while the rescan also counted the staging
+// buffers, so every sweep left the total reading low.)
+uint64_t TexStoreEntryBytes(GuestTexture& t) {
+  if (t.gpu_bytes == 0) {
+    t.gpu_bytes = GuestTextureGpuBytes(t);
+  }
+  uint64_t bytes = t.gpu_bytes;
+  // In-place-update entries retain their staging ping-pong buffers, which land
+  // in device-local memory on resizable-BAR systems.
+  if (t.upload != nullptr) {
+    bytes += t.upload->size();
+  }
+  if (t.upload_b != nullptr) {
+    bytes += t.upload_b->size();
+  }
+  return bytes;
+}
+
+// Insert into the texture store and charge the budget in the same breath.
+//
+// The total used to be recomputed only every kStoreByteScanIntervalFrames and
+// otherwise merely decremented on eviction, so every texture decoded between
+// two rescans was invisible to the cap - for up to two seconds the budget was
+// not enforced at all. Measured on device against a 288 MB budget, the sweep
+// was entering at 291, 326, 361 and 417 MB: memory the device has already
+// committed by the time anything notices. The rescan stays, because entries
+// gain and lose staging buffers after they are inserted and only a full pass
+// can resettle that drift.
+std::pair<std::unordered_map<uint64_t, GuestTexture>::iterator, bool> TexStoreEmplace(
+    uint64_t key, const GuestTexture& gt) {
+  auto result = g_r.tex_store.emplace(key, gt);
+  if (result.second) {
+    g_tex_store_bytes += TexStoreEntryBytes(result.first->second);
+  }
+  return result;
+}
+
+// The counterpart, for the removals that are not evictions: an entry being
+// replaced by a fresh decode, or a warm entry superseded at commit. Charging
+// on insert only works if every removal discharges, or the total ratchets up
+// and the budget starts evicting against memory that is no longer there.
+std::unordered_map<uint64_t, GuestTexture>::iterator TexStoreErase(
+    std::unordered_map<uint64_t, GuestTexture>::iterator it) {
+  g_tex_store_bytes -= std::min<uint64_t>(g_tex_store_bytes, TexStoreEntryBytes(it->second));
+  return g_r.tex_store.erase(it);
+}
+
 void EvictTexStore(uint64_t frame_number, uint64_t submission) {
   static bool s_evicting = false;
   static uint64_t s_next_scan_frame = 0;
@@ -458,18 +508,7 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
     s_next_bytes_frame = frame_number + kStoreByteScanIntervalFrames;
     uint64_t total = 0;
     for (auto& [k, t] : g_r.tex_store) {
-      if (t.gpu_bytes == 0) {
-        t.gpu_bytes = GuestTextureGpuBytes(t);
-      }
-      total += t.gpu_bytes;
-      // In-place-update entries retain their staging ping-pong buffers,
-      // which land in device-local memory on resizable-BAR systems.
-      if (t.upload != nullptr) {
-        total += t.upload->size();
-      }
-      if (t.upload_b != nullptr) {
-        total += t.upload_b->size();
-      }
+      total += TexStoreEntryBytes(t);
     }
     g_tex_store_bytes = total;
     REXLOG_INFO("native-scene: store sizes tex={}MB/{} mesh={}MB/{}", g_tex_store_bytes >> 20,
@@ -536,7 +575,7 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
     const auto it = g_r.tex_store.find(ages[i].second);
     if (it != g_r.tex_store.end()) {
       g_tex_store_bytes -= std::min<uint64_t>(g_tex_store_bytes,
-                                              it->second.gpu_bytes);
+                                              TexStoreEntryBytes(it->second));
       RetireGuestTexture(it->second, submission);
       g_r.tex_store.erase(it);
     }
@@ -5194,7 +5233,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
                      tex_ptr, key, it->second.incomplete, it->second.payload_fp, fp);
       }
       RetireGuestTexture(it->second, context.device->CurrentSubmission());
-      g_r.tex_store.erase(it);
+      TexStoreErase(it);
     }
     if (!within()) {
       ++wc.deferred;
@@ -5210,7 +5249,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       gt.retry_after_frame = frame_number + 120;
     }
     gt.last_used_frame = frame_number;
-    g_r.tex_store.emplace(key, gt);
+    TexStoreEmplace(key, gt);
   };
   // Draw-time fetch-word bindings (streamed artwork / decal ad overrides)
   // share the same store.
@@ -5230,7 +5269,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
     GuestTexture gt;
     EnsureGuestTextureFromWords(context, base, words, gt);
     gt.last_used_frame = frame_number;
-    g_r.tex_store.emplace(fkey, gt);
+    TexStoreEmplace(fkey, gt);
   };
 
   warm_fetch_words(item.diffuse_fetch);
@@ -5868,7 +5907,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
           }
           t.gt.last_used_frame = wit->second.last_used_frame;
           RetireGuestTexture(wit->second, context.device->CurrentSubmission());
-          g_r.tex_store.erase(wit);
+          TexStoreErase(wit);
         }
         if (t.valid) {
           CommitStagedGuestTexture(context, t.gt, t.commit);
@@ -5900,7 +5939,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         if (t.gt.last_used_frame == 0) {
           t.gt.last_used_frame = frame_number;
         }
-        g_r.tex_store.emplace(t.words_key, t.gt);
+        TexStoreEmplace(t.words_key, t.gt);
         continue;
       }
       // No words key and not a cube: an empty/failed stage slot; release
@@ -7029,6 +7068,7 @@ void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context)
       RetireGuestTexture(t, submission);
     }
     g_r.tex_store.clear();
+    g_tex_store_bytes = 0;
     g_r.tex_routes.clear();
     g_r.words_sticky.clear();
     g_r.tex_sticky.clear();
@@ -11432,7 +11472,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                         frame_number, key);
           }
           RetireGuestTexture(it->second, context.device->CurrentSubmission());
-          g_r.tex_store.erase(it);
+          TexStoreErase(it);
           it = g_r.tex_store.end();  // falls into the inline decode below
         } else {
           // Budget exhausted (burst overflow): heal on the workers, serve
@@ -11516,7 +11556,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                     frame_number, key, gt.valid ? 1 : 0, gt.incomplete ? 1 : 0,
                     gt.payload_fp);
       }
-      it = g_r.tex_store.emplace(key, gt).first;
+      it = TexStoreEmplace(key, gt).first;
     }
     if (it != g_r.tex_store.end() &&
         (tr2d || (g_in_menus_frame.load(std::memory_order_relaxed) &&

@@ -145,6 +145,7 @@ REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
+#include <rex/system/guest_pause.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system.h>
@@ -1148,6 +1149,40 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
       skate3::native_scene::FlushTextureCache();
       skate3::native_scene::FlushMeshCache();
     });
+    // Park the guest threads while the app is away, and release them when it
+    // comes back.
+    //
+    // This matters most on Android, where SDL pauses only its own thread: the
+    // pinned guest threads otherwise run flat out for the whole background
+    // period, burning battery and keeping the process looking busy to a system
+    // deciding what to reclaim. Parking is cooperative and bounded, so a thread
+    // that does not reach a checkpoint in time simply keeps running - see
+    // guest_pause.h for why it is never forced.
+    //
+    // DELIBERATELY NOT GraphicsSystem::Pause() or AudioSystem::Pause(), though
+    // both exist and look like exactly the right thing. Both block the caller
+    // on an UNBOUNDED fence wait (command_processor.cpp Pause, audio_system.cpp
+    // Pause) until their worker acknowledges. This callback runs inside the
+    // UIKit delegate with roughly five seconds before iOS kills the app for
+    // failing to go quiescent - and a command processor stuck in vkQueueSubmit
+    // waiting on a drawable is the single most-documented failure in this port.
+    // Waiting on it here would turn a hitch into that kill, which is the exact
+    // outcome the presentation gate above was written to prevent.
+    //
+    // Nothing is lost by leaving them alone: presentation is already gated, and
+    // once the guest stops queueing work the command processor drains and goes
+    // idle on its own.
+    sdl_context->SetSuspendHandlers(
+        []() {
+          // The thread servicing this callback must never park itself: on iOS
+          // it is inside a UIKit delegate, and nothing would be left running to
+          // release it.
+          rex::system::ExcludeCurrentThreadFromGuestPause();
+          const uint32_t parked =
+              rex::system::RequestGuestPause(std::chrono::milliseconds(250));
+          REXLOG_WARN("[lifecycle] suspend: {} guest threads parked", parked);
+        },
+        []() { rex::system::ReleaseGuestPause(); });
   }
 #endif
   render_mode_indicator_ = std::make_unique<skate3::RenderModeIndicator>(drawer);
