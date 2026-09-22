@@ -820,6 +820,18 @@ bool SceneFailed();
 
 // Pedestrians & Traffic / Movable Props as they were at boot. The spawn hooks
 // must all agree for the whole session, so neither reads the live cvar.
+// Result of the last completed benchmark run, for the on-screen readout and
+// the log. valid is false when none has finished this session.
+struct BenchmarkResult {
+  bool valid = false;
+  uint32_t frames = 0;
+  double avg_ms = 0.0, p50_ms = 0.0, p95_ms = 0.0, p99_ms = 0.0, max_ms = 0.0;
+  uint32_t chars_avg = 0, chars_max = 0;
+  double battery_c = -1.0;
+};
+BenchmarkResult LastBenchmarkResult();
+void ClearBenchmarkResult();
+
 bool AmbientNpcsAtBoot();
 bool MovablePropsAtBoot();
 
