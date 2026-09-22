@@ -976,6 +976,21 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
 // disagreeing about what exists. Existing entities are not despawned - they
 // walk off on their own.
 REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_vegetation, true, "Skate 3",
+    "Draw grass, shrubs and tree/leaf cards. Off drops them at scene capture, "
+    "which removes a large share of the draw calls and the shimmer they cause "
+    "once the 3D scene resolution is lowered.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_merge_draws, false, "Skate 3",
+    "Coalesce adjacent draw islands of one material into a single draw, at the "
+    "cost of rendering up to 32 extra triangles per merge. Fewer draw calls is "
+    "the trade a CPU-bound machine wants; a machine with CPU headroom pays the "
+    "triangles for nothing. Applies to geometry built after the change.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_ambient_npcs, true, "Skate 3",
     "Spawn ambient pedestrians and traffic. Off stops the LivingWorld census "
     "spawning them at all, so they cost no collision, no voice and no update - "
@@ -2945,6 +2960,45 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   return true;
 }
 
+// Tree cards and environmentsimple.alphatest (grass, shrubs, leaf and fence
+// cards). Draw-heavy out of all proportion to what they contribute on a phone
+// screen, and they shimmer badly once the scene raster is scaled down.
+bool IsVegetationCard(const DrawItem& item) {
+  return item.env_family == 7 || item.env_family == 9 || item.env_family == 10 ||
+         item.transparent || item.env_family == 13;
+}
+
+// LivingWorld pedestrians and traffic, and their hair: family 5 is the NPC
+// default_hair, while the PLAYER's hair is family 4. The player families (1
+// and 2), the skateboard and all gameplay geometry are deliberately not here.
+bool IsAmbientNpc(const DrawItem& item) {
+  return item.char_family == 3 || item.char_family == 5 || item.char_family == 6 ||
+         item.char_family == 7;
+}
+
+// Content cuts, one user setting each. This runs before palette capture for
+// dynamic submissions and before publication for statics, so anything dropped
+// here also skips the scene post-processing and the render-side texture and
+// draw work - not just its own draw.
+//
+// The ambient-NPC and movable-prop arms overlap the spawn hooks in
+// skate3_native_render.cpp on purpose. The hooks stop entities being created
+// at all, which is the bigger win; this catches anything that was already
+// alive when the setting was read, so the picture agrees with the setting
+// immediately rather than after the last pedestrian wanders off.
+bool ContentSettingsDrop(const DrawItem& item) {
+  if (IsVegetationCard(item) && !REXCVAR_GET(skate3_native_render_scene_vegetation)) {
+    return true;
+  }
+  if (IsAmbientNpc(item) && !AmbientNpcsAtBoot()) {
+    return true;
+  }
+  if (item.dynobj != 0 && !MovablePropsAtBoot()) {
+    return true;
+  }
+  return false;
+}
+
 bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
   const uint32_t record = REX_LOAD_U32(ctx);
   if (!GuestReadableApprox(base, record)) {
@@ -2990,6 +3044,37 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
     DrawEntry entry{REX_LOAD_U32(d), REX_LOAD_U32(d + 4), REX_LOAD_U32(d + 8),
                     REX_LOAD_U32(d + 12)};
     if (entry.index_count == 0 || entry.index_count > item.ib_count) continue;
+    // A draw list is visibility islands inside ONE material mesh, so every
+    // island already shares a pipeline, a vertex buffer and an index buffer -
+    // the only thing separating them is a gap in the index range. Merging
+    // adjacent islands, and gaps small enough not to be worth a second draw,
+    // turns several draws into one at the cost of rendering the triangles in
+    // the gap.
+    //
+    // Worth having because this port is CPU-bound on a phone well before it is
+    // fill-bound: a [cp-op] line measured 130% of a 30s window in guest packet
+    // work. Trading up to 32 triangles for a draw call is the right side of
+    // that trade there, and the wrong side on a machine with CPU to spare -
+    // which is why it is off by default.
+    //
+    // The gap must be a whole number of triangles ((gap % 3) == 0) or the
+    // merged range would start mid-primitive, and the merged end must stay
+    // inside the index buffer.
+    if (REXCVAR_GET(skate3_native_render_scene_merge_draws) && !item.draws.empty()) {
+      // InlineVector::back() is const-only; operator[] has a mutable
+      // overload and this needs to write the merged length back.
+      DrawEntry& prev = item.draws[item.draws.size() - 1];
+      const uint64_t prev_end = uint64_t(prev.start_index) + prev.index_count;
+      const uint64_t entry_end = uint64_t(entry.start_index) + entry.index_count;
+      const uint64_t gap = entry.start_index >= prev_end
+                               ? uint64_t(entry.start_index) - prev_end
+                               : UINT64_MAX;
+      if (prev.prim == entry.prim && prev.base_vertex == entry.base_vertex &&
+          gap <= 96 && (gap % 3u) == 0u && entry_end <= item.ib_count) {
+        prev.index_count = uint32_t(entry_end - prev.start_index);
+        continue;
+      }
+    }
     item.draws.push_back(entry);
   }
   if (item.draws.empty()) {
@@ -4687,6 +4772,9 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
   }
   DrawItem item;
   if (!BuildItemGeometry(base, ctx, item)) {
+    return 0;
+  }
+  if (ContentSettingsDrop(item)) {
     return 0;
   }
   item.ctx = ctx;  // identity key for the palette serve / entity store
