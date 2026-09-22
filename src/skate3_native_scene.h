@@ -829,6 +829,10 @@ struct BenchmarkResult {
   uint32_t chars_avg = 0, chars_max = 0;
   double battery_c = -1.0;
 };
+// Frames still to measure in the run in progress, 0 when none is running.
+// Drives the on-screen progress readout - a benchmark with no visible sign it
+// is running looks exactly like a button that did nothing.
+uint32_t BenchmarkFramesRemaining();
 BenchmarkResult LastBenchmarkResult();
 void ClearBenchmarkResult();
 

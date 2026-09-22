@@ -1229,7 +1229,14 @@ void RenderModeIndicator::OnDraw(ImGuiIO& io) {
   const bool scene_off = !REXCVAR_GET(skate3_native_render) ||
                          !REXCVAR_GET(skate3_native_render_scene) ||
                          skate3::native_scene::SceneFailed();
-  if (!REXCVAR_GET(skate3_native_render_mode_indicator) && !scene_off) {
+  // The benchmark shows here whatever the indicator cvar says. A run with no
+  // visible sign it is happening is indistinguishable from a button that did
+  // nothing, and the result arriving only in the log is no use on a phone.
+  const uint32_t bench_left = skate3::native_scene::BenchmarkFramesRemaining();
+  const skate3::native_scene::BenchmarkResult bench =
+      skate3::native_scene::LastBenchmarkResult();
+  const bool show_bench = bench_left > 0 || bench.valid;
+  if (!REXCVAR_GET(skate3_native_render_mode_indicator) && !scene_off && !show_bench) {
     return;
   }
   // Pre-runtime (installer wizards) no guest frame exists yet - there is no
@@ -1250,9 +1257,34 @@ void RenderModeIndicator::OnDraw(ImGuiIO& io) {
                    ImGuiWindowFlags_AlwaysAutoResize |
                    ImGuiWindowFlags_NoSavedSettings |
                    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-  ImGui::TextColored(native ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
-                            : ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
-                     "%s", native ? "NATIVE" : "EMULATED");
+  if (REXCVAR_GET(skate3_native_render_mode_indicator) || scene_off) {
+    ImGui::TextColored(native ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
+                              : ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
+                       "%s", native ? "NATIVE" : "EMULATED");
+  }
+  if (bench_left > 0) {
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "BENCHMARK  %u frames left",
+                       bench_left);
+    ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "skate normally");
+  } else if (bench.valid) {
+    ImGui::TextColored(ImVec4(0.35f, 1.0f, 0.45f, 1.0f), "BENCHMARK  %u frames",
+                       bench.frames);
+    ImGui::Text("avg %.1f fps  (%.2f ms)", bench.avg_ms > 0.0 ? 1000.0 / bench.avg_ms : 0.0,
+                bench.avg_ms);
+    ImGui::Text("p50 %.2f  p95 %.2f  p99 %.2f ms", bench.p50_ms, bench.p95_ms, bench.p99_ms);
+    ImGui::Text("worst %.2f ms", bench.max_ms);
+    // The character count is what separates a real run from one taken in a
+    // menu: the first run measured on device reported 750 fps with chars 0.
+    if (bench.chars_avg == 0) {
+      ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+                         "no characters in view - not a gameplay run");
+    } else {
+      ImGui::Text("characters %u", bench.chars_avg);
+    }
+    if (bench.battery_c > 0.0) {
+      ImGui::Text("battery %.1f C", bench.battery_c);
+    }
+  }
   ImGui::End();
 }
 

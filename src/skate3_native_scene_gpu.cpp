@@ -8086,6 +8086,9 @@ void RenderOutlineComposite(const NativeGuestOutputRenderContext& context,
 // RenderScene). Window length in frames = the perf-interval cvar.
 std::mutex g_bench_result_mutex;
 skate3::native_scene::BenchmarkResult g_bench_result;
+// Frames left in the run, for the on-screen readout. Plain atomic: written by
+// the render thread once a frame, read by the UI thread.
+std::atomic<uint32_t> g_bench_remaining{0};
 
 // Battery temperature, so a run that is really thermal throttling can be told
 // from a run that is slow. -1 when unavailable.
@@ -8154,6 +8157,7 @@ void BenchmarkTick(const FrameScene& scene) {
     chars_max = 0;
     last = std::chrono::steady_clock::now();
     REXLOG_WARN("benchmark: armed ({} frames after {} warmup frames)", want, warmup_left);
+    g_bench_remaining.store(uint32_t(want) + warmup_left, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_bench_result_mutex);
     g_bench_result = {};
     return;
@@ -8162,6 +8166,7 @@ void BenchmarkTick(const FrameScene& scene) {
     // Cleared from outside mid-run: drop the partial result rather than
     // reporting a run that measured something else.
     active = false;
+    g_bench_remaining.store(0, std::memory_order_relaxed);
     return;
   }
   const auto now = std::chrono::steady_clock::now();
@@ -8183,6 +8188,8 @@ void BenchmarkTick(const FrameScene& scene) {
     chars_sum += chars;
     chars_max = std::max(chars_max, chars);
   }
+  g_bench_remaining.store(uint32_t(size_t(want) - samples.size()) + warmup_left,
+                          std::memory_order_relaxed);
   if (samples.size() < size_t(want)) {
     return;
   }
@@ -8218,6 +8225,7 @@ void BenchmarkTick(const FrameScene& scene) {
     g_bench_result = r;
   }
   active = false;
+  g_bench_remaining.store(0, std::memory_order_relaxed);
   REXCVAR_SET(skate3_benchmark_frames, 0);
 }
 
@@ -13077,4 +13085,8 @@ skate3::native_scene::BenchmarkResult skate3::native_scene::LastBenchmarkResult(
 void skate3::native_scene::ClearBenchmarkResult() {
   std::lock_guard<std::mutex> lock(g_bench_result_mutex);
   g_bench_result = {};
+}
+
+uint32_t skate3::native_scene::BenchmarkFramesRemaining() {
+  return g_bench_remaining.load(std::memory_order_relaxed);
 }
