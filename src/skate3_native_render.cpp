@@ -708,6 +708,43 @@ void Install() {
 // Deferred (multi-pass) meshes draw nothing inside the call, detected via
 // the draw sequence counter so their transforms are left for the post-draw
 // fixup instead of being read from a stale constant bank.
+// LivingWorld census spawners: (this, spawn request) -> entity, or 0 for
+// "nothing spawned".
+//
+// Returning 0 is the game's OWN result when a census declines to spawn - it is
+// what Free Skate at population level 0 produces - so every caller already
+// handles it. That is why this is a spawn hook and not a draw filter: an
+// entity that never exists costs no collision, no voice, no engine noise, no
+// hair and no LivingWorld update slot, and on a phone that CPU cost is the
+// larger half of what a crowd is worth. Entities that already exist are left
+// alone and walk off by themselves.
+//
+// The values are latched at boot (see AmbientNpcsAtBoot), so a world cannot be
+// half-populated by a mid-session toggle.
+extern "C" REX_FUNC(sub_82E22F30) {  // LWPedestrianCensusMan
+  if (!skate3::native_scene::AmbientNpcsAtBoot()) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_82E22F30(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82C36300) {  // vehicle census
+  if (!skate3::native_scene::AmbientNpcsAtBoot()) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_82C36300(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82C4D440) {  // movable street props
+  if (!skate3::native_scene::MovablePropsAtBoot()) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_82C4D440(ctx, base);
+}
+
 extern "C" REX_FUNC(sub_82795AD8) {
   const bool enabled = skate3::native_render::Enabled();
   const uint32_t mesh_context = ctx.r3.u32;

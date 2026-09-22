@@ -959,6 +959,36 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_transparents, true, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
                     "Publish world sort-list items (static geometry)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Ambient crowds and movable street props, stopped at the SPAWN rather than
+// hidden at draw time.
+//
+// Hiding the meshes leaves every one of them being simulated: collision,
+// voices, engine noise, hair, and a slot in the LivingWorld update. On a phone
+// the frame is CPU-bound long before it is fill-bound, so the draw saving is
+// the smaller half of what these are worth. The hooks take the game's own
+// "spawned nothing" exit from the census managers, which is the same path Free
+// Skate level 0 uses - so it is a state the title already handles everywhere,
+// not a new one invented here.
+//
+// kRequiresRestart, and read ONCE through the AtBoot accessors below: the
+// spawners run as the world loads, and letting the value change underneath a
+// world that was already populated would leave the picture and the physics
+// disagreeing about what exists. Existing entities are not despawned - they
+// walk off on their own.
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_ambient_npcs, true, "Skate 3",
+    "Spawn ambient pedestrians and traffic. Off stops the LivingWorld census "
+    "spawning them at all, so they cost no collision, no voice and no update - "
+    "not just hidden meshes. The player and other skaters are unaffected. "
+    "Applies on restart.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_movable_props, true, "Skate 3",
+    "Spawn movable street props (benches, cones, bins and other pushable "
+    "clutter). Off stops them being created; gameplay geometry - rails, ledges "
+    "and surfaces - is unaffected. Applies on restart.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_entity_fade, true, "Skate 3",
                     "Honor the game's per-entity spawn/distance fade: LivingWorld "
                     "pres entities (NPCs, traffic vehicles) publish an opacity that "
@@ -11253,5 +11283,21 @@ extern "C" REX_FUNC(sub_82802A00) {
     ns::g_freecam_guest_rewrites.fetch_add(1, std::memory_order_relaxed);
   }
   __imp__sub_82802A00(ctx, base);
+}
+
+// Pedestrians & Traffic / Movable Props as they were at boot.
+//
+// Latched in a function-local static, so the spawn hooks all see one answer
+// for the life of the process even though the cvar itself is writable. The
+// hooks run on guest threads as the world streams in; reading the live cvar
+// would let a mid-session toggle populate half a world.
+bool skate3::native_scene::AmbientNpcsAtBoot() {
+  static const bool value = REXCVAR_GET(skate3_native_render_scene_ambient_npcs);
+  return value;
+}
+
+bool skate3::native_scene::MovablePropsAtBoot() {
+  static const bool value = REXCVAR_GET(skate3_native_render_scene_movable_props);
+  return value;
 }
 

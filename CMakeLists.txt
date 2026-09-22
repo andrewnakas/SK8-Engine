@@ -560,6 +560,7 @@ if(REXGLUE_RUNTIME_STATIC)
         target_link_options(skate3 PRIVATE
             "LINKER:-force_load,$<TARGET_FILE:rexruntime>")
     endif()
+
 endif()
 
 rexglue_configure_target(skate3)
@@ -572,6 +573,25 @@ rexglue_configure_target(skate3)
 option(SKATE3_ENABLE_GUEST_TRACE "Compile the guest call-trace hook into the recompiled code" OFF)
 if(SKATE3_ENABLE_GUEST_TRACE)
     target_compile_definitions(skate3 PRIVATE SKATE3_GUEST_TRACE=1)
+endif()
+
+# Let the title advance more than one refresh period of simulation in a frame.
+#
+# Skate 3 measures real elapsed time and then clamps it at ONE refresh period,
+# so its speed is period/frame_time: a 33 ms frame runs the game at half speed.
+# That is not a dropped-frames look, it is the simulation genuinely advancing
+# slower, and it is what "the frame rate is fine but it feels like slow motion"
+# on a phone actually is.
+#
+# This was inside if(SKATE3_SWITCH), so Android and iOS compiled the plain 100u
+# and the skate3_frame_advance_cap cvar did nothing on the platforms that need
+# it most - the phones are exactly where frames overrun the period. The guest
+# edit is scripts/patch_frame_advance_cap.py; the ceiling is the cvar, and it
+# stays a ceiling on purpose: uncapped, a 3-second load stall would advance
+# three seconds of physics in one step and put the skater through the world.
+option(SKATE3_GUEST_FRAME_ADVANCE_CAP "Let the guest advance past one refresh period per frame" ON)
+if(SKATE3_GUEST_FRAME_ADVANCE_CAP)
+    target_compile_definitions(skate3 PRIVATE REX_GUEST_FRAME_ADVANCE_CAP_HOOK=1)
 endif()
 
 if(SKATE3_SWITCH)
@@ -598,18 +618,6 @@ if(SKATE3_SWITCH)
     option(SKATE3_GUEST_LOOP_BARRIER "Compiler barrier at guest loop back edges" ON)
     if(SKATE3_GUEST_LOOP_BARRIER)
         target_compile_definitions(skate3 PRIVATE REX_GUEST_LOOP_BARRIER=1)
-    endif()
-
-    # Let the title advance more than one refresh period of simulation in a
-    # frame. It measures real elapsed time and then clamps it at one period,
-    # which is why the game runs at period/frame_time speed - half speed at
-    # 33 ms a frame. The generated tree is shared with the phone builds and
-    # compiles a plain 100u unless this is defined; the guest-side edit is
-    # scripts/patch_frame_advance_cap.py and the cap itself is the cvar
-    # skate3_frame_advance_cap. See src/skate3_frame_advance.cpp.
-    option(SKATE3_GUEST_FRAME_ADVANCE_CAP "Let the guest advance past one refresh period per frame" ON)
-    if(SKATE3_GUEST_FRAME_ADVANCE_CAP)
-        target_compile_definitions(skate3 PRIVATE REX_GUEST_FRAME_ADVANCE_CAP_HOOK=1)
     endif()
 
     # GCC in gnu++ mode defaults to -ffp-contract=fast and fuses a multiply and

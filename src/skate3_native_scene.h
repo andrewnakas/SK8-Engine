@@ -818,6 +818,11 @@ bool ToggleSceneEnabled();
 // renderer cvars are still enabled.
 bool SceneFailed();
 
+// Pedestrians & Traffic / Movable Props as they were at boot. The spawn hooks
+// must all agree for the whole session, so neither reads the live cvar.
+bool AmbientNpcsAtBoot();
+bool MovablePropsAtBoot();
+
 // Clears the sticky failure so the next frame retries the full pipeline
 // build (ToggleSceneEnabled calls this on re-enable: a transient allocation
 // failure can succeed on retry; a persistent one simply re-latches).
