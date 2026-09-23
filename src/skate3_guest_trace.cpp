@@ -796,7 +796,7 @@ void SamplerMain() {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         continue;
       }
-      REXLOG_INFO("skate3 profile: sampling '{}' every {}us", wanted, interval.count());
+      REXLOG_WARN("skate3 profile: sampling '{}' every {}us", wanted, interval.count());
     }
 
     uintptr_t pc = 0;
@@ -873,7 +873,7 @@ void SamplerMain() {
             line += fmt::format("sub_{:08X}={:.1f}%", ranked[i].second, percent);
           }
         }
-        REXLOG_INFO("skate3 profile: {} samples of '{}' | {}", counts.total, wanted, line);
+        REXLOG_WARN("skate3 profile: {} samples of '{}' | {}", counts.total, wanted, line);
         // How concentrated is the cost? A flat profile spread over thousands
         // of functions is the signature of instruction-cache and iTLB
         // thrashing, which is the pathology to expect from 290 MB of
@@ -900,7 +900,7 @@ void SamplerMain() {
             if (n80 == 0 && frac >= 0.80) n80 = i + 1;
             if (n95 == 0 && frac >= 0.95) n95 = i + 1;
           }
-          REXLOG_INFO("skate3 profile spread: {} distinct guest functions; "
+          REXLOG_WARN("skate3 profile spread: {} distinct guest functions; "
                       "50% of guest samples in {}, 80% in {}, 95% in {}",
                       hits.size(), n50, n80, n95);
           // Write the ranked hot set where the build can pick it up as a
@@ -922,7 +922,7 @@ void SamplerMain() {
                 out << fmt::format("__imp__sub_{:08X}\n", r.second);
                 out << fmt::format("sub_{:08X}\n", r.second);
               }
-              REXLOG_INFO("skate3 profile: wrote {} ordered symbols to {}",
+              REXLOG_WARN("skate3 profile: wrote {} ordered symbols to {}",
                           ranked.size() * 2, path);
             }
           }
@@ -946,7 +946,7 @@ void SamplerMain() {
             }
             hline += fmt::format("{}={:.1f}%", hranked[i].second, percent);
           }
-          REXLOG_INFO("skate3 profile host: {}", hline);
+          REXLOG_WARN("skate3 profile host: {}", hline);
           if (!syscalls.empty()) {
             // arm64 numbers: 98 futex, 101 nanosleep, 113 clock_gettime,
             // 115 clock_nanosleep, 73 ppoll, 63 read, 64 write.
@@ -964,7 +964,7 @@ void SamplerMain() {
               sline += fmt::format("nr={}:{:.1f}%", sr[i].second,
                                    100.0 * double(sr[i].first) / double(counts.total));
             }
-            REXLOG_INFO("skate3 profile syscalls: {}", sline);
+            REXLOG_WARN("skate3 profile syscalls: {}", sline);
             syscalls.clear();
           }
         }
