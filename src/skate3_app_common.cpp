@@ -1674,6 +1674,10 @@ void Skate3BaseApp::EnsureSimpleSettingsDialog() {
         pad.buttons = state.buttons;
         pad.thumb_lx = state.thumb_lx;
         pad.thumb_ly = state.thumb_ly;
+        pad.left_trigger = state.left_trigger;
+        pad.right_trigger = state.right_trigger;
+        pad.thumb_rx = state.thumb_rx;
+        pad.thumb_ry = state.thumb_ry;
       }
     }
     return pad;
