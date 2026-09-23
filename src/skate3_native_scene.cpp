@@ -976,22 +976,6 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
 // disagreeing about what exists. Existing entities are not despawned - they
 // walk off on their own.
 
-// Benchmark. A fixed number of frames measured after a warmup, so two settings
-// can be compared with a number instead of a feeling - which matters because an
-// average hides the stutters that decide whether a game plays well.
-REXCVAR_DEFINE_INT32(
-    skate3_benchmark_frames, 0, "Skate 3",
-    "Measure this many frames and report avg/p50/p95/p99/worst, then reset to "
-    "0. Set it to start a run; 3600 is about a minute at 60 fps.")
-    .range(0, 36000)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(
-    skate3_benchmark_warmup, 120, "Skate 3",
-    "Frames to discard before measuring, so shader compilation and texture "
-    "streaming provoked by arriving somewhere new are not counted as the "
-    "steady state.")
-    .range(0, 3600)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_hair_single_pass, false, "Skate 3",
     "Draw hair in one coverage pass instead of the game's two cull passes. "

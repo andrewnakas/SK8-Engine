@@ -104,8 +104,6 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_perf_interval);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_hair_single_pass);
-REXCVAR_DECLARE(int32_t, skate3_benchmark_frames);
-REXCVAR_DECLARE(int32_t, skate3_benchmark_warmup);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_grid_standalone);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_display_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_grab_native);
@@ -8084,151 +8082,6 @@ void RenderOutlineComposite(const NativeGuestOutputRenderContext& context,
 
 // Windowed perf + telemetry log lines (verbatim from the former tail of
 // RenderScene). Window length in frames = the perf-interval cvar.
-std::mutex g_bench_result_mutex;
-skate3::native_scene::BenchmarkResult g_bench_result;
-// Frames left in the run, for the on-screen readout. Plain atomic: written by
-// the render thread once a frame, read by the UI thread.
-std::atomic<uint32_t> g_bench_remaining{0};
-
-// Battery temperature, so a run that is really thermal throttling can be told
-// from a run that is slow. -1 when unavailable.
-double ReadBatteryTempC() {
-#if REX_PLATFORM_ANDROID
-  static int zone = -2;  // -2 = not scanned, -1 = none found
-  if (zone == -2) {
-    zone = -1;
-    for (int i = 0; i < 200; ++i) {
-      char path[64];
-      std::snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", i);
-      std::FILE* f = std::fopen(path, "r");
-      if (f == nullptr) {
-        continue;
-      }
-      char name[32] = {};
-      const bool got = std::fscanf(f, "%31s", name) == 1;
-      std::fclose(f);
-      if (got && (std::strcmp(name, "battery") == 0 || std::strcmp(name, "bms") == 0)) {
-        zone = i;
-        break;
-      }
-    }
-  }
-  if (zone < 0) {
-    return -1.0;
-  }
-  char path[64];
-  std::snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", zone);
-  std::FILE* f = std::fopen(path, "r");
-  if (f == nullptr) {
-    return -1.0;
-  }
-  long milli = 0;
-  const bool got = std::fscanf(f, "%ld", &milli) == 1;
-  std::fclose(f);
-  // Some zones report milli-degrees, some whole degrees.
-  return got ? (milli > 1000 ? double(milli) / 1000.0 : double(milli)) : -1.0;
-#else
-  // iOS gives no battery temperature to a sandboxed app. The thermal state is
-  // the nearest thing and is not a temperature, so it is not reported here
-  // rather than reported as a wrong number.
-  return -1.0;
-#endif
-}
-
-// One measured frame. Everything is static because a run is a single sequence
-// and there is only ever one in flight.
-void BenchmarkTick(const FrameScene& scene) {
-  static std::vector<double> samples;
-  static std::chrono::steady_clock::time_point last{};
-  static uint32_t warmup_left = 0;
-  static bool active = false;
-  static uint64_t chars_sum = 0;
-  static uint32_t chars_max = 0;
-  const int32_t want = std::clamp(REXCVAR_GET(skate3_benchmark_frames), 0, 36000);
-  if (!active) {
-    if (want <= 0) {
-      return;
-    }
-    active = true;
-    warmup_left = uint32_t(std::clamp(REXCVAR_GET(skate3_benchmark_warmup), 0, 3600));
-    samples.clear();
-    samples.reserve(size_t(want));
-    chars_sum = 0;
-    chars_max = 0;
-    last = std::chrono::steady_clock::now();
-    REXLOG_WARN("benchmark: armed ({} frames after {} warmup frames)", want, warmup_left);
-    g_bench_remaining.store(uint32_t(want) + warmup_left, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(g_bench_result_mutex);
-    g_bench_result = {};
-    return;
-  }
-  if (want <= 0) {
-    // Cleared from outside mid-run: drop the partial result rather than
-    // reporting a run that measured something else.
-    active = false;
-    g_bench_remaining.store(0, std::memory_order_relaxed);
-    return;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-  last = now;
-  if (warmup_left > 0) {
-    --warmup_left;
-    return;
-  }
-  // A gap over a second is the menu being opened or the app being backgrounded,
-  // not a frame. Counting it would put a 30-second outlier in the worst-frame
-  // column and make p99 meaningless.
-  if (ms > 0.0 && ms < 1000.0) {
-    samples.push_back(ms);
-    uint32_t chars = 0;
-    for (const DrawItem& item : scene.items) {
-      chars += item.char_family != 0 ? 1u : 0u;
-    }
-    chars_sum += chars;
-    chars_max = std::max(chars_max, chars);
-  }
-  g_bench_remaining.store(uint32_t(size_t(want) - samples.size()) + warmup_left,
-                          std::memory_order_relaxed);
-  if (samples.size() < size_t(want)) {
-    return;
-  }
-  std::vector<double> sorted = samples;
-  std::sort(sorted.begin(), sorted.end());
-  double sum = 0.0;
-  for (const double v : sorted) {
-    sum += v;
-  }
-  const size_t n = sorted.size();
-  const double avg = sum / double(n);
-  const auto pct = [&](double p) { return sorted[std::min(n - 1, size_t(p * double(n)))]; };
-  // WARN so it survives the shipped phone log level - a benchmark nobody can
-  // read afterwards is not a benchmark.
-  REXLOG_WARN(
-      "benchmark: {} frames | avg {:.2f} ms ({:.1f} fps) | p50 {:.2f} | p95 {:.2f} | "
-      "p99 {:.2f} | max {:.2f} | chars avg {} max {} | batt {:.1f} C",
-      n, avg, avg > 0.0 ? 1000.0 / avg : 0.0, pct(0.50), pct(0.95), pct(0.99), sorted[n - 1],
-      chars_sum / std::max<uint64_t>(n, 1), chars_max, ReadBatteryTempC());
-  {
-    skate3::native_scene::BenchmarkResult r;
-    r.valid = true;
-    r.frames = uint32_t(n);
-    r.avg_ms = avg;
-    r.p50_ms = pct(0.50);
-    r.p95_ms = pct(0.95);
-    r.p99_ms = pct(0.99);
-    r.max_ms = sorted[n - 1];
-    r.chars_avg = uint32_t(chars_sum / std::max<uint64_t>(n, 1));
-    r.chars_max = chars_max;
-    r.battery_c = ReadBatteryTempC();
-    std::lock_guard<std::mutex> lock(g_bench_result_mutex);
-    g_bench_result = r;
-  }
-  active = false;
-  g_bench_remaining.store(0, std::memory_order_relaxed);
-  REXCVAR_SET(skate3_benchmark_frames, 0);
-}
-
 void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
                    uint32_t drawn_2d, uint32_t drawn_spline, bool shadow_ready,
                    uint32_t shadow_draws) {
@@ -13032,7 +12885,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                     .count()));
   g_pw_render.Add(perf_ns_since(render_t0));
   const uint64_t frames = g_frames_rendered.fetch_add(1) + 1;
-  BenchmarkTick(scene);
   MaybeDumpSceneRing();
   LogFrameStats(scene, frames, drawn, drawn_2d, drawn_spline, shadow_ready,
                 shadow_draws);
@@ -13076,17 +12928,3 @@ void ResetSceneFailure() {}
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12 || REX_HAS_VULKAN
-
-skate3::native_scene::BenchmarkResult skate3::native_scene::LastBenchmarkResult() {
-  std::lock_guard<std::mutex> lock(g_bench_result_mutex);
-  return g_bench_result;
-}
-
-void skate3::native_scene::ClearBenchmarkResult() {
-  std::lock_guard<std::mutex> lock(g_bench_result_mutex);
-  g_bench_result = {};
-}
-
-uint32_t skate3::native_scene::BenchmarkFramesRemaining() {
-  return g_bench_remaining.load(std::memory_order_relaxed);
-}
