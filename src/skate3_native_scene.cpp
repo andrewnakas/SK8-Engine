@@ -975,6 +975,7 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
 // world that was already populated would leave the picture and the physics
 // disagreeing about what exists. Existing entities are not despawned - they
 // walk off on their own.
+
 // Benchmark. A fixed number of frames measured after a warmup, so two settings
 // can be compared with a number instead of a feeling - which matters because an
 // average hides the stutters that decide whether a game plays well.
@@ -991,7 +992,6 @@ REXCVAR_DEFINE_INT32(
     "steady state.")
     .range(0, 3600)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_hair_single_pass, false, "Skate 3",
     "Draw hair in one coverage pass instead of the game's two cull passes. "
@@ -1492,6 +1492,37 @@ REXCVAR_DEFINE_BOOL(
     "Time the guest's wait loop (sub_82B755C0) and report how many milliseconds "
     "per second the render thread spends in it. A profiler share is not a "
     "duration; this is.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// MEASURED on a Galaxy S23 FE with vulkan_log_pass_opens: a gameplay frame
+// opens five render passes, and the last two are the SAME texture back to back
+//   #4 1280x720 color=64 LOAD store=STORE target=0xb40000777171c650  (tonemap)
+//   #5 1280x720 color=64 LOAD store=STORE target=0xb40000777171c650  (HUD/2D)
+// separated only by the trailing FlushBarriers() at the end of ApplyHdrPost.
+// That flush exists to return hdr_resolved/ao/vol/bloom to kRenderTarget for
+// the NEXT frame - none of them is the HUD's target - but FlushBarriers also
+// ends the open render pass, so the tonemap's tile is stored to memory and the
+// HUD immediately loads it back. On a tiler that is 1280x720x4 stored plus the
+// same loaded, 7.37 MB per frame, 442 MB/s at 60.
+//
+// Skipping it lets the same-target early-out in SetRenderTargets hold the pass
+// open. The barriers stay QUEUED - not lost - and are submitted by the next
+// flush or by EndFrame's SubmitBarriers(true), both of which precede any
+// re-use of those textures.
+//
+// Removing a STORE is why this is worth more than the various load-discard
+// ideas: a load may already be free if the driver keeps the tile resident, but
+// a store is paid either way.
+//
+// Default OFF deliberately: it is hot-reloadable, so it can be A/B'd inside a
+// single thermal state from live_cvars.txt, which is better evidence than two
+// runs at different temperatures - and it is the honest way to ship a change
+// whose failure mode is a visibly wrong HUD.
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_merge_hud_pass, false, "Skate 3",
+    "Keep the tonemap's render pass open into the HUD pass instead of storing and "
+    "reloading the whole target between them. Saves a full-resolution store plus "
+    "load per frame on a tile-based GPU.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(

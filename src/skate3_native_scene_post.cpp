@@ -60,6 +60,7 @@ REXCVAR_DECLARE(double, skate3_menu_blur_sigma);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_merge_hud_pass);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_intensity);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_knee);
 REXCVAR_DECLARE(double, skate3_native_render_scene_bloom_threshold);
@@ -1942,7 +1943,12 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
                    nrhi::ResourceState::kRenderTarget);
     }
   }
-  cmd->FlushBarriers();
+  // Flushing here ends the render pass, and the very next thing to render is
+  // the HUD into the SAME target (measured: passes #4 and #5 of 5 share a
+  // target pointer). See skate3_native_render_scene_merge_hud_pass.
+  if (!REXCVAR_GET(skate3_native_render_scene_merge_hud_pass)) {
+    cmd->FlushBarriers();
+  }
 }
 
 
