@@ -1036,6 +1036,25 @@ REXCVAR_DEFINE_BOOL(
     "and surfaces - is unaffected. Applies on restart.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_other_skaters, true, "Skate 3",
+    "Spawn the other skaters who roam the world with you. Off makes the "
+    "ambient skater service decline every request, the way the pedestrian "
+    "and traffic censuses next to it do, so they cost no animation, no "
+    "cloth sim, no physics, no collision and no update - not just hidden "
+    "bodies. Measured at four skaters a world. The player is created on a "
+    "different path and is unaffected, and so is any skater a challenge "
+    "spawns for a race or a versus. Applies on restart.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_other_skaters_trace, false, "Skate 3",
+    "Log every request the ambient skater factory takes: the manager, the "
+    "slot, the roster size behind it and whether the cut declined it. This "
+    "is what showed the service is one manager asked hundreds of times, not "
+    "a single pass over a table of skaters.")
+    .debug_only()
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_entity_fade, true, "Skate 3",
                     "Honor the game's per-entity spawn/distance fade: LivingWorld "
                     "pres entities (NPCs, traffic vehicles) publish an opacity that "
@@ -11425,5 +11444,14 @@ bool skate3::native_scene::AmbientNpcsAtBoot() {
 bool skate3::native_scene::MovablePropsAtBoot() {
   static const bool value = REXCVAR_GET(skate3_native_render_scene_movable_props);
   return value;
+}
+
+bool skate3::native_scene::OtherSkatersAtBoot() {
+  static const bool value = REXCVAR_GET(skate3_native_render_scene_other_skaters);
+  return value;
+}
+
+bool skate3::native_scene::OtherSkatersTrace() {
+  return REXCVAR_GET(skate3_native_render_scene_other_skaters_trace);
 }
 

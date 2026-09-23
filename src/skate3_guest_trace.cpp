@@ -90,6 +90,7 @@
 #include <vector>
 
 #if defined(__APPLE__)
+#include <execinfo.h>
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach/thread_status.h>
@@ -366,7 +367,7 @@ uint32_t GuestFunctionForHostPc(const void* pc, uint32_t* offset) {
 }
 
 void LogHostBacktrace(const char* tag) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
   void* frames[24];
   const int n = ::backtrace(frames, 24);
   for (int i = 0; i < n; ++i) {

@@ -14,11 +14,23 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include "native/skate3_native_guest_read.h"
+#include "skate3_guest_trace.h"
+
+// Spawn trace only: the host call stack at the bind, symbolized back to guest
+// function names. bionic has no <execinfo.h>, so Android goes through the
+// runtime's unwinder shim the same way skate3_guest_trace.cpp does.
+#if defined(__ANDROID__)
+#include <rex/execinfo_android.h>
+#elif defined(__linux__) || defined(__APPLE__)
+#include <execinfo.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_entity_ident, true, "Skate 3",
@@ -32,6 +44,24 @@ REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_entity_ident_log, false, "Skate 3",
     "Log identity-store diagnostics: the periodic ident[] stats line and "
     "rate-limited serve-path lines.")
+    .debug_only()
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_entity_spawn_trace, false, "Skate 3",
+    "Log the guest call stack that CREATED each skater-family entity, once "
+    "per entity, capped. Binds are one-shot per entity and happen near "
+    "construction, so this stack is the spawn path - the instrument for "
+    "naming the ambient-skater spawner, which has no symbol anywhere. "
+    "Needs skate3_native_render_scene_entity_ident.")
+    .debug_only()
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_entity_spawn_trace_limit, 3, "Skate 3",
+    "Spawn trace: how many stacks to log per entity class. Per class, not "
+    "overall, so the known LivingWorld spawners stay visible as the control "
+    "group however many skaters are traced.")
+    .range(1, 64)
     .debug_only()
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
@@ -91,6 +121,11 @@ struct EntityRec {
   uint32_t vtable = 0;
   int32_t view_refs = 0;
   uint64_t bind_count = 0;
+  // Spawn trace only: the guest function that created this entity, i.e. the
+  // first frame above the shared entity-construction tail. This is what
+  // separates "the roster loop made it" from "something else did", which is
+  // the whole question when deciding what a despawn hook may safely cut.
+  uint32_t origin = 0;
 };
 
 struct CtxEntry {
@@ -207,6 +242,84 @@ int CompareRows(const float rows[12], const float mem[12]) {
   return exact ? 0 : (near_ok ? 1 : 2);
 }
 
+// ---- spawn trace (diagnostic) ---------------------------------------------
+//
+// Binds are one-shot per entity and run near construction (see the header),
+// so the host call stack at the bind IS the spawn path. Every frame of it
+// that lies inside a recompiled guest body symbolizes back to sub_XXXXXXXX,
+// which is what makes this the practical way to name a spawner that has no
+// symbol in any file in the tree.
+//
+// A few per class, not a few overall: the LivingWorld stacks are the control
+// group. Their spawner is already known (sub_82E22F30 / sub_82C36300), so
+// seeing those addresses appear in an lw stack is the proof the instrument
+// reads what it claims to, before any weight is put on a skater stack.
+// Called with g_mu held: the counters and the seen-set are covered by it.
+bool WantSpawnTrace(uint32_t entity, EntClass cls) {
+  if (!REXCVAR_GET(skate3_native_render_scene_entity_spawn_trace) ||
+      cls == EntClass::kUnknown) {
+    return false;
+  }
+  static size_t s_per_class[6] = {};
+  static std::unordered_set<uint32_t> s_traced;
+  const size_t slot = std::min<size_t>(size_t(cls), 5);
+  const size_t cap = size_t(
+      REXCVAR_GET(skate3_native_render_scene_entity_spawn_trace_limit));
+  if (s_per_class[slot] >= cap) {
+    return false;
+  }
+  if (!s_traced.insert(entity).second) {
+    return false;  // this entity already contributed its stack
+  }
+  ++s_per_class[slot];
+  return true;
+}
+
+// The frames shared by every presentation entity's construction tail: our own
+// hook (misattributed to whatever host function precedes it) and the guest
+// init that calls BindConstants. The creator is the first frame above them.
+bool SharedTailFrame(uint32_t guest) {
+  return guest == 0x82780D30 || guest == 0x8290B750;
+}
+
+uint32_t CaptureOrigin() {
+#if defined(__ANDROID__) || defined(__linux__) || defined(__APPLE__)
+  void* frames[16];
+  const int n = ::backtrace(frames, 16);
+  for (int i = 0; i < n; ++i) {
+    const uint32_t guest =
+        skate3::guest_trace::GuestFunctionForHostPc(frames[i], nullptr);
+    if (guest != 0 && !SharedTailFrame(guest)) {
+      return guest;
+    }
+  }
+#endif
+  return 0;
+}
+
+void LogSpawnStack(uint32_t entity, uint32_t vtable, EntClass cls) {
+#if defined(__ANDROID__) || defined(__linux__) || defined(__APPLE__)
+  void* frames[32];
+  const int n = ::backtrace(frames, 32);
+  REXLOG_INFO("native-entity: SPAWN cls={} entity={:08X} vtbl={:08X} frames={}",
+              ClassName(cls), entity, vtable, n);
+  for (int i = 0; i < n; ++i) {
+    uint32_t off = 0;
+    const uint32_t guest =
+        skate3::guest_trace::GuestFunctionForHostPc(frames[i], &off);
+    if (guest != 0) {
+      REXLOG_INFO("native-entity: SPAWN   #{} sub_{:08X}+0x{:X}", i, guest, off);
+    }
+    // Host frames (runtime, renderer, this file) are deliberately dropped:
+    // the guest chain is the whole point and the host half is noise.
+  }
+#else
+  (void)entity;
+  (void)vtable;
+  (void)cls;
+#endif
+}
+
 }  // namespace
 
 void OnBindConstants(uint8_t* base, uint32_t entity) {
@@ -274,21 +387,39 @@ void OnBindClass(uint32_t entity, EntClass cls) {
   if (!REXCVAR_GET(skate3_native_render_scene_entity_ident) || entity == 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(g_mu);
-  const auto it = g_entities.find(entity);
-  if (it == g_entities.end()) {
-    return;  // base walk failed its guards; keep the entity out entirely
+  uint32_t vtable = 0;
+  bool trace_this = false;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    const auto it = g_entities.find(entity);
+    if (it == g_entities.end()) {
+      return;  // base walk failed its guards; keep the entity out entirely
+    }
+    // Most-derived override returns last, so plain assignment converges.
+    it->second.cls = cls;
+    vtable = it->second.vtable;
+    // One capped line per distinct (vtable, class) pair: the live class
+    // table, for promoting vtable-based classification later.
+    static std::unordered_map<uint64_t, bool> s_seen;
+    const uint64_t key = (uint64_t(vtable) << 8) | uint8_t(cls);
+    if (REXCVAR_GET(skate3_native_render_scene_entity_ident_log) &&
+        s_seen.size() < 64 && s_seen.emplace(key, true).second) {
+      REXLOG_INFO("native-entity: class {} vtbl={:08X} entity={:08X}",
+                  ClassName(cls), vtable, entity);
+    }
+    trace_this = WantSpawnTrace(entity, cls);
+    const bool skater_family =
+        cls == EntClass::kSkater || cls == EntClass::kColorized ||
+        cls == EntClass::kCac || cls == EntClass::kSkaterAux;
+    if (skater_family && it->second.origin == 0 &&
+        REXCVAR_GET(skate3_native_render_scene_entity_spawn_trace)) {
+      it->second.origin = CaptureOrigin();
+    }
   }
-  // Most-derived override returns last, so plain assignment converges.
-  it->second.cls = cls;
-  // One capped line per distinct (vtable, class) pair: the live class
-  // table, for promoting vtable-based classification later.
-  static std::unordered_map<uint64_t, bool> s_seen;
-  const uint64_t key = (uint64_t(it->second.vtable) << 8) | uint8_t(cls);
-  if (REXCVAR_GET(skate3_native_render_scene_entity_ident_log) &&
-      s_seen.size() < 64 && s_seen.emplace(key, true).second) {
-    REXLOG_INFO("native-entity: class {} vtbl={:08X} entity={:08X}",
-                ClassName(cls), it->second.vtable, entity);
+  // Outside the lock: symbolization touches its own tables and this is a
+  // logging path, so it has no business holding the store's mutex.
+  if (trace_this) {
+    LogSpawnStack(entity, vtable, cls);
   }
 }
 
@@ -665,22 +796,53 @@ void EmitStats() {
     return;
   }
   size_t ents = 0, ctxs = 0, live = 0;
+  // Live ENTITIES per class, which is what a population question actually
+  // asks. The cls(...) counters below it are per-draw-item hits: a single
+  // skater contributes one per body piece, so they answer a different
+  // question and must not be read as a head count.
+  size_t live_cls[6] = {};
+  // Skater roll-call: who is alive right now and what made them.
+  struct SkaterLine {
+    uint32_t entity;
+    uint32_t origin;
+    EntClass cls;
+    bool live;
+  };
+  std::vector<SkaterLine> skaters;
   {
     std::lock_guard<std::mutex> lock(g_mu);
     ents = g_entities.size();
     ctxs = g_ctx.size();
     for (const auto& [addr, rec] : g_entities) {
-      live += rec.view_refs > 0 ? 1 : 0;
+      if (rec.view_refs > 0) {
+        ++live;
+        ++live_cls[std::min<size_t>(size_t(rec.cls), 5)];
+      }
+      const bool skater_family =
+          rec.cls == EntClass::kSkater || rec.cls == EntClass::kColorized ||
+          rec.cls == EntClass::kCac || rec.cls == EntClass::kSkaterAux;
+      if (skater_family && skaters.size() < 32) {
+        skaters.push_back({addr, rec.origin, rec.cls, rec.view_refs > 0});
+      }
+    }
+  }
+  if (REXCVAR_GET(skate3_native_render_scene_entity_spawn_trace)) {
+    for (const SkaterLine& sk : skaters) {
+      REXLOG_INFO("native-entity: skater ent={:08X} cls={} live={} origin=sub_{:08X}",
+                  sk.entity, ClassName(sk.cls), sk.live ? 1 : 0, sk.origin);
     }
   }
   REXLOG_INFO(
       "native-entity: ident[ents={}/{} ctx={} bind={} add={} rmv={} "
+      "livecls(b/lw/sk/co/cac/aux)={}/{}/{}/{}/{}/{} "
       "hit={} miss={} lw_ovl={} cls(b/lw/sk/co/cac/aux)={}/{}/{}/{}/{}/{} "
       "fade ok/div/bad={}/{}/{} w416 e/n/d={}/{}/{} w352 e/n/d={}/{}/{} "
       "ropa unmap={} rfail={} wserve={}/{}/{} wprim={}/{}]",
       live, ents, ctxs, g_bind_calls.exchange(0, std::memory_order_relaxed),
       g_add_events.exchange(0, std::memory_order_relaxed),
       g_rmv_events.exchange(0, std::memory_order_relaxed),
+      live_cls[0], live_cls[1], live_cls[2], live_cls[3], live_cls[4],
+      live_cls[5],
       g_item_hit.exchange(0, std::memory_order_relaxed),
       g_item_miss.exchange(0, std::memory_order_relaxed),
       g_item_lw_overlap.exchange(0, std::memory_order_relaxed),

@@ -745,6 +745,65 @@ extern "C" REX_FUNC(sub_82C4D440) {  // movable street props
   __imp__sub_82C4D440(ctx, base);
 }
 
+// The other-skater roster factory: (manager, request, &slot, slot index, ...)
+// -> BOOL "a skater now occupies this slot".
+//
+// Found by backtracing the construction of every skater-family presentation
+// entity (skate3_native_render_scene_entity_spawn_trace). The world builds
+// six skaters: the player arrives alone down a loader path, and the other
+// five come from one roster pass in sub_8278B790, four of them through this
+// factory in a counted loop.
+//
+// The false return is the game's OWN branch, not an invention: the call site
+// is `bl 0x8278b600; clrlwi r9,r3,24; beq -> loc_8278C010`, and loc_8278C010
+// is the loop increment. A slot that declines simply is not filled and the
+// pass moves to the next one - nothing dereferences a result, which is what
+// makes this safe in a way a constructor hook would not be.
+//
+// Scope: this address has exactly ONE call site in the whole image, inside
+// that roster pass. A skater a challenge spawns for a race or a versus does
+// not come through here, so it is untouched and career stays completable -
+// which is the whole reason to cut at the roster rather than at the draw.
+//
+// The ambient-skater factory: (manager, request, &slot, slot index, ...)
+// -> BOOL "a skater now occupies this slot".
+//
+// Found by backtracing the construction of every skater-family presentation
+// entity (skate3_native_render_scene_entity_spawn_trace), which is reliable
+// because binds are one-shot and happen at construction.
+//
+// MEASURED, and not what the shape first suggested: there is ONE manager
+// with a one-entry roster, asked hundreds of times a session, and the four
+// roaming skaters a world carries are handed out by it one at a time. It is
+// an ambient population service, the skater counterpart of the pedestrian
+// and traffic censuses next to it - not a one-shot pass over a roster table.
+//
+// The false return is the game's OWN branch, not an invention: the call site
+// is `bl 0x8278b600; clrlwi r9,r3,24; beq -> loc_8278C010`, and loc_8278C010
+// is the loop increment. A slot that declines is simply not filled; nothing
+// dereferences a result, which is what makes this safe where a constructor
+// hook would not be. The function's own return is built with a subfe 0/1
+// idiom, so it really does decline on its own.
+//
+// Scope: this address has exactly ONE call site in the whole image. A skater
+// a challenge spawns for a race or a versus does not come through here, so
+// career stays completable - which is why the cut is made at the spawn and
+// not at the draw.
+extern "C" REX_FUNC(sub_8278B600) {
+  const bool cut = !skate3::native_scene::OtherSkatersAtBoot();
+  if (skate3::native_scene::OtherSkatersTrace()) {
+    uint32_t count = 0;
+    std::memcpy(&count, base + ctx.r3.u32 + 1264, 4);
+    REXLOG_INFO("skate3 roster: mgr={:08X} slot {} of {} -> {}", ctx.r3.u32,
+                ctx.r6.u32, __builtin_bswap32(count), cut ? "cut" : "create");
+  }
+  if (cut) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_8278B600(ctx, base);
+}
+
 extern "C" REX_FUNC(sub_82795AD8) {
   const bool enabled = skate3::native_render::Enabled();
   const uint32_t mesh_context = ctx.r3.u32;
