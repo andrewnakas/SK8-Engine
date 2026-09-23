@@ -4,6 +4,7 @@
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
 #include "native/skate3_native_guest_read.h"
+#include "skate3_guest_trace.h"
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_palette.h"
 #include "skate3_crash_report.h"
@@ -765,37 +766,83 @@ extern "C" REX_FUNC(sub_82C4D440) {  // movable street props
 // not come through here, so it is untouched and career stays completable -
 // which is the whole reason to cut at the roster rather than at the draw.
 //
-// The ambient-skater factory: (manager, request, &slot, slot index, ...)
-// -> BOOL "a skater now occupies this slot".
+// The skater factory: (manager, request, &slot, loop index, ...) -> BOOL
+// "a skater now occupies this slot".
 //
 // Found by backtracing the construction of every skater-family presentation
 // entity (skate3_native_render_scene_entity_spawn_trace), which is reliable
-// because binds are one-shot and happen at construction.
+// because binds are one-shot and happen at construction. Every skater in the
+// world is built here - and MEASURED THE HARD WAY, that includes the PLAYER.
+// Declining every call does raise the frame rate a long way, and it also
+// takes your own skater with it.
 //
-// MEASURED, and not what the shape first suggested: there is ONE manager
-// with a one-entry roster, asked hundreds of times a session, and the four
-// roaming skaters a world carries are handed out by it one at a time. It is
-// an ambient population service, the skater counterpart of the pedestrian
-// and traffic censuses next to it - not a one-shot pass over a roster table.
+// So the cut needs a discriminator, and the call site hands one over. The
+// caller picks the slot to fill as
+//
+//     slot = manager + (((request+188 >> 4) & 0xF) + 460) * 4
+//
+// i.e. the REQUEST carries a 0-15 slot id, one per skater. That is the real
+// identity; the loop counter in r6 is not, because the loop runs to
+// [manager+1264], which is 1. There is one manager, asked hundreds of times
+// a session, once per skater request.
+//
+// Which slot is the player is a fact only a device can confirm, so the keep
+// set is a BITMASK cvar rather than a constant: trying a different slot costs
+// a relaunch instead of a rebuild, and on Apple a rebuild here is all 111
+// generated TUs.
 //
 // The false return is the game's OWN branch, not an invention: the call site
 // is `bl 0x8278b600; clrlwi r9,r3,24; beq -> loc_8278C010`, and loc_8278C010
 // is the loop increment. A slot that declines is simply not filled; nothing
-// dereferences a result, which is what makes this safe where a constructor
-// hook would not be. The function's own return is built with a subfe 0/1
-// idiom, so it really does decline on its own.
+// dereferences a result. The function's own return is a subfe 0/1 idiom, so
+// it declines on its own too.
 //
-// Scope: this address has exactly ONE call site in the whole image. A skater
-// a challenge spawns for a race or a versus does not come through here, so
-// career stays completable - which is why the cut is made at the spawn and
-// not at the draw.
+// Scope: this address has exactly ONE call site in the whole image, so a
+// skater a challenge spawns for a race or a versus is out of reach of it.
+// rwaudio::PacketPlayer::OnEventPlay - a voice starting. Named from the
+// audio symbol CSV under ~/Documents/sk8AudioDecompile, the only guest-name
+// map that exists for this title, and it only covers the audio engine.
+//
+// Diagnostic only, and WARN level on purpose: the engine ships with
+// --log_level=warn, so an INFO diagnostic is invisible unless the whole log
+// is turned up - and turning it up costs enough frame time to look like a
+// regression in the thing being measured. That mistake has already been made
+// once here.
+//
+// The question it answers: pedestrians and skaters whose presentation entity
+// was never created can still be HEARD, panning as you skate past, so the
+// gameplay objects behind them are alive. The stack above a voice start names
+// whatever is driving them.
+extern "C" REX_FUNC(sub_82B28B78) {
+  if (skate3::native_scene::VoiceTrace()) {
+    static std::atomic<uint32_t> seen{0};
+    const uint32_t n = seen.fetch_add(1, std::memory_order_relaxed);
+    if (n < 24) {
+      REXLOG_WARN("skate3 voice: #{} player={:08X}", n, ctx.r3.u32);
+      skate3::guest_trace::LogHostBacktraceWarn("voice");
+    }
+  }
+  __imp__sub_82B28B78(ctx, base);
+}
+
 extern "C" REX_FUNC(sub_8278B600) {
-  const bool cut = !skate3::native_scene::OtherSkatersAtBoot();
+  uint32_t slot = 0xFFFFFFFFu;
+  uint32_t field = 0;
+  if (skate3::native_scene::GuestTryCopy(&field,
+                                              base + ctx.r4.u32 + 188, 4)) {
+    slot = (__builtin_bswap32(field) >> 4) & 0xF;
+  }
+  // An unreadable request is left alone. Refusing on a read that failed would
+  // cut a skater on the strength of a number we do not have.
+  const uint32_t keep_mask =
+      uint32_t(skate3::native_scene::OtherSkatersKeepSlots());
+  const bool cut = !skate3::native_scene::OtherSkatersAtBoot() &&
+                   slot != 0xFFFFFFFFu && slot < 32 &&
+                   (keep_mask & (1u << slot)) == 0;
   if (skate3::native_scene::OtherSkatersTrace()) {
-    uint32_t count = 0;
-    std::memcpy(&count, base + ctx.r3.u32 + 1264, 4);
-    REXLOG_INFO("skate3 roster: mgr={:08X} slot {} of {} -> {}", ctx.r3.u32,
-                ctx.r6.u32, __builtin_bswap32(count), cut ? "cut" : "create");
+    REXLOG_INFO("skate3 skater: mgr={:08X} req={:08X} slot={} -> {}",
+                ctx.r3.u32, ctx.r4.u32, int32_t(slot),
+                cut ? "cut" : "create");
   }
   if (cut) {
     ctx.r3.u64 = 0;

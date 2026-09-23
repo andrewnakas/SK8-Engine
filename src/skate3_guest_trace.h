@@ -36,6 +36,8 @@ uint32_t GuestFunctionForHostPc(const void* pc, uint32_t* offset = nullptr);
 
 // Log the calling thread's host backtrace with guest names attached.
 void LogHostBacktrace(const char* tag);
+// The same, at WARN, so it survives a shipping --log_level=warn.
+void LogHostBacktraceWarn(const char* tag);
 
 // ---- sampling profiler -----------------------------------------------------
 // Starts the guest sampler if --skate3_guest_profile=true, otherwise returns

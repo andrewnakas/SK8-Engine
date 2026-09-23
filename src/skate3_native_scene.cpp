@@ -1042,10 +1042,31 @@ REXCVAR_DEFINE_BOOL(
     "ambient skater service decline every request, the way the pedestrian "
     "and traffic censuses next to it do, so they cost no animation, no "
     "cloth sim, no physics, no collision and no update - not just hidden "
-    "bodies. Measured at four skaters a world. The player is created on a "
-    "different path and is unaffected, and so is any skater a challenge "
-    "spawns for a race or a versus. Applies on restart.")
+    "bodies. Measured at four skaters a world. The player is built by the "
+    "same factory, so the lowest slot ids are kept - see "
+    "skate3_native_render_scene_other_skaters_keep. A skater a challenge "
+    "spawns for a race or a versus comes from elsewhere and is unaffected. "
+    "Applies on restart.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_other_skaters_keep, 1, "Skate 3",
+    "With Other Skaters off, a BITMASK of slot ids to build anyway: bit 0 "
+    "keeps slot 0, bit 1 keeps slot 1, and so on. The player is built by the "
+    "same factory as the roamers - cutting every slot takes your own skater "
+    "with them - and the request carries a 0-15 slot id, so this is what "
+    "keeps you in the world. A mask rather than a count because which slot "
+    "is the player is a fact only a device can confirm, and trying one costs "
+    "a relaunch instead of a rebuild. 1 = slot 0 only, 2 = slot 1 only, "
+    "4 = slot 2, 8 = slot 3, 15 = all four.")
+    .range(0, 65535)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(
+    skate3_audio_voice_trace, false, "Skate 3",
+    "Log the guest call stack behind the first two dozen voices that start, "
+    "at WARN so it is readable on a device without turning the whole log up. "
+    "For finding what still makes noise after its body was cut.")
+    .debug_only()
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_other_skaters_trace, false, "Skate 3",
     "Log every request the ambient skater factory takes: the manager, the "
@@ -11449,6 +11470,16 @@ bool skate3::native_scene::MovablePropsAtBoot() {
 bool skate3::native_scene::OtherSkatersAtBoot() {
   static const bool value = REXCVAR_GET(skate3_native_render_scene_other_skaters);
   return value;
+}
+
+int32_t skate3::native_scene::OtherSkatersKeepSlots() {
+  static const int32_t value =
+      REXCVAR_GET(skate3_native_render_scene_other_skaters_keep);
+  return value;
+}
+
+bool skate3::native_scene::VoiceTrace() {
+  return REXCVAR_GET(skate3_audio_voice_trace);
 }
 
 bool skate3::native_scene::OtherSkatersTrace() {

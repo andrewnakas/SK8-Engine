@@ -384,6 +384,26 @@ void LogHostBacktrace(const char* tag) {
 #endif
 }
 
+// Same walk as LogHostBacktrace, at WARN. The shipping builds run
+// --log_level=warn, so an INFO backtrace is invisible on a device unless the
+// whole log is turned up - and turning it up costs enough frame time to be
+// mistaken for the regression you are hunting.
+void LogHostBacktraceWarn(const char* tag) {
+#if defined(__linux__) || defined(__APPLE__)
+  void* frames[32];
+  const int n = ::backtrace(frames, 32);
+  for (int i = 0; i < n; ++i) {
+    uint32_t off = 0;
+    const uint32_t guest = GuestFunctionForHostPc(frames[i], &off);
+    if (guest != 0) {
+      REXLOG_WARN("skate3 trace: {} #{} sub_{:08X}+0x{:X}", tag, i, guest, off);
+    }
+  }
+#else
+  (void)tag;
+#endif
+}
+
 void Arm(const char* reason) {
   if (g_entries == nullptr) {
     return;

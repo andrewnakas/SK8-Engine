@@ -841,8 +841,13 @@ bool MovablePropsAtBoot();
 // The other-skater roster cut. Latched at boot like the two above, because
 // the factory hook behind it runs on a guest thread while the world builds.
 bool OtherSkatersAtBoot();
-// Log every roster slot the factory is asked for (diagnostic).
+// Lowest slot ids to build anyway when the cut is on: the player shares the
+// factory with the roamers, so this is what keeps the player.
+int32_t OtherSkatersKeepSlots();
+// Log every request the factory is asked for (diagnostic).
 bool OtherSkatersTrace();
+// Log the call stack behind each starting voice (diagnostic).
+bool VoiceTrace();
 
 // Clears the sticky failure so the next frame retries the full pipeline
 // build (ToggleSceneEnabled calls this on re-enable: a transient allocation
