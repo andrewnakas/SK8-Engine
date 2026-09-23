@@ -311,6 +311,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_image_watch.cpp
     src/skate3_iso_installer.cpp
     src/skate3_launcher.cpp
+    src/skate3_live_cvars.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp

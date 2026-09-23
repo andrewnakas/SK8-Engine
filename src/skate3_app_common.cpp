@@ -19,6 +19,7 @@
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
 #include "skate3_launcher.h"
+#include "skate3_live_cvars.h"
 #include "skate3_pack_select.h"
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
 #include <rex/input/touch_input_driver.h>
@@ -1486,6 +1487,10 @@ void Skate3BaseApp::OnPostSetup() {
   // demo path because its controller reads that macro's progress milestones.
   skate3::guest_trace::Install();
   skate3::guest_trace::InstallSampler();
+  // Live cvar file watcher: no-op unless --skate3_live_cvars=true. Lets an A/B
+  // lever be flipped mid-run from adb instead of costing a relaunch and the
+  // walk back to wherever the measurement happens.
+  skate3::live_cvars::Install();
   // Direct level load and its probe: no-op unless one of its cvars is set.
   // Last, so a probe chains to whatever hook the features above installed
   // rather than replacing it.
