@@ -1369,6 +1369,22 @@ void MatchGuestRefreshToFrameCap() {
 }
 
 void Skate3BaseApp::OnPostSetup() {
+#if defined(__SWITCH__)
+  // Global volatile once came back silently on a cold rebuild and every
+  // measurement after it ran on the slow build; say which build this is.
+#if defined(REX_GUEST_MEM_VOLATILE) && REX_GUEST_MEM_VOLATILE
+  constexpr int kGuestMemVolatile = 1;
+#else
+  constexpr int kGuestMemVolatile = 0;
+#endif
+#if defined(REX_GUEST_LOOP_BARRIER) && REX_GUEST_LOOP_BARRIER
+  constexpr int kGuestLoopBarrier = 1;
+#else
+  constexpr int kGuestLoopBarrier = 0;
+#endif
+  REXLOG_WARN("[build] guest_mem_volatile={} guest_loop_barrier={}", kGuestMemVolatile,
+              kGuestLoopBarrier);
+#endif
   // Before the guest runs, because the title reads the video mode once at
   // startup and its simulation step comes straight out of it.
   MatchGuestRefreshToFrameCap();

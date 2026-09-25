@@ -296,11 +296,19 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_app_common.cpp
     src/skate3_frame_advance.cpp
     src/skate3_sim_catchup.cpp
+    src/skate3_phys_profile.cpp
     src/skate3_audio_profile.cpp
     src/skate3_audio_fixes.cpp
     src/skate3_audio_probe.cpp
     src/skate3_audio_shadow.cpp
     src/skate3_audio_native.cpp
+    src/skate3_audio_port.cpp
+    src/skate3_audio_ports_66.cpp
+    src/skate3_audio_ports_67a.cpp
+    src/skate3_audio_ports_67b.cpp
+    src/skate3_audio_ports_68a.cpp
+    src/skate3_audio_ports_68b.cpp
+    src/skate3_audio_ports_misc.cpp
     src/skate3_crash_report.cpp
     src/skate3_demo_path.cpp
     src/skate3_alloc_counter.cpp
@@ -606,8 +614,14 @@ if(SKATE3_SWITCH)
     # the D3D and audio drivers became `b .`, which is the freeze after the intro
     # movie. The generated header restores the qualifier when this is defined.
     # scripts/scan_spin_loops.sh on skate3.debug.elf must report 0 afterwards.
+    #
+    # OFF by default: the loop barrier below is the real fix, and global
+    # volatile costs hundreds of milliseconds of guest time a frame. It was
+    # turned off once with -D in the cache only, so the cold rebuild of
+    # 2026-09-24 quietly brought it back and every measurement after that ran
+    # on the slow build. Boot logs "[build] guest_mem_volatile=" to catch that.
     option(SKATE3_GUEST_MEM_VOLATILE
-        "Volatile guest loads/stores in the recompiled code (GCC hoists polls out of loops otherwise)" ON)
+        "Volatile guest loads/stores in the recompiled code (GCC hoists polls out of loops otherwise)" OFF)
     if(SKATE3_GUEST_MEM_VOLATILE)
         target_compile_definitions(skate3 PRIVATE REX_GUEST_MEM_VOLATILE=1)
     endif()

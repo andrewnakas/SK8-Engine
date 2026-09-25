@@ -2,12 +2,18 @@
  * @file        skate3_audio_shadow.cpp
  * @brief       Differential verification for native audio replacements
  *
- * See the header for why the lifted body runs first and stays authoritative.
+ * See the header for why the lifted body runs first and stays authoritative, and for
+ * exactly what is and is not compared.
  */
 #include "skate3_audio_shadow.h"
 
-#include <atomic>
+#include <unordered_map>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -26,21 +32,173 @@ REXCVAR_DEFINE_UINT32(
     skate3_audio_shadow_reports, 16, "Skate 3",
     "How many divergences to report per function before going quiet.");
 
+REXCVAR_DEFINE_STRING(
+    skate3_audio_vectors_path, "", "Skate 3",
+    "Record every shadow comparison as a replayable vector to this path.\n"
+    "\n"
+    "Phase 4 tier 1 needs identical inputs fed to the verified C++ and to the Rust port. The "
+    "harness already brackets every call, so rather than generating synthetic vectors this "
+    "dumps the real ones: the entry registers, the watched windows, their bytes on entry, and "
+    "the bytes the ORIGINAL lifted body produced. The Rust port is then replayed against them "
+    "offline. Real inputs, because synthetic tests have never caught a format bug in this "
+    "project and real data has caught every one.");
+
+REXCVAR_DEFINE_INT32(
+    skate3_audio_vectors_max, 4096, "Skate 3",
+    "Stop recording shadow vectors after this many, so a session cannot fill the disk.");
+
+REXCVAR_DEFINE_STRING(
+    skate3_audio_vectors_only, "", "Skate 3",
+    "Comma-separated function names to record vectors for; empty records every comparing port. "
+    "Without this the cap is spent on whichever functions run most -- one four-lane sine kernel "
+    "runs millions of times a session -- so a rarely called function gets no vectors at all and "
+    "cannot be replayed against its Rust translation.");
+
+REXCVAR_DEFINE_INT32(
+    skate3_audio_vectors_per_function, 0, "Skate 3",
+    "Stop recording one function's vectors after this many; 0 sets no per-function limit. With "
+    "it, one session can record a kernel called 5,000 times a second and one called four times "
+    "side by side, instead of the global cap filling with the hot one first.");
+
+REXCVAR_DEFINE_BOOL(
+    skate3_audio_vectors_diverged_only, false, "Skate 3",
+    "Record a shadow vector only for comparisons that diverged.\n"
+    "\n"
+    "A session with two hundred hooks armed would otherwise write every call. The diverging "
+    "vector is what a port fix needs: the entry registers, the read set, and the bytes the "
+    "original produced where the native body disagreed.");
+
 namespace skate3::audio {
 namespace {
 
-// The window is compared twice per call; audio functions run at 187.5 Hz, so this is
-// deliberately small. A function needing more than this is the wrong shape for a
-// window-based diff and should be compared on its output buffer instead.
-constexpr uint32_t kMaxWatch = 64 * 1024;
+// Total bytes compared per call, across all windows: kShadowMaxWatch in the header. Audio
+// functions run at audio rate, so this stays small; a kernel writing more is a hard failure.
+constexpr uint32_t kMaxWatch = kShadowMaxWatch;
 
-std::atomic<uint64_t> g_reports{0};
+thread_local bool t_nested_replay = false;
 
-bool RegistersEqual(const PPCContext& a, const PPCContext& b) {
-  return std::memcmp(&a, &b, sizeof(PPCContext)) == 0;
+// Registers the ABI obliges a callee to preserve. The ranges match the save/restore
+// helpers present in the image: __savegprlr_14..31, __savefpr_14..31, and __savevmx_14..31
+// plus __savevmx_64..127.
+#define SHADOW_PRESERVED_GPRS(X) \
+  X(r1) X(r2) X(r13) X(r14) X(r15) X(r16) X(r17) X(r18) X(r19) X(r20) X(r21) X(r22) X(r23) \
+  X(r24) X(r25) X(r26) X(r27) X(r28) X(r29) X(r30) X(r31)
+#define SHADOW_PRESERVED_FPRS(X) \
+  X(f14) X(f15) X(f16) X(f17) X(f18) X(f19) X(f20) X(f21) X(f22) X(f23) X(f24) X(f25) X(f26) \
+  X(f27) X(f28) X(f29) X(f30) X(f31)
+#define SHADOW_PRESERVED_VRS(X) \
+  X(v14) X(v15) X(v16) X(v17) X(v18) X(v19) X(v20) X(v21) X(v22) X(v23) X(v24) X(v25) X(v26) \
+  X(v27) X(v28) X(v29) X(v30) X(v31) X(v64) X(v65) X(v66) X(v67) X(v68) X(v69) X(v70) X(v71) \
+  X(v72) X(v73) X(v74) X(v75) X(v76) X(v77) X(v78) X(v79) X(v80) X(v81) X(v82) X(v83) X(v84) \
+  X(v85) X(v86) X(v87) X(v88) X(v89) X(v90) X(v91) X(v92) X(v93) X(v94) X(v95) X(v96) X(v97) \
+  X(v98) X(v99) X(v100) X(v101) X(v102) X(v103) X(v104) X(v105) X(v106) X(v107) X(v108) \
+  X(v109) X(v110) X(v111) X(v112) X(v113) X(v114) X(v115) X(v116) X(v117) X(v118) X(v119) \
+  X(v120) X(v121) X(v122) X(v123) X(v124) X(v125) X(v126) X(v127)
+#define SHADOW_PRESERVED_CRS(X) X(cr2) X(cr3) X(cr4)
+
+bool SameBits(const PPCRegister& a, const PPCRegister& b) {
+  return a.u64 == b.u64;
 }
 
-// Name the first differing byte range, which is far more useful than "they differ".
+template <typename T>
+bool SameBytes(const T& a, const T& b) {
+  return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
+
+template <typename T>
+void HexOf(const T& v, char* out, size_t cap) {
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+  size_t n = 0;
+  for (size_t i = 0; i < sizeof(T) && n + 3 <= cap; i++) {
+    std::snprintf(out + n, cap - n, "%02X", p[i]);
+    n += 2;
+  }
+}
+
+struct GprRef { const char* name; PPCRegister PPCContext::* mp; };
+struct VrRef { const char* name; PPCVRegister PPCContext::* mp; };
+struct CrRef { const char* name; PPCCRRegister PPCContext::* mp; };
+constexpr GprRef kGprs[32] = {{"r0", &PPCContext::r0}, {"r1", &PPCContext::r1}, {"r2", &PPCContext::r2}, {"r3", &PPCContext::r3}, {"r4", &PPCContext::r4}, {"r5", &PPCContext::r5}, {"r6", &PPCContext::r6}, {"r7", &PPCContext::r7}, {"r8", &PPCContext::r8}, {"r9", &PPCContext::r9}, {"r10", &PPCContext::r10}, {"r11", &PPCContext::r11}, {"r12", &PPCContext::r12}, {"r13", &PPCContext::r13}, {"r14", &PPCContext::r14}, {"r15", &PPCContext::r15}, {"r16", &PPCContext::r16}, {"r17", &PPCContext::r17}, {"r18", &PPCContext::r18}, {"r19", &PPCContext::r19}, {"r20", &PPCContext::r20}, {"r21", &PPCContext::r21}, {"r22", &PPCContext::r22}, {"r23", &PPCContext::r23}, {"r24", &PPCContext::r24}, {"r25", &PPCContext::r25}, {"r26", &PPCContext::r26}, {"r27", &PPCContext::r27}, {"r28", &PPCContext::r28}, {"r29", &PPCContext::r29}, {"r30", &PPCContext::r30}, {"r31", &PPCContext::r31}};
+constexpr GprRef kFprs[32] = {{"f0", &PPCContext::f0}, {"f1", &PPCContext::f1}, {"f2", &PPCContext::f2}, {"f3", &PPCContext::f3}, {"f4", &PPCContext::f4}, {"f5", &PPCContext::f5}, {"f6", &PPCContext::f6}, {"f7", &PPCContext::f7}, {"f8", &PPCContext::f8}, {"f9", &PPCContext::f9}, {"f10", &PPCContext::f10}, {"f11", &PPCContext::f11}, {"f12", &PPCContext::f12}, {"f13", &PPCContext::f13}, {"f14", &PPCContext::f14}, {"f15", &PPCContext::f15}, {"f16", &PPCContext::f16}, {"f17", &PPCContext::f17}, {"f18", &PPCContext::f18}, {"f19", &PPCContext::f19}, {"f20", &PPCContext::f20}, {"f21", &PPCContext::f21}, {"f22", &PPCContext::f22}, {"f23", &PPCContext::f23}, {"f24", &PPCContext::f24}, {"f25", &PPCContext::f25}, {"f26", &PPCContext::f26}, {"f27", &PPCContext::f27}, {"f28", &PPCContext::f28}, {"f29", &PPCContext::f29}, {"f30", &PPCContext::f30}, {"f31", &PPCContext::f31}};
+constexpr VrRef kVrs[128] = {
+    {"v0", &PPCContext::v0}, {"v1", &PPCContext::v1}, {"v2", &PPCContext::v2}, {"v3", &PPCContext::v3}, {"v4", &PPCContext::v4}, {"v5", &PPCContext::v5}, {"v6", &PPCContext::v6}, {"v7", &PPCContext::v7},
+    {"v8", &PPCContext::v8}, {"v9", &PPCContext::v9}, {"v10", &PPCContext::v10}, {"v11", &PPCContext::v11}, {"v12", &PPCContext::v12}, {"v13", &PPCContext::v13}, {"v14", &PPCContext::v14}, {"v15", &PPCContext::v15},
+    {"v16", &PPCContext::v16}, {"v17", &PPCContext::v17}, {"v18", &PPCContext::v18}, {"v19", &PPCContext::v19}, {"v20", &PPCContext::v20}, {"v21", &PPCContext::v21}, {"v22", &PPCContext::v22}, {"v23", &PPCContext::v23},
+    {"v24", &PPCContext::v24}, {"v25", &PPCContext::v25}, {"v26", &PPCContext::v26}, {"v27", &PPCContext::v27}, {"v28", &PPCContext::v28}, {"v29", &PPCContext::v29}, {"v30", &PPCContext::v30}, {"v31", &PPCContext::v31},
+    {"v32", &PPCContext::v32}, {"v33", &PPCContext::v33}, {"v34", &PPCContext::v34}, {"v35", &PPCContext::v35}, {"v36", &PPCContext::v36}, {"v37", &PPCContext::v37}, {"v38", &PPCContext::v38}, {"v39", &PPCContext::v39},
+    {"v40", &PPCContext::v40}, {"v41", &PPCContext::v41}, {"v42", &PPCContext::v42}, {"v43", &PPCContext::v43}, {"v44", &PPCContext::v44}, {"v45", &PPCContext::v45}, {"v46", &PPCContext::v46}, {"v47", &PPCContext::v47},
+    {"v48", &PPCContext::v48}, {"v49", &PPCContext::v49}, {"v50", &PPCContext::v50}, {"v51", &PPCContext::v51}, {"v52", &PPCContext::v52}, {"v53", &PPCContext::v53}, {"v54", &PPCContext::v54}, {"v55", &PPCContext::v55},
+    {"v56", &PPCContext::v56}, {"v57", &PPCContext::v57}, {"v58", &PPCContext::v58}, {"v59", &PPCContext::v59}, {"v60", &PPCContext::v60}, {"v61", &PPCContext::v61}, {"v62", &PPCContext::v62}, {"v63", &PPCContext::v63},
+    {"v64", &PPCContext::v64}, {"v65", &PPCContext::v65}, {"v66", &PPCContext::v66}, {"v67", &PPCContext::v67}, {"v68", &PPCContext::v68}, {"v69", &PPCContext::v69}, {"v70", &PPCContext::v70}, {"v71", &PPCContext::v71},
+    {"v72", &PPCContext::v72}, {"v73", &PPCContext::v73}, {"v74", &PPCContext::v74}, {"v75", &PPCContext::v75}, {"v76", &PPCContext::v76}, {"v77", &PPCContext::v77}, {"v78", &PPCContext::v78}, {"v79", &PPCContext::v79},
+    {"v80", &PPCContext::v80}, {"v81", &PPCContext::v81}, {"v82", &PPCContext::v82}, {"v83", &PPCContext::v83}, {"v84", &PPCContext::v84}, {"v85", &PPCContext::v85}, {"v86", &PPCContext::v86}, {"v87", &PPCContext::v87},
+    {"v88", &PPCContext::v88}, {"v89", &PPCContext::v89}, {"v90", &PPCContext::v90}, {"v91", &PPCContext::v91}, {"v92", &PPCContext::v92}, {"v93", &PPCContext::v93}, {"v94", &PPCContext::v94}, {"v95", &PPCContext::v95},
+    {"v96", &PPCContext::v96}, {"v97", &PPCContext::v97}, {"v98", &PPCContext::v98}, {"v99", &PPCContext::v99}, {"v100", &PPCContext::v100}, {"v101", &PPCContext::v101}, {"v102", &PPCContext::v102}, {"v103", &PPCContext::v103},
+    {"v104", &PPCContext::v104}, {"v105", &PPCContext::v105}, {"v106", &PPCContext::v106}, {"v107", &PPCContext::v107}, {"v108", &PPCContext::v108}, {"v109", &PPCContext::v109}, {"v110", &PPCContext::v110}, {"v111", &PPCContext::v111},
+    {"v112", &PPCContext::v112}, {"v113", &PPCContext::v113}, {"v114", &PPCContext::v114}, {"v115", &PPCContext::v115}, {"v116", &PPCContext::v116}, {"v117", &PPCContext::v117}, {"v118", &PPCContext::v118}, {"v119", &PPCContext::v119},
+    {"v120", &PPCContext::v120}, {"v121", &PPCContext::v121}, {"v122", &PPCContext::v122}, {"v123", &PPCContext::v123}, {"v124", &PPCContext::v124}, {"v125", &PPCContext::v125}, {"v126", &PPCContext::v126}, {"v127", &PPCContext::v127}};
+constexpr CrRef kCrs[8] = {{"cr0", &PPCContext::cr0}, {"cr1", &PPCContext::cr1}, {"cr2", &PPCContext::cr2}, {"cr3", &PPCContext::cr3}, {"cr4", &PPCContext::cr4}, {"cr5", &PPCContext::cr5}, {"cr6", &PPCContext::cr6}, {"cr7", &PPCContext::cr7}};
+
+struct RegisterMismatch {
+  const char* name = nullptr;
+  char lifted[40] = {0};
+  char native[40] = {0};
+};
+
+// The first named-result or preserved register that differs. `a` is the native result, `b` the
+// lifted one. Float registers are compared as bits, so -0.0 against +0.0 and NaN payloads count
+// as differences.
+RegisterMismatch RegisterDiff(const PPCContext& a, const PPCContext& b, ShadowResults r) {
+  RegisterMismatch m;
+  auto gpr = [&](const GprRef& ref) {
+    if (SameBits(a.*ref.mp, b.*ref.mp)) return false;
+    m.name = ref.name;
+    HexOf((b.*ref.mp).u64, m.lifted, sizeof m.lifted);
+    HexOf((a.*ref.mp).u64, m.native, sizeof m.native);
+    return true;
+  };
+  auto vr = [&](const VrRef& ref) {
+    if (SameBytes(a.*ref.mp, b.*ref.mp)) return false;
+    m.name = ref.name;
+    HexOf(b.*ref.mp, m.lifted, sizeof m.lifted);
+    HexOf(a.*ref.mp, m.native, sizeof m.native);
+    return true;
+  };
+  auto cr = [&](const CrRef& ref) {
+    if (SameBytes(a.*ref.mp, b.*ref.mp)) return false;
+    m.name = ref.name;
+    HexOf(b.*ref.mp, m.lifted, sizeof m.lifted);
+    HexOf(a.*ref.mp, m.native, sizeof m.native);
+    return true;
+  };
+  for (int i = 0; i < 32; i++) {
+    if ((r.gprs >> i) & 1u) { if (gpr(kGprs[i])) return m; }
+  }
+  for (int i = 0; i < 32; i++) {
+    if ((r.fprs >> i) & 1u) { if (gpr(kFprs[i])) return m; }
+  }
+  for (int i = 0; i < 64; i++) {
+    if ((r.vrs_lo >> i) & 1ull) { if (vr(kVrs[i])) return m; }
+  }
+  for (int i = 0; i < 64; i++) {
+    if ((r.vrs_hi >> i) & 1ull) { if (vr(kVrs[64 + i])) return m; }
+  }
+  for (int i = 0; i < 8; i++) {
+    if ((r.crs >> i) & 1u) { if (cr(kCrs[i])) return m; }
+  }
+#define X(reg) if (gpr({#reg, &PPCContext::reg})) return m;
+  SHADOW_PRESERVED_GPRS(X)
+  SHADOW_PRESERVED_FPRS(X)
+#undef X
+#define X(reg) if (vr({#reg, &PPCContext::reg})) return m;
+  SHADOW_PRESERVED_VRS(X)
+#undef X
+#define X(reg) if (cr({#reg, &PPCContext::reg})) return m;
+  SHADOW_PRESERVED_CRS(X)
+#undef X
+  return m;
+}
+
 size_t FirstDiff(const uint8_t* a, const uint8_t* b, size_t n) {
   for (size_t i = 0; i < n; i++) {
     if (a[i] != b[i]) return i;
@@ -48,67 +206,432 @@ size_t FirstDiff(const uint8_t* a, const uint8_t* b, size_t n) {
   return n;
 }
 
+struct StatsRegistry {
+  std::mutex mutex;
+  std::vector<ShadowStats*> all;
+};
+
+StatsRegistry& Registry() {
+  static StatsRegistry registry;
+  return registry;
+}
+
+void LogStats(ShadowStats& stats, uint64_t runs) {
+  stats.logged_runs.store(runs, std::memory_order_relaxed);
+  REXLOG_INFO("skate3-audio-shadow: {} runs={} diverged: registers={} memory={} skipped={} "
+              "overflow={}",
+              stats.name, runs, stats.register_diffs.load(std::memory_order_relaxed),
+              stats.memory_diffs.load(std::memory_order_relaxed),
+              stats.skipped.load(std::memory_order_relaxed),
+              stats.overflow.load(std::memory_order_relaxed));
+}
+
+// Started on the first comparison rather than at static init. Logs every function whose
+// count moved since it was last logged.
+void ReporterMain() {
+  for (uint64_t tick = 1;; tick++) {
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    std::lock_guard<std::mutex> lock(Registry().mutex);
+    if (tick % 3 == 0) {
+      // One line at warn every 30 s, so a session run at log_level=warn still leaves the
+      // positive evidence: how much was compared, and whether anything disagreed.
+      uint64_t runs = 0, reg = 0, mem = 0, skipped = 0, overflow = 0;
+      size_t compared = 0;
+      std::string diverged;
+      for (ShadowStats* stats : Registry().all) {
+        const uint64_t r = stats->runs.load(std::memory_order_relaxed);
+        const uint64_t d = stats->register_diffs.load(std::memory_order_relaxed) +
+                           stats->memory_diffs.load(std::memory_order_relaxed);
+        runs += r;
+        reg += stats->register_diffs.load(std::memory_order_relaxed);
+        mem += stats->memory_diffs.load(std::memory_order_relaxed);
+        skipped += stats->skipped.load(std::memory_order_relaxed);
+        overflow += stats->overflow.load(std::memory_order_relaxed);
+        if (r != 0) compared++;
+        if (d != 0 && diverged.size() < 400) {
+          if (!diverged.empty()) diverged += ',';
+          diverged += stats->name;
+        }
+      }
+      REXLOG_WARN("[audio-shadow] functions={} compared_calls={} diverged: registers={} "
+                  "memory={} skipped={} overflow={} diverging=[{}]",
+                  compared, runs, reg, mem, skipped, overflow, diverged);
+    }
+    for (ShadowStats* stats : Registry().all) {
+      const uint64_t runs = stats->runs.load(std::memory_order_relaxed) +
+                            stats->skipped.load(std::memory_order_relaxed) +
+                            stats->overflow.load(std::memory_order_relaxed);
+      if (runs != stats->logged_runs.load(std::memory_order_relaxed)) {
+        LogStats(*stats, stats->runs.load(std::memory_order_relaxed));
+        stats->logged_runs.store(runs, std::memory_order_relaxed);
+      }
+    }
+  }
+}
+
+void EnsureReporter() {
+  static std::once_flag once;
+  std::call_once(once, [] { std::thread(ReporterMain).detach(); });
+}
+
 }  // namespace
+
+ShadowStats::ShadowStats(const char* function_name) : name(function_name) {
+  std::lock_guard<std::mutex> lock(Registry().mutex);
+  Registry().all.push_back(this);
+}
 
 bool ShadowEnabled() {
   static const bool armed = REXCVAR_GET(skate3_audio_shadow);
   return armed;
 }
 
-bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lifted,
-                   uint32_t watch_addr, uint32_t watch_len, const char* name) {
-  if (watch_len > kMaxWatch) watch_len = kMaxWatch;
-  uint8_t* watch = (watch_addr && watch_len) ? base + watch_addr : nullptr;
+bool ShadowNestedReplay() {
+  return t_nested_replay;
+}
 
-  const PPCContext entry = ctx;
-  std::vector<uint8_t> mem_entry;
-  if (watch) {
-    mem_entry.assign(watch, watch + watch_len);
+void ShadowSkip(ShadowStats& stats, const char* why) {
+  EnsureReporter();
+  const uint64_t skipped = stats.skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (skipped == 1 || skipped == 16 || skipped == 256 || (skipped % 4096) == 0) {
+    REXLOG_INFO("skate3-audio-shadow: {} not comparable on {} calls so far ({})", stats.name,
+                skipped, why);
+  }
+}
+
+namespace {
+
+// Vector recording for Phase 4. One line per comparison, hex, self-describing:
+//
+//   name  run  r3 r4 r5 r6 r7  ret_r3  nwin  addr:len:entry:lifted ...
+//
+// Only r3-r7 and the returned r3 are recorded, not the whole PPCContext: it carries 128 vector
+// registers, and the functions these vectors cover take their arguments in r3-r7. A port that
+// needs more than that is a port this file should not be feeding.
+std::mutex g_vector_mutex;
+std::FILE* g_vector_file = nullptr;
+bool g_vector_tried = false;
+uint64_t g_vector_count = 0;
+
+void HexBytes(std::FILE* out, const uint8_t* data, uint32_t len) {
+  for (uint32_t i = 0; i < len; i++) {
+    std::fprintf(out, "%02X", data[i]);
+  }
+}
+
+void RecordVector(const char* name, const PPCContext& entry, const PPCContext& after,
+                  std::span<const ShadowWindow> windows, std::span<const ShadowWindow> inputs,
+                  const uint8_t* base, const std::vector<uint8_t>& mem_inputs,
+                  const std::vector<uint8_t>& mem_entry,
+                  const std::vector<uint8_t>& mem_lifted, uint64_t run) {
+  std::lock_guard<std::mutex> lock(g_vector_mutex);
+  if (!g_vector_tried) {
+    g_vector_tried = true;
+    const std::string path = REXCVAR_GET(skate3_audio_vectors_path);
+    if (!path.empty()) {
+      g_vector_file = std::fopen(path.c_str(), "w");
+      if (g_vector_file == nullptr) {
+        REXLOG_ERROR("skate3-audio-shadow: cannot write vectors to '{}'", path);
+      } else {
+        std::fprintf(g_vector_file,
+                     "# skate3 shadow vectors: name run r3 r4 r5 r6 r7 ret_r3 then spans.\n"
+                     "# F:n:bits              = entry f1..f8 as raw 64-bit patterns\n"
+                     "# R64:n:bits            = entry r1 and r3..r10, full 64 bits\n"
+                     "# V:n:words / Vr:1:words = entry v1..v3 and the v1 the original left\n"
+                     "# Fr:1:bits             = f1 as the ORIGINAL left it\n"
+                     "# I:addr:len:bytes      = read set, the memory the function saw\n"
+                     "# W:addr:len:entry:exp  = write set, entry bytes and what the ORIGINAL "
+                     "produced\n");
+        REXLOG_INFO("skate3-audio-shadow: recording vectors to '{}' (cap {})", path,
+                    REXCVAR_GET(skate3_audio_vectors_max));
+      }
+    }
+  }
+  if (g_vector_file == nullptr) {
+    return;
+  }
+  // The filter is parsed once, under the same lock that guards the file.
+  static bool s_filter_parsed = false;
+  static std::vector<std::string> s_wanted;
+  if (!s_filter_parsed) {
+    s_filter_parsed = true;
+    const std::string only = REXCVAR_GET(skate3_audio_vectors_only);
+    size_t at = 0;
+    while (at < only.size()) {
+      size_t comma = only.find(',', at);
+      if (comma == std::string::npos) {
+        comma = only.size();
+      }
+      std::string one = only.substr(at, comma - at);
+      while (!one.empty() && (one.front() == ' ' || one.front() == '\t')) one.erase(one.begin());
+      while (!one.empty() && (one.back() == ' ' || one.back() == '\t')) one.pop_back();
+      if (!one.empty()) {
+        s_wanted.push_back(one);
+      }
+      at = comma + 1;
+    }
+    if (!s_wanted.empty()) {
+      REXLOG_INFO("skate3-audio-shadow: recording vectors for {} named function(s) only",
+                  s_wanted.size());
+    }
+  }
+  if (!s_wanted.empty()) {
+    bool wanted = false;
+    for (const std::string& one : s_wanted) {
+      if (one == name) {
+        wanted = true;
+        break;
+      }
+    }
+    if (!wanted) {
+      return;
+    }
+  }
+  // The per-function cap, counted under the same lock as the file.
+  static std::unordered_map<std::string, uint64_t> s_per_function;
+  uint64_t* recorded_here = nullptr;
+  const int32_t per_function = REXCVAR_GET(skate3_audio_vectors_per_function);
+  if (per_function > 0) {
+    recorded_here = &s_per_function[std::string(name)];
+    if (*recorded_here >= static_cast<uint64_t>(per_function)) {
+      return;
+    }
+  }
+  if (g_vector_count >= static_cast<uint64_t>(REXCVAR_GET(skate3_audio_vectors_max))) {
+    if (g_vector_count == static_cast<uint64_t>(REXCVAR_GET(skate3_audio_vectors_max))) {
+      g_vector_count++;
+      REXLOG_INFO("skate3-audio-shadow: vector cap reached, stopping at {}", g_vector_count - 1);
+      std::fflush(g_vector_file);
+    }
+    return;
+  }
+  g_vector_count++;
+  if (recorded_here != nullptr) {
+    (*recorded_here)++;
+  }
+
+  std::fprintf(g_vector_file, "%s\t%llu\t%08X\t%08X\t%08X\t%08X\t%08X\t%08X", name,
+               static_cast<unsigned long long>(run), entry.r3.u32, entry.r4.u32, entry.r5.u32,
+               entry.r6.u32, entry.r7.u32, after.r3.u32);
+  // Float arguments, as raw bit patterns. Without these a kernel whose scale factor arrives in
+  // f1 -- which is most of the DSP surface -- records its memory and its integer registers and is
+  // still unreplayable, because the one value that decides its output is missing. `Fr:1` is what
+  // the ORIGINAL left in f1, for the bodies that return a float.
+  // f1..f8. Most bodies take at most four, but the one-pole filter stage takes its recursion
+  // state in f5, and a missing float argument cannot be told apart from a zero one on replay.
+  {
+    const PPCRegister* const fprs[8] = {&entry.f1, &entry.f2, &entry.f3, &entry.f4,
+                                        &entry.f5, &entry.f6, &entry.f7, &entry.f8};
+    for (int i = 0; i < 8; ++i) {
+      std::fprintf(g_vector_file, "\tF:%d:%016llX", i + 1,
+                   static_cast<unsigned long long>(fprs[i]->u64));
+    }
+  }
+  std::fprintf(g_vector_file, "\tFr:1:%016llX",
+               static_cast<unsigned long long>(after.f1.u64));
+  // The fixed columns above keep only the low word of r3..r7. Two things that costs:
+  //
+  // A chain formed 64-bit -- RexGlue's add and mullw are 64-bit on zero-extended operands --
+  // carries the high half into a returned address, so a truncated recording cannot exercise it
+  // and a truncated port passes. One port's ring copy receives an argument with all 64 bits set,
+  // produced by a branch-free max in its caller.
+  //
+  // And r8 was not recorded at all, so a body taking six arguments could not be replayed: feeding
+  // zero for the sixth makes every address it computes wrong, which turns a failure into a pass.
+  {
+    const PPCRegister* const gprs[6] = {&entry.r3, &entry.r4, &entry.r5,
+                                        &entry.r6, &entry.r7, &entry.r8};
+    for (int i = 0; i < 6; ++i) {
+      std::fprintf(g_vector_file, "\tR64:%d:%016llX", i + 3,
+                   static_cast<unsigned long long>(gprs[i]->u64));
+    }
+    // r9 and r10 carry the seventh and eighth integer arguments, and r1 is the caller's stack
+    // pointer: a body that reads arguments nine and up off the caller's frame, as the filter
+    // stage does at 84..103(r1), cannot be replayed without it.
+    std::fprintf(g_vector_file, "\tR64:9:%016llX\tR64:10:%016llX\tR64:1:%016llX",
+                 static_cast<unsigned long long>(entry.r9.u64),
+                 static_cast<unsigned long long>(entry.r10.u64),
+                 static_cast<unsigned long long>(entry.r1.u64));
+  }
+  // Entry v1..v3 and the v1 the original left, four host-order words each. The four-lane sine kernel
+  // takes its argument and returns its result in v1 and writes no memory at all, so without these
+  // its recorded calls hold nothing that could be replayed.
+  {
+    const PPCVRegister* const vrs[3] = {&entry.v1, &entry.v2, &entry.v3};
+    for (int i = 0; i < 3; ++i) {
+      std::fprintf(g_vector_file, "\tV:%d:%08X%08X%08X%08X", i + 1, vrs[i]->u32[0],
+                   vrs[i]->u32[1], vrs[i]->u32[2], vrs[i]->u32[3]);
+    }
+    std::fprintf(g_vector_file, "\tVr:1:%08X%08X%08X%08X", after.v1.u32[0], after.v1.u32[1],
+                 after.v1.u32[2], after.v1.u32[3]);
+  }
+  // The read set, from a snapshot taken BEFORE the lifted body ran.
+  //
+  // It used to be read from live memory here, on the reasoning that a read span is not written
+  // and so still holds its entry bytes. That reasoning is wrong whenever a span is both read and
+  // written -- a header word a function reads and then updates, which is common -- and the
+  // recording then held the POST-call value while claiming to be the input. Measured on one
+  // recorded file: of 4,454 bytes covered by both a read span and a write span whose entry and
+  // expected bytes differ, 4,454 held the expected byte and none held the entry byte. Replaying
+  // those vectors fed a function its own output and made a correct port look broken.
+  size_t in_off = 0;
+  for (const ShadowWindow& w : inputs) {
+    std::fprintf(g_vector_file, "\tI:%08X:%u:", w.addr, w.len);
+    HexBytes(g_vector_file, mem_inputs.data() + in_off, w.len);
+    in_off += w.len;
+  }
+  size_t off = 0;
+  for (const ShadowWindow& w : windows) {
+    std::fprintf(g_vector_file, "\tW:%08X:%u:", w.addr, w.len);
+    HexBytes(g_vector_file, mem_entry.data() + off, w.len);
+    std::fputc(':', g_vector_file);
+    HexBytes(g_vector_file, mem_lifted.data() + off, w.len);
+    off += w.len;
+  }
+  std::fputc('\n', g_vector_file);
+  std::fflush(g_vector_file);  // per line: a killed session keeps whole records
+}
+
+}  // namespace
+
+bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lifted,
+                   std::span<const ShadowWindow> windows,
+                   std::span<const ShadowWindow> inputs, ShadowResults returns,
+                   ShadowStats& stats, bool reads_truncated) {
+  static const uint64_t report_cap = REXCVAR_GET(skate3_audio_shadow_reports);
+  static const bool diverged_only = REXCVAR_GET(skate3_audio_vectors_diverged_only);
+  EnsureReporter();
+
+  // Reached from an outer native replay: the outer comparison already brackets this call, and
+  // comparing again would double every count and vector. Run the lifted body and nothing else.
+  if (t_nested_replay) {
+    lifted(ctx, base);
+    return true;
+  }
+
+  // A window set over the byte budget is a hard failure. Dropping windows would let a native
+  // write land outside them, which is never rewound and so reaches the live game.
+  uint32_t total = 0;
+  for (const ShadowWindow& w : windows) {
+    total += w.len;
+  }
+  if (total > kMaxWatch) {
+    const uint64_t n = stats.overflow.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n == 16 || n == 256 || (n % 4096) == 0) {
+      REXLOG_ERROR("skate3-audio-shadow: {} budget overflow {} > {} bytes; NOT compared ({} so far)",
+                   stats.name, total, kMaxWatch, n);
+    }
+    lifted(ctx, base);
+    return false;
+  }
+
+  // Per call rather than thread_local: a hooked function can call another hooked
+  // function, and nested comparisons must not share buffers.
+  std::vector<uint8_t> mem_entry(total), mem_lifted(total);
+  size_t off = 0;
+  for (const ShadowWindow& w : windows) {
+    std::memcpy(mem_entry.data() + off, base + w.addr, w.len);
+    off += w.len;
+  }
+  // The read set is snapshotted here, before anything runs. See RecordVector for why reading it
+  // afterwards was wrong.
+  size_t input_total = 0;
+  for (const ShadowWindow& w : inputs) {
+    input_total += w.len;
+  }
+  std::vector<uint8_t> mem_inputs(input_total);
+  size_t in_off = 0;
+  for (const ShadowWindow& w : inputs) {
+    std::memcpy(mem_inputs.data() + in_off, base + w.addr, w.len);
+    in_off += w.len;
   }
 
   // 1. The lifted body, for real.
+  const PPCContext entry = ctx;
   lifted(ctx, base);
   const PPCContext after_lifted = ctx;
-  std::vector<uint8_t> mem_lifted;
-  if (watch) {
-    mem_lifted.assign(watch, watch + watch_len);
-    std::memcpy(watch, mem_entry.data(), watch_len);
+  off = 0;
+  for (const ShadowWindow& w : windows) {
+    std::memcpy(mem_lifted.data() + off, base + w.addr, w.len);
+    off += w.len;
   }
 
-  // 2. The native body, against a rewound copy.
+  const uint64_t run_number = stats.runs.load(std::memory_order_relaxed) + 1;
+  // A truncated read set is worse than no vector: the comparison below is still sound -- only
+  // writes are rewound -- but a replay of the row would reach memory the row does not carry and
+  // count itself unreplayable. Say so once and record nothing.
+  if (reads_truncated && run_number == 1) {
+    REXLOG_WARN(
+        "skate3-audio-shadow: {} declares more read spans than fit; recording no vectors for it",
+        stats.name);
+  }
+  if (!diverged_only && !reads_truncated) {
+    RecordVector(stats.name, entry, after_lifted, windows, inputs, base, mem_inputs, mem_entry,
+                 mem_lifted, run_number);
+  }
+
+  // 2. Rewind memory, last window first so overlapping windows end at their entry bytes.
+  off = total;
+  for (size_t i = windows.size(); i-- > 0;) {
+    off -= windows[i].len;
+    std::memcpy(base + windows[i].addr, mem_entry.data() + off, windows[i].len);
+  }
+
+  // 3. The native body, against the rewound copy.
   ctx = entry;
+  t_nested_replay = true;
   native(ctx, base);
-  const bool regs_ok = RegistersEqual(ctx, after_lifted);
-  bool mem_ok = true;
-  size_t at = 0;
-  if (watch) {
-    at = FirstDiff(watch, mem_lifted.data(), watch_len);
-    mem_ok = at == watch_len;
+  t_nested_replay = false;
+  const RegisterMismatch bad_register = RegisterDiff(ctx, after_lifted, returns);
+  const ShadowWindow* bad_window = nullptr;
+  size_t bad_at = 0;
+  uint8_t lifted_byte = 0, native_byte = 0;
+  off = 0;
+  for (const ShadowWindow& w : windows) {
+    if (!bad_window) {
+      const size_t at = FirstDiff(base + w.addr, mem_lifted.data() + off, w.len);
+      if (at != w.len) {
+        bad_window = &w;
+        bad_at = at;
+        lifted_byte = mem_lifted[off + at];
+        native_byte = base[w.addr + at];
+      }
+    }
+    off += w.len;
   }
 
-  // 3. Restore the authoritative result, whatever the native code did.
+  // 4. Restore the authoritative result, whatever the native code did.
+  off = 0;
+  for (const ShadowWindow& w : windows) {
+    std::memcpy(base + w.addr, mem_lifted.data() + off, w.len);
+    off += w.len;
+  }
   ctx = after_lifted;
-  if (watch) {
-    std::memcpy(watch, mem_lifted.data(), watch_len);
-  }
 
-  if (regs_ok && mem_ok) {
-    return true;
+  const bool diverged = bad_register.name != nullptr || bad_window != nullptr;
+  if (bad_register.name) stats.register_diffs.fetch_add(1, std::memory_order_relaxed);
+  if (bad_window) stats.memory_diffs.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t runs = stats.runs.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  if (diverged && diverged_only && !reads_truncated) {
+    RecordVector(stats.name, entry, after_lifted, windows, inputs, base, mem_inputs, mem_entry,
+                 mem_lifted, runs);
   }
-  if (g_reports.fetch_add(1, std::memory_order_relaxed) <
-      REXCVAR_GET(skate3_audio_shadow_reports)) {
-    if (!regs_ok && !mem_ok) {
-      REXLOG_ERROR("skate3-audio-shadow: {} diverges in registers and at {:08X}+{}",
-                   name, watch_addr, at);
-    } else if (!regs_ok) {
-      REXLOG_ERROR("skate3-audio-shadow: {} diverges in registers", name);
-    } else {
-      REXLOG_ERROR("skate3-audio-shadow: {} diverges in memory at {:08X}+{} "
+  if (diverged && stats.reports.fetch_add(1, std::memory_order_relaxed) < report_cap) {
+    if (bad_register.name) {
+      REXLOG_ERROR("skate3-audio-shadow: {} run {} diverges in register {} (lifted {}, native {})",
+                   stats.name, runs, bad_register.name, bad_register.lifted, bad_register.native);
+    }
+    if (bad_window) {
+      REXLOG_ERROR("skate3-audio-shadow: {} run {} diverges in memory at {:08X}+{} "
                    "(lifted {:02X}, native {:02X})",
-                   name, watch_addr, at, mem_lifted[at], watch[at]);
+                   stats.name, runs, bad_window->addr, bad_at, lifted_byte, native_byte);
     }
   }
-  return false;
+  if (runs == 1 || runs == 16 || runs == 256 || runs == 4096) {
+    LogStats(stats, runs);
+  }
+  return !diverged;
 }
 
 }  // namespace skate3::audio

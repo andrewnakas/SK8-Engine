@@ -76,12 +76,23 @@ void NativeEventSubmit(PPCContext& __restrict ctx, uint8_t* base) {
 
 extern "C" REX_FUNC(sub_82B28CC0) {
   if (skate3::audio::ShadowEnabled()) {
-    // Watch the player's FIFO head and tail. The write to packet+0x0C falls outside
-    // this window and is not covered by the memory diff -- the harness compares one
-    // region, and the packet can sit anywhere relative to the player.
-    const uint32_t player = REX_LOAD_U32(ctx.r3.u32 + kRecordPlayer);
+    // Every byte it writes: the FIFO head and tail, the old tail's next pointer when the
+    // list was not empty, and the new packet's next pointer. The windows must cover all of
+    // them, or a native write outside them would reach the live game unrewound.
+    static skate3::audio::ShadowStats stats("EVENT_SUBMIT");
+    const uint32_t record = ctx.r3.u32;
+    const uint32_t player = REX_LOAD_U32(record + kRecordPlayer);
+    const uint32_t packet = REX_LOAD_U32(record + kRecordPacket);
+    skate3::audio::ShadowWindow windows[3];
+    size_t count = 0;
+    windows[count++] = {player + kPlayerPacketHead, 8};
+    if (REX_LOAD_U32(player + kPlayerPacketHead) != 0) {
+      windows[count++] = {REX_LOAD_U32(player + kPlayerPacketTail) + kPacketNext, 4};
+    }
+    windows[count++] = {packet + kPacketNext, 4};
+    const skate3::audio::ShadowWindow inputs[] = {{record, 12}};
     skate3::audio::ShadowCompare(ctx, base, NativeEventSubmit, __imp__sub_82B28CC0,
-                                 player + kPlayerPacketHead, 8, "EVENT_SUBMIT");
+                                 {windows, count}, {inputs, 1}, skate3::audio::kReturnR3, stats);
     return;
   }
   if (UseNative()) {

@@ -12,8 +12,8 @@
 // Every function below is one the Skate 3 Rust engine's skate-audio-core crate
 // ports one-to-one and names (andrewnakas/skate-3-rust-engine, branch
 // audio/retail-exact-player-sound), most with recorded bit-exact vectors. Each
-// is wrapped with two tick reads so the report names which bodies hold the
-// time - the ones worth replacing with native kernels. Times are INCLUSIVE:
+// is timed with two tick reads (inside its port hook, skate3_audio_port.h) so
+// the report names which bodies hold the time. Times are INCLUSIVE:
 // the graph pass contains the kernels it calls.
 //
 // Off unless skate3_audio_profile is set; the wrappers then cost one flag test.
@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -167,19 +168,34 @@ void MaybeReport() {
 
 }  // namespace
 
-#define SKATE3_WRAP(addr, name)                                        \
-  extern "C" REX_FUNC(sub_##addr) {                                    \
-    if (!REXCVAR_GET(skate3_audio_profile)) {                          \
-      __imp__sub_##addr(ctx, base);                                    \
-      return;                                                          \
-    }                                                                  \
-    const uint64_t t0 = Now();                                         \
-    __imp__sub_##addr(ctx, base);                                      \
-    g_ticks[kFn_##addr].fetch_add(Now() - t0, std::memory_order_relaxed); \
-    g_calls[kFn_##addr].fetch_add(1, std::memory_order_relaxed);       \
-    if (kFn_##addr == kFn_82B219E8) {                                  \
-      MaybeReport();                                                   \
-    }                                                                  \
+// Every profiled function is now a native port (skate3_audio_port.h), so the port hook owns
+// its symbol and does the timing through these; a second strong definition here would not
+// link. The timing is inclusive and covers whichever body ran, native or original.
+namespace skate3::audio {
+
+bool ProfileOn() {
+  return REXCVAR_GET(skate3_audio_profile);
+}
+
+uint64_t ProfileNow() {
+  return Now();
+}
+
+int ProfileSlot(uint32_t addr) {
+  for (int i = 0; i < kFnCount; ++i) {
+    if (uint32_t(std::strtoul(kAddrs[i], nullptr, 16)) == addr) {
+      return i;
+    }
   }
-SKATE3_AUDIO_PROFILED(SKATE3_WRAP)
-#undef SKATE3_WRAP
+  return -1;
+}
+
+void ProfileRecord(int slot, uint64_t ticks) {
+  g_ticks[slot].fetch_add(ticks, std::memory_order_relaxed);
+  g_calls[slot].fetch_add(1, std::memory_order_relaxed);
+  if (slot == kFn_82B219E8) {
+    MaybeReport();
+  }
+}
+
+}  // namespace skate3::audio
