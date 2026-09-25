@@ -1368,6 +1368,10 @@ void MatchGuestRefreshToFrameCap() {
       cap, cap, current, cap, cap);
 }
 
+namespace skate3 {
+void StartGuestSampler();  // skate3_sampler.cpp
+}  // namespace skate3
+
 void Skate3BaseApp::OnPostSetup() {
 #if defined(__SWITCH__)
   // Global volatile once came back silently on a cold rebuild and every
@@ -1393,6 +1397,8 @@ void Skate3BaseApp::OnPostSetup() {
   // freeze where the main thread is resumed and then simply never executes -
   // produced no thread dump at all, which is why that failure had no evidence.
   skate3::crash_report::StartWatchdogEarly();
+  // Off unless skate3_sampler_threads names threads (src/skate3_sampler.cpp).
+  skate3::StartGuestSampler();
   // The base image and its title update are applied by now and the guest has
   // not run: the one moment the static image is known-good. Snapshot it and
   // make its read-only pages read-only, so the first write to any of them is
