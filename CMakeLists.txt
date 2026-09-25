@@ -296,6 +296,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_app_common.cpp
     src/skate3_frame_advance.cpp
     src/skate3_sim_catchup.cpp
+    src/skate3_audio_profile.cpp
     src/skate3_audio_fixes.cpp
     src/skate3_audio_probe.cpp
     src/skate3_audio_shadow.cpp
