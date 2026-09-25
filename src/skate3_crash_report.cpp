@@ -102,6 +102,19 @@ extern std::atomic<uint32_t> rex_diag_shmem_page_size;
 REXCVAR_DECLARE(int32_t, skate3_hang_watchdog_seconds);
 REXCVAR_DECLARE(int32_t, skate3_stall_watchdog_seconds);
 
+#if defined(__SWITCH__)
+// The bring-up diagnostics below ran unconditionally in every Switch build and
+// were never meant to ship: a mallinfo() every 5 s holds the malloc lock while
+// it walks a 2.7 GB arena of ~17,000 free chunks, and the thread dumps at 60,
+// 120 and 240 s plus a ring trace of every guest call from 120 to 150 s each
+// land as a visible hitch in play. The hang watchdog itself is unaffected.
+REXCVAR_DEFINE_BOOL(skate3_switch_bringup_diagnostics, false, "Skate 3",
+                    "Switch only: the 5 s [heap]/[progress]/[jobs]/[timerd] block, the "
+                    "periodic thread dumps and the timed guest call trace. Costly; for "
+                    "chasing a stall, not for play.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
+
 namespace skate3::crash_report {
 
 namespace {
@@ -754,7 +767,8 @@ void WatchdogMain() {
     // looking identical from the outside - and turning on debug logging to tell
     // them apart is slow enough to change the behaviour being measured. Frames
     // and guest work are the two counters that answer it directly.
-    if ((uptime % 5) == 0) {
+    const bool bringup = REXCVAR_GET(skate3_switch_bringup_diagnostics);
+    if (bringup && (uptime % 5) == 0) {
       // Memory belongs on this line: the process was killed outright with the
       // log still flowing - no fault, no terminate, no crash file - and running
       // out of a 3189 MB pool is the way that happens on Horizon. The guest
@@ -822,16 +836,16 @@ void WatchdogMain() {
     // recorded set is the code that keeps running while nothing advances.
     // Armed late enough to catch the front end rather than the intro movie:
     // the slow part starts once menus appear, well past a minute in.
-    if (uptime == 120) {
+    if (bringup && uptime == 120) {
       REXSYS_WARN("[trace] arming guest call trace");
       skate3::guest_trace::Arm("switch-freeze");
     }
-    if (uptime == 150) {
+    if (bringup && uptime == 150) {
       REXSYS_WARN("[trace] dumping guest call trace");
       skate3::guest_trace::Dump("switch-freeze");
     }
 
-    if (uptime == 60 || uptime == 120 || uptime == 240) {
+    if (bringup && (uptime == 60 || uptime == 120 || uptime == 240)) {
       REXSYS_WARN("[dump] periodic thread dump at {}s (not a hang report)", uptime);
       DumpAllThreads();
     }
