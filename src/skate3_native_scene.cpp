@@ -48,6 +48,7 @@
 // backend runtime-compiles the embedded HLSL as before.
 #include "native/shaders/spirv/skate3_native_shaders_spirv.h"
 #include "skate3_native_scene_state.h"
+#include "skate3_mp_hooks.h"
 
 #if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
 #include <rex/graphics/native_rhi.h>
@@ -11424,6 +11425,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                               std::chrono::steady_clock::now().time_since_epoch())
                               .count(),
                           std::memory_order_relaxed);
+  if (skate3::mp::Get().on_scene_published) {
+    skate3::mp::Get().on_scene_published(scene);
+  }
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;
   g_scene = std::make_shared<const FrameScene>(std::move(scene));

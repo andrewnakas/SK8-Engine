@@ -312,6 +312,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_iso_installer.cpp
     src/skate3_launcher.cpp
     src/skate3_live_cvars.cpp
+    src/skate3_mp_hooks.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
@@ -467,6 +468,13 @@ if(EXISTS "${SKATE3_GENERATED_ROOT}/sources.cmake")
         "${SKATE3_GENERATED_ROOT}/..")
 else()
     message(STATUS "generated/sources.cmake not found; run the generate-all target before building skate3")
+endif()
+
+# Cross-play multiplayer module (github.com/andrewnakas/Skate3_multiplayer).
+# Point this at that repo's mp/ directory; empty builds the plain game.
+set(SKATE3_MULTIPLAYER_DIR "" CACHE PATH "Multiplayer module directory (mp/ of Skate3_multiplayer)")
+if(SKATE3_MULTIPLAYER_DIR)
+    include("${SKATE3_MULTIPLAYER_DIR}/Skate3MultiplayerEngine.cmake")
 endif()
 
 if(EXISTS "${SKATE3_GENERATED_ROOT}/eawebkit/sources.cmake")

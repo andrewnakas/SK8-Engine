@@ -95,6 +95,7 @@ REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
 #include "skate3_title_update_installer.h"
 #include "skate3_user_settings.h"
 #include "skate3_warp.h"
+#include "skate3_mp_hooks.h"
 
 #include <algorithm>
 #include <array>
@@ -1315,6 +1316,10 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                               skate3_native_render_scene_freecam,
                               !REXCVAR_GET(skate3_native_render_scene_freecam));
                         });
+  // Multiplayer's own overlays go on top of the engine's.
+  if (skate3::mp::Get().on_app_init) {
+    skate3::mp::Get().on_app_init(drawer);
+  }
 }
 
 // Keep the reported guest refresh in step with the frame cap.
@@ -1527,6 +1532,9 @@ void Skate3BaseApp::OnShutdown() {
   rex::ui::UnregisterBind("bind_skate3_log_debug_marker");
   rex::ui::UnregisterBind("bind_skate3_log_user_marker");
   rex::ui::UnregisterBind("bind_skate3_native_debug");
+  if (skate3::mp::Get().on_app_shutdown) {
+    skate3::mp::Get().on_app_shutdown();
+  }
   ApplyGameplayCursorMode();
   skate3::native_scene::SetSettingsMenuBlur(false);
   simple_settings_dialog_.reset();
