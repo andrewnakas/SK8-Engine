@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string_view>
 #include <system_error>
@@ -30,7 +31,13 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include <rex/ui/window_win.h>
+#elif !defined(__APPLE__) && !defined(__ANDROID__)
 #include <gtk/gtk.h>
 #endif
 
@@ -185,13 +192,15 @@ bool ReadContentHeader(const fs::path& path, XCONTENT_AGGREGATE_DATA& out) {
   if (fs::file_size(path, ec) < kHeaderSize || ec) {
     return false;
   }
-  FILE* file = rex::filesystem::OpenFile(path, "rb");
+  // Streams, not rex::filesystem::OpenFile: that FILE* comes from
+  // rexruntime.dll's C runtime, and handing it to this module's fread is an
+  // invalid-parameter fast-fail on Windows.
+  std::ifstream file(path, std::ios::binary);
   if (!file) {
     return false;
   }
-  const size_t read = std::fread(&out, 1, kHeaderSize, file);
-  std::fclose(file);
-  return read == kHeaderSize;
+  file.read(reinterpret_cast<char*>(&out), kHeaderSize);
+  return file.gcount() == static_cast<std::streamsize>(kHeaderSize);
 }
 
 // A pack's shipped header, if it has one. Community packs put it beside the
@@ -289,14 +298,13 @@ fs::path LiveHeaderDir(rex::Runtime* runtime, uint32_t title_id) {
 fs::path LastChoicePath(rex::Runtime* runtime) { return AddonsRoot(runtime) / "last_choice.txt"; }
 
 std::string ReadLastChoice(rex::Runtime* runtime) {
-  FILE* file = rex::filesystem::OpenFile(LastChoicePath(runtime), "rb");
+  std::ifstream file(LastChoicePath(runtime), std::ios::binary);
   if (!file) {
     return {};
   }
   char buffer[1024] = {};
-  const size_t read = std::fread(buffer, 1, sizeof(buffer) - 1, file);
-  std::fclose(file);
-  std::string value(buffer, read);
+  file.read(buffer, sizeof(buffer) - 1);
+  std::string value(buffer, static_cast<size_t>(file.gcount()));
   while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) {
     value.pop_back();
   }
@@ -309,10 +317,9 @@ void WriteLastChoice(rex::Runtime* runtime, const std::string& value) {
   }
   std::error_code ec;
   fs::create_directories(AddonsRoot(runtime), ec);
-  if (FILE* file = rex::filesystem::OpenFile(LastChoicePath(runtime), "wb")) {
-    std::fwrite(value.data(), 1, value.size(), file);
-    std::fputc('\n', file);
-    std::fclose(file);
+  std::ofstream file(LastChoicePath(runtime), std::ios::binary | std::ios::trunc);
+  if (file) {
+    file << value << '\n';
   }
 }
 
@@ -1132,12 +1139,43 @@ std::string CanonicalKey(const fs::path& path) {
 // would never paint. Mirrors the ISO installer's pump.
 void PumpUntilDone(rex::ui::WindowedAppContext& app_context, rex::ui::Window* window,
                    const std::shared_ptr<Selection>& selection) {
+#if defined(_WIN32)
+  HWND hwnd = nullptr;
+  if (auto* win32_window = dynamic_cast<rex::ui::Win32Window*>(window)) {
+    hwnd = win32_window->hwnd();
+  }
+#endif
   while (!selection->decided && !app_context.HasQuitFromUIThread()) {
     app_context.ExecutePendingFunctionsFromUIThread();
+#if defined(_WIN32)
+    // Nothing else pumps the message queue yet. Without this the picker never
+    // paints, and a few seconds later Windows declares the game Not Responding
+    // and closes it. Bounded, and it rechecks the decision: the picker repaints
+    // continuously, so a WM_PAINT is always waiting and an unbounded drain
+    // would never come back to see that the choice was made.
+    MSG message;
+    for (int pumped = 0; pumped < 64 && !selection->decided &&
+                         PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE);
+         ++pumped) {
+      if (message.message == WM_QUIT) {
+        app_context.QuitFromUIThread();
+        break;
+      }
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+    if (app_context.HasQuitFromUIThread()) {
+      break;
+    }
+#endif
     if (window) {
       window->RequestPaint();
     }
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+#if defined(_WIN32)
+    if (hwnd) {
+      RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+#elif !defined(__APPLE__) && !defined(__ANDROID__)
     while (gtk_events_pending()) {
       gtk_main_iteration_do(FALSE);
     }
