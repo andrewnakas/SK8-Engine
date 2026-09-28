@@ -778,6 +778,57 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     }
     ib_payload = ib_scratch.data();
   }
+  // Index range guard. A mesh whose indices address past its own vertex
+  // buffer is reading the wrong memory (New San Van: the resolved IB/VB
+  // addresses of two whole arenas land in the arena's main block, while
+  // the converted pack itself is clean), and drawing it throws spikes
+  // across the map. Reject it; the draw path retries on later frames, so
+  // if the addresses are only transiently wrong it decodes once they
+  // settle - the "recovered" line below says which case it is.
+  static std::mutex s_badidx_mutex;
+  static std::unordered_set<uint32_t> s_badidx_meshes;
+  if (!item.cloth_quads) {
+    const uint16_t* src_ib = reinterpret_cast<const uint16_t*>(ib_payload);
+    uint32_t bad = 0, max_idx = 0;
+    const DrawEntry whole{4, 0, 0, item.ib_count};
+    const std::vector<DrawEntry> whole_list{whole};
+    for (const DrawEntry& de : item.draws.empty() ? whole_list : item.draws) {
+      if (uint64_t(de.start_index) + de.index_count > item.ib_count) {
+        ++bad;
+        continue;
+      }
+      for (uint32_t i = 0; i < de.index_count; ++i) {
+        const uint32_t a = uint32_t(SwapU16(src_ib[de.start_index + i])) + de.base_vertex;
+        max_idx = std::max(max_idx, a);
+        bad += a >= num_verts;
+      }
+    }
+    if (bad != 0) {
+      bool first;
+      {
+        std::lock_guard<std::mutex> lock(s_badidx_mutex);
+        first = s_badidx_meshes.insert(item.mesh).second;
+      }
+      static std::atomic<uint32_t> s_logs{0};
+      if (first && s_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+        REXLOG_WARN(
+            "native-scene: mesh {:08X} rejected: {} indices past {} verts (max {}) "
+            "vb_obj {:08X} vb {:08X} ib_obj {:08X} ib {:08X} ib_count {}",
+            item.mesh, bad, num_verts, max_idx, item.vb_obj, item.vb_addr, item.ib_obj,
+            item.ib_addr, item.ib_count);
+      }
+      return false;
+    }
+    bool recovered = false;
+    {
+      std::lock_guard<std::mutex> lock(s_badidx_mutex);
+      recovered = s_badidx_meshes.erase(item.mesh) != 0;
+    }
+    if (recovered) {
+      REXLOG_WARN("native-scene: mesh {:08X} recovered: vb {:08X} ib {:08X} now in range",
+                  item.mesh, item.vb_addr, item.ib_addr);
+    }
+  }
   nrhi::Buffer* vb = AcquireMeshUploadBuffer(device, size_t(num_verts) * 56);
   nrhi::Buffer* ib = AcquireMeshUploadBuffer(device, size_t(item.ib_count) * 2);
   if (!vb || !ib) {
