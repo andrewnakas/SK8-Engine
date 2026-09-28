@@ -988,9 +988,14 @@ extern "C" REX_FUNC(sub_827E5B30) {
 extern "C" REX_FUNC(sub_827A52C8) {
   const uint32_t parts = ctx.r3.u32;
   const uint32_t count = ctx.r4.u32;
+  // r5 = the canonical source palette, r6 = the per-mesh remap tables:
+  // captured so multiplayer can replicate the canonical skeleton.
+  const uint32_t source_palette = ctx.r5.u32;
+  const uint32_t remap_tables = ctx.r6.u32;
   __imp__sub_827A52C8(ctx, base);
   if (skate3::native_render::Enabled()) {
-    skate3::native_palette::OnBoneTransforms(base, parts, count);
+    skate3::native_palette::OnBoneTransforms(base, parts, count, source_palette,
+                                             remap_tables);
   }
 }
 

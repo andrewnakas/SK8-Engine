@@ -5,6 +5,7 @@
 
 #include "skate3_native_debug_dialog.h"
 #include "skate3_native_scene.h"
+#include "skate3_mp_hooks.h"
 
 #include "generated/skate3_init.h"
 
@@ -11269,6 +11270,20 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     opaque_items.emplace_back(view_dist2(item), &item);
     stamp_route(1);
+  }
+  // Multiplayer: remote players' skaters. The module owns the items, which
+  // stay valid until its next call, i.e. for the rest of this frame.
+  if (skate3::mp::Get().on_render_scene && debug_mode == 0) {
+    std::vector<const DrawItem*> mp_opaque;
+    std::vector<const DrawItem*> mp_transparent;
+    skate3::mp::Get().on_render_scene(scene, mp_opaque, mp_transparent);
+    for (const DrawItem* extra : mp_opaque) {
+      opaque_items.emplace_back(view_dist2(*extra), extra);
+    }
+    if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
+      transparent_items.insert(transparent_items.end(), mp_transparent.begin(),
+                               mp_transparent.end());
+    }
   }
   // Publish the culled-ctx set every rendered frame, including empty ones:
   // the guest filter must clear promptly when the cull stands down. Ctxs

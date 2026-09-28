@@ -9,8 +9,11 @@ namespace rex::ui {
 class ImGuiDrawer;
 }
 
+#include <vector>
+
 namespace skate3::native_scene {
 struct FrameScene;
+struct DrawItem;
 }
 
 namespace skate3::mp {
@@ -23,6 +26,12 @@ struct Hooks {
   // Every frame scene the native renderer publishes, just before it becomes
   // visible to the render thread (guest submit thread).
   void (*on_scene_published)(const native_scene::FrameScene& scene) = nullptr;
+  // Render thread, once per rendered frame after the scene's own draw lists
+  // are built: extra items to draw this frame (remote players' skaters).
+  void (*on_render_scene)(
+      const native_scene::FrameScene& scene,
+      std::vector<const native_scene::DrawItem*>& extra_opaque,
+      std::vector<const native_scene::DrawItem*>& extra_transparent) = nullptr;
 };
 
 void Register(const Hooks& hooks);
