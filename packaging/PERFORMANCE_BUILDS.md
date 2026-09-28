@@ -57,12 +57,7 @@ AVX2 rather than trusting the build log:
 objdump -d out/build/linux-release/skate3 | grep -cE 'vfmadd|vpermd'   # ~27000, not 0
 ```
 
-### Windows — PRESET ADDED, NEVER BUILT
-
-**Status: unverified.** `windows-release` did not exist until now, so the
-`engine-release.yml` Windows job has never been able to run - it has always
-invoked a preset the repo did not define. The preset now exists and one real
-bug in its path is fixed, but nobody has compiled it yet.
+### Windows — DONE, measured
 
 ```bat
 :: from an x64 Native Tools Command Prompt, so clang-cl finds the MSVC headers
@@ -76,24 +71,98 @@ Uses **clang-cl**: the SDK requires a Clang compiler id, and Windows needs the
 MSVC ABI for D3D12 and the Win32 headers. clang-cl is both. D3D12 and Vulkan
 both build; `gpu_backend` picks at runtime.
 
-The bug already fixed: clang-cl reports its compiler id as `Clang` while taking
-MSVC-style arguments, and the arch-flag branch tested Clang before MSVC - so an
-AVX2 Windows build would have been handed `-march=x86-64-v3`, which the cl
-driver rejects. MSVC is tested first now.
+The bug already fixed before the first build: clang-cl reports its compiler id
+as `Clang` while taking MSVC-style arguments, and the arch-flag branch tested
+Clang before MSVC - so an AVX2 Windows build would have been handed
+`-march=x86-64-v3`, which the cl driver rejects. MSVC is tested first now.
 
-What to expect to go wrong, in likely order:
+Three more real bugs surfaced getting the first Windows build to link, none of
+them Windows-only hacks - all fixed on the shared source:
+
+- `xboxkrnl_ob.cpp` passed a `u8"..."` (`char8_t`) literal into a
+  `std::string_view` parameter - a hard C++20/23 type mismatch GCC let through
+  and clang-cl did not.
+- `rexglue-sdk`'s global compile options passed `-ffp-model=strict` and
+  `-fno-char8_t` to clang-cl in their GCC spelling, which it rejects outright;
+  routed through `/clang:` instead. A redundant `-O3` alongside clang-cl's own
+  `/O2` default tripped `-Wunused-command-line-argument` and failed any target
+  also building with `/WX` (SPIRV-Tools-opt).
+- `skate3_heap_check.cpp` (the guest heap-corruption checker, off by default)
+  used glibc-only `<execinfo.h>`/`backtrace()`/`prctl()` unconditionally; added
+  real Windows equivalents (`RtlCaptureStackBackTrace`, `GetCurrentThreadId`)
+  rather than stubbing the diagnostic out on this platform.
+
+Verify AVX2 landed - `/arch:AVX2` is the Windows spelling, so the Linux
+objdump check does not apply:
+
+```bat
+dumpbin /disasm out\build\windows-release\skate3.exe | findstr /R "vfmadd vpermd"
+```
+
+17,390 hits on the first successful build - not a marginal signal.
+
+Artifacts are `skate3.exe` and `rexruntime.dll` (the workflow's allowlist
+expects exactly those two names).
+
+#### Measured: discrete vs. integrated, and how far the presets go
+
+First real Windows numbers, one laptop with both a discrete GPU and an Intel
+iGPU as separate DXGI adapters (`d3d12_adapter=0` / `=1`), AVX2 build,
+uncapped (`skate3_guest_fps_cap_auto=false skate3_guest_fps_cap=0`), measured
+via the engine's own `skate3_native_render_scene_perf_log=true` in real
+gameplay (Career mode) rather than an idle menu:
+
+| GPU | config | avg fps | range |
+|---|---|---|---|
+| NVIDIA RTX 4050 (discrete) | `quality` preset (2x2 supersample, 4x MSAA, full effects) | 159 | 120-185 |
+| NVIDIA RTX 4050 (discrete) | `performance` preset | 167 | 128-208 |
+| NVIDIA RTX 4050 (discrete) | `performance` + HDR/haze off + draw/LOD distance 0.5x + AF off | **255** | 163-433 |
+| Intel UHD (integrated) | `performance` preset | 177 | 148-200 |
+
+(The discrete max-performance row is the reliable one: 394 gameplay samples over
+~20 minutes of varied Career mode play, filtered to frames actually drawing
+scene content so menu/idle frames - which read a meaningless 400-690 "fps" on
+an almost-empty screen - don't skew it. The other three rows are smaller
+samples and read directionally correct but noisier.)
+
+Two things fall out of this:
+
+- **On this discrete GPU, the game is CPU-bound, not GPU-bound.** Switching
+  `quality` -> `performance` alone only bought ~5-8%; that matches the AVX2
+  table above showing AVX2 doing the real work on a discrete GPU while
+  changing nothing on an iGPU. The preset system's biggest wins are aimed at
+  GPU-bound machines, i.e. integrated graphics.
+- **HDR and haze are not part of any preset** - they default on regardless of
+  `skate3_performance_profile`, and turning them off (haze is a minor extra
+  pass; HDR gates the format/cost of several others even with bloom/shafts
+  already off) plus halving draw/LOD distance pushed fps to **+53%** over the
+  plain `performance` preset. Pushing draw/LOD distance to the engine's floor
+  (0.25x) and disabling lightmaps too was tried and rejected: no further
+  measured fps gain over 0.5x, and lightmaps off looks noticeably worse
+  (flat, unlit geometry) for nothing in return.
+
+Max-performance launch line (discrete or integrated, adjust `d3d12_adapter`):
+
+```bat
+skate3.exe --skate3_performance_profile=performance ^
+  --skate3_native_render_scene_haze=false --skate3_native_render_scene_hdr=false ^
+  --skate3_draw_distance_scale=0.5 --skate3_lod_distance_scale=0.5 ^
+  --anisotropic_override=0
+```
+
+What to expect to go wrong, in likely order, for anyone building this fresh:
 
 - `clang-cl` not on PATH, or run outside the Native Tools prompt (no MSVC
   headers). This is the usual first failure.
 - Ninja not installed, or an MSVC/clang-cl version mismatch.
 - Codegen: it is ~4 minutes and 113 generated `.cpp` files on Linux; the same
   step has to succeed here.
-- Verify AVX2 landed - `/arch:AVX2` is the Windows spelling, so the Linux
-  objdump check does not apply. `dumpbin /disasm` or a debugger will show
-  `vfmadd`/`vpermd`.
-
-Artifacts are `skate3.exe` and `rexruntime.dll` (the workflow's allowlist
-expects exactly those two names).
+- **Smart App Control** (on by default on many fresh Windows 11 installs)
+  blocks a freshly-compiled, unsigned `skate3.exe`/`rexruntime.dll` from
+  launching at all - a "Bad Image" dialog whose error code decodes to the
+  Code Integrity facility, not a corrupt build. Off is one-way without a
+  Windows reinstall, so this is a call for whoever owns the machine, not
+  something to flip automatically.
 
 ### macOS — IN PROGRESS
 

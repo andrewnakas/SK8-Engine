@@ -53,14 +53,27 @@
 
 #include "generated/skate3_init.h"
 
-#if defined(__ANDROID__)
+#if defined(_WIN32)
+// No <execinfo.h>/prctl on Windows; CaptureStackBackTrace and
+// GetCurrentThreadId cover the same two jobs (see LogHostBacktrace,
+// ThreadName, and the ::backtrace call in the free-record path below).
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#elif defined(__ANDROID__)
 // bionic has no <execinfo.h>; this supplies backtrace* over the unwinder.
 #include <rex/execinfo_android.h>
 #else
 #include <execinfo.h>
 #endif
 #include <signal.h>
+#if !defined(_WIN32)
 #include <sys/prctl.h>
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -290,10 +303,21 @@ uint32_t ChunkOf(uint32_t block) {
 
 const char* ThreadName() {
   static thread_local char name[20] = {0};
-  if (name[0] == 0 &&
-      prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) != 0) {
-    name[0] = '?';
-    name[1] = 0;
+  if (name[0] == 0) {
+#if defined(_WIN32)
+    // Windows has no direct "get my own thread's name" without pulling in
+    // GetThreadDescription (kernel32, Windows 10 1607+) and freeing a
+    // LocalAlloc'd buffer; the numeric ID is just as useful for correlating
+    // frames in a log and keeps this a plain snprintf.
+    std::snprintf(name, sizeof(name), "tid:%lu",
+                   static_cast<unsigned long>(::GetCurrentThreadId()));
+#else
+    if (prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(name), 0, 0, 0) !=
+        0) {
+      name[0] = '?';
+      name[1] = 0;
+    }
+#endif
   }
   return name;
 }
@@ -310,17 +334,32 @@ bool PoolArena(uint8_t* base, uint32_t pool, uint32_t* lo, uint32_t* hi) {
 }
 
 void LogFrames(const char* what, void* const* frames, int n) {
+#if defined(_WIN32)
+  // Symbolizing here would need DbgHelp (SymInitialize/SymFromAddr) and a
+  // new link dependency; the raw addresses are enough to feed into
+  // addr2line/llvm-symbolizer or a debugger's "resolve address" by hand.
+  for (int i = 0; i < n; ++i) {
+    REXLOG_ERROR("heap-check:   {} #{} 0x{:016X}", what, i,
+                 reinterpret_cast<uintptr_t>(frames[i]));
+  }
+#else
   char** syms = ::backtrace_symbols(const_cast<void* const*>(frames), n);
   for (int i = 0; i < n; ++i) {
     REXLOG_ERROR("heap-check:   {} #{} {}", what, i,
                  syms != nullptr ? syms[i] : "<no symbol>");
   }
   ::free(syms);
+#endif
 }
 
 void LogHostBacktrace() {
   void* frames[24];
+#if defined(_WIN32)
+  const int n =
+      static_cast<int>(::RtlCaptureStackBackTrace(0, 24, frames, nullptr));
+#else
   const int n = ::backtrace(frames, 24);
+#endif
   LogFrames("now", frames, n);
 }
 
@@ -859,7 +898,12 @@ extern "C" REX_FUNC(sub_82990A58) {
         auto ep = g_epoch.find(chunk);
         rec.epoch = ep == g_epoch.end() ? 0 : ep->second;
         std::snprintf(rec.thread, sizeof(rec.thread), "%s", ThreadName());
+#if defined(_WIN32)
+        rec.frame_count = static_cast<int>(
+            ::RtlCaptureStackBackTrace(0, kFreeFrames, rec.frames, nullptr));
+#else
         rec.frame_count = ::backtrace(rec.frames, kFreeFrames);
+#endif
         g_freed[block] = rec;
       }
     }
