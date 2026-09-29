@@ -371,7 +371,7 @@ endif()
 # pinned release. -DSKATE3_TRAINER=OFF builds without it.
 option(SKATE3_TRAINER "Build the SK8TRAINER in-game trainer" ON)
 set(SKATE3_TRAINER_DIR "" CACHE PATH "Local SK8TRAINER checkout (empty = fetch from GitHub)")
-set(SKATE3_TRAINER_TAG "v0.2.0" CACHE STRING "SK8TRAINER git tag to fetch")
+set(SKATE3_TRAINER_TAG "v0.2.1" CACHE STRING "SK8TRAINER git tag to fetch")
 if(SKATE3_TRAINER)
     if(NOT SKATE3_TRAINER_DIR)
         include(FetchContent)

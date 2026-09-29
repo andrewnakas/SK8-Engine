@@ -762,8 +762,10 @@ void Skate3BaseApp::OnPostSetup() {
   ApplyGameplayCursorMode();
 
 #if defined(SKATE3_TRAINER)
+  // The runtime holds the finally resolved folders (the app's own accessors
+  // keep the pre-install defaults, which are empty unless configured).
   skate3::trainer::Configure(
-      {game_data_root(), update_data_root(), user_data_root()},
+      {runtime()->game_data_root(), runtime()->update_data_root(), runtime()->user_data_root()},
       static_cast<rex::input::InputSystem*>(runtime()->input_system()));
 #endif
   if (auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system())) {
