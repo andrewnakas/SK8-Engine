@@ -14,6 +14,9 @@
 #include <rex/ui/overlay/simple_settings_overlay.h>
 
 #include "skate3_native_debug_dialog.h"
+#if defined(SKATE3_TRAINER)
+#include "skate3_trainer.h"
+#endif
 
 namespace rex::ui {
 class ImGuiDrawer;
@@ -60,6 +63,10 @@ class Skate3BaseApp : public rex::ReXApp {
   std::unique_ptr<rex::ui::SimpleSettingsDialog> simple_settings_dialog_;
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
+#if defined(SKATE3_TRAINER)
+  // SK8TRAINER: Insert, pad Back+LB+RB, or the touch SK8 button.
+  std::unique_ptr<skate3::trainer::TrainerDialog> trainer_dialog_;
+#endif
   bool recipe_overlay_installed_ = false;
   bool big_device_aliases_installed_ = false;
   std::atomic<uint32_t> debug_marker_count_{0};

@@ -736,6 +736,18 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                               skate3_native_render_scene_showcase,
                               !REXCVAR_GET(skate3_native_render_scene_showcase));
                         });
+#if defined(SKATE3_TRAINER)
+  trainer_dialog_ = std::make_unique<skate3::trainer::TrainerDialog>(drawer);
+  skate3::trainer::SetToggleHandler([this] {
+    app_context().CallInUIThreadDeferred([this] {
+      if (trainer_dialog_) trainer_dialog_->Toggle();
+    });
+  });
+  rex::ui::RegisterBind("bind_skate3_trainer", "Insert", "SK8TRAINER menu", [this] {
+    if (trainer_dialog_) trainer_dialog_->Toggle();
+  });
+  skate3::trainer::RegisterBinds();
+#endif
   rex::ui::RegisterBind("bind_skate3_freecam", "End",
                         "Drone camera (free fly)", [] {
                           REXCVAR_SET(
@@ -749,6 +761,11 @@ void Skate3BaseApp::OnPostSetup() {
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
 
+#if defined(SKATE3_TRAINER)
+  skate3::trainer::Configure(
+      {game_data_root(), update_data_root(), user_data_root()},
+      static_cast<rex::input::InputSystem*>(runtime()->input_system()));
+#endif
   if (auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system())) {
     input_system->SetActiveCallback([this]() {
       const bool settings_visible = simple_settings_dialog_ && simple_settings_dialog_->visible();
@@ -758,7 +775,12 @@ void Skate3BaseApp::OnPostSetup() {
       const bool freecam_captures =
           REXCVAR_GET(skate3_native_render_scene_freecam) &&
           REXCVAR_GET(skate3_native_render_scene_freecam_capture_input);
-      return !settings_visible && !xam_ui_active && !freecam_captures;
+      bool trainer_captures = false;
+#if defined(SKATE3_TRAINER)
+      // The trainer menu is driven with the pad: keep it off the skater.
+      trainer_captures = skate3::trainer::CapturesInput();
+#endif
+      return !settings_visible && !xam_ui_active && !freecam_captures && !trainer_captures;
     });
     input_system->SetMenuChordCallback([this]() {
       app_context().CallInUIThreadDeferred([this]() { ToggleSimpleSettings(); });
@@ -825,6 +847,12 @@ void Skate3BaseApp::OnShutdown() {
   simple_settings_dialog_.reset();
   native_debug_dialog_.reset();
   render_mode_indicator_.reset();
+#if defined(SKATE3_TRAINER)
+  rex::ui::UnregisterBind("bind_skate3_trainer");
+  skate3::trainer::UnregisterBinds();
+  skate3::trainer::SetToggleHandler({});
+  trainer_dialog_.reset();
+#endif
 }
 
 void Skate3BaseApp::ToggleSimpleSettings() {
