@@ -10,7 +10,17 @@ Hooks& Table() {
   return hooks;
 }
 
+void (*g_open_settings_page)() = nullptr;
+
 }  // namespace
+
+void SetOpenSettingsPage(void (*open)()) { g_open_settings_page = open; }
+
+void OpenSettingsPage() {
+  if (g_open_settings_page) {
+    g_open_settings_page();
+  }
+}
 
 void Register(const Hooks& hooks) { Table() = hooks; }
 

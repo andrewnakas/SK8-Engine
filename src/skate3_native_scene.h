@@ -821,6 +821,12 @@ bool SceneFailed();
 // Pedestrians & Traffic / Movable Props as they were at boot. The spawn hooks
 // must all agree for the whole session, so neither reads the live cvar.
 bool AmbientNpcsAtBoot();
+// Live answer for the ambient-NPC spawn hooks and draw filter: the boot
+// setting, unless a multiplayer session has them suppressed right now (every
+// player's world must hold the same crowd - none - or they would skate
+// through different streets).
+bool AmbientNpcsEnabled();
+void SetAmbientNpcsSuppressed(bool suppressed);
 bool MovablePropsAtBoot();
 // The other-skater roster cut. Latched at boot like the two above, because
 // the factory hook behind it runs on a guest thread while the world builds.

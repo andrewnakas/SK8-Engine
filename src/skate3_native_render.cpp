@@ -723,7 +723,7 @@ void Install() {
 // The values are latched at boot (see AmbientNpcsAtBoot), so a world cannot be
 // half-populated by a mid-session toggle.
 extern "C" REX_FUNC(sub_82E22F30) {  // LWPedestrianCensusMan
-  if (!skate3::native_scene::AmbientNpcsAtBoot()) {
+  if (!skate3::native_scene::AmbientNpcsEnabled()) {
     ctx.r3.u64 = 0;
     return;
   }
@@ -731,7 +731,7 @@ extern "C" REX_FUNC(sub_82E22F30) {  // LWPedestrianCensusMan
 }
 
 extern "C" REX_FUNC(sub_82C36300) {  // vehicle census
-  if (!skate3::native_scene::AmbientNpcsAtBoot()) {
+  if (!skate3::native_scene::AmbientNpcsEnabled()) {
     ctx.r3.u64 = 0;
     return;
   }

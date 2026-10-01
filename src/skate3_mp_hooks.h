@@ -7,6 +7,7 @@
 
 namespace rex::ui {
 class ImGuiDrawer;
+struct SimpleSettingsExtraPage;
 }
 
 #include <vector>
@@ -32,9 +33,18 @@ struct Hooks {
       const native_scene::FrameScene& scene,
       std::vector<const native_scene::DrawItem*>& extra_opaque,
       std::vector<const native_scene::DrawItem*>& extra_transparent) = nullptr;
+  // When the settings menu is built: the module's own page for its rail
+  // (Multiplayer). Fill in name/desc/build; leave build empty for no page.
+  void (*build_settings_page)(rex::ui::SimpleSettingsExtraPage& page) = nullptr;
 };
 
 void Register(const Hooks& hooks);
 const Hooks& Get();
+
+// The app's side of the seam, for the module to call: open the settings menu
+// straight onto the module's page (toggles closed if it is already showing).
+// UI thread. A no-op until the app has installed it.
+void SetOpenSettingsPage(void (*open)());
+void OpenSettingsPage();
 
 }  // namespace skate3::mp

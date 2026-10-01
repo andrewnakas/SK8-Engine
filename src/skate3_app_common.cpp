@@ -1316,7 +1316,15 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                               skate3_native_render_scene_freecam,
                               !REXCVAR_GET(skate3_native_render_scene_freecam));
                         });
-  // Multiplayer's own overlays go on top of the engine's.
+  // Multiplayer's own overlays go on top of the engine's, and its MP button
+  // opens the settings menu on its page.
+  static Skate3BaseApp* s_app_for_mp = nullptr;
+  s_app_for_mp = this;
+  skate3::mp::SetOpenSettingsPage([] {
+    if (s_app_for_mp) {
+      s_app_for_mp->ToggleSettingsExtraPage();
+    }
+  });
   if (skate3::mp::Get().on_app_init) {
     skate3::mp::Get().on_app_init(drawer);
   }
@@ -1570,6 +1578,15 @@ void Skate3BaseApp::ToggleSimpleSettings() {
   simple_settings_dialog_->Show();
 }
 
+void Skate3BaseApp::ToggleSettingsExtraPage() {
+  EnsureSimpleSettingsDialog();
+  if (!simple_settings_dialog_->visible()) {
+    ApplySettingsCursorMode();
+    skate3::native_scene::SetSettingsMenuBlur(true);
+  }
+  simple_settings_dialog_->ToggleExtraPage();
+}
+
 void Skate3BaseApp::TogglePerformanceMenu() {
   EnsureSimpleSettingsDialog();
   // Set up as if opening: TogglePerformance() closes instead when the
@@ -1732,6 +1749,12 @@ void Skate3BaseApp::EnsureSimpleSettingsDialog() {
       level_select_dialog_->Show();
     }
   });
+  // Multiplayer's page joins the rail when the module is linked in.
+  if (skate3::mp::Get().build_settings_page) {
+    rex::ui::SimpleSettingsExtraPage page;
+    skate3::mp::Get().build_settings_page(page);
+    simple_settings_dialog_->SetExtraPage(std::move(page));
+  }
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
   simple_settings_dialog_->SetTouchLayoutCallbacks(
       [](bool editing) { rex::input::touch::SetTouchLayoutEditing(editing); },

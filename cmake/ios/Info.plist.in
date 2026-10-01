@@ -28,6 +28,8 @@
 	<!-- The 6 GB disc is staged into Documents over Finder file sharing rather
 	     than shipped in the bundle; both keys are required for the app's
 	     Documents directory to appear there and stay writable. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Multiplayer connects to friends' games on your Wi-Fi.</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

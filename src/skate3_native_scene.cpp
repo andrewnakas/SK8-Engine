@@ -3078,7 +3078,7 @@ bool ContentSettingsDrop(const DrawItem& item) {
   if (IsVegetationCard(item) && !REXCVAR_GET(skate3_native_render_scene_vegetation)) {
     return true;
   }
-  if (IsAmbientNpc(item) && !AmbientNpcsAtBoot()) {
+  if (IsAmbientNpc(item) && !AmbientNpcsEnabled()) {
     return true;
   }
   if (item.dynobj != 0 && !MovablePropsAtBoot()) {
@@ -11479,6 +11479,19 @@ extern "C" REX_FUNC(sub_82802A00) {
 bool skate3::native_scene::AmbientNpcsAtBoot() {
   static const bool value = REXCVAR_GET(skate3_native_render_scene_ambient_npcs);
   return value;
+}
+
+namespace {
+std::atomic<bool> g_ambient_npcs_suppressed{false};
+}  // namespace
+
+bool skate3::native_scene::AmbientNpcsEnabled() {
+  return AmbientNpcsAtBoot() &&
+         !g_ambient_npcs_suppressed.load(std::memory_order_relaxed);
+}
+
+void skate3::native_scene::SetAmbientNpcsSuppressed(bool suppressed) {
+  g_ambient_npcs_suppressed.store(suppressed, std::memory_order_relaxed);
 }
 
 bool skate3::native_scene::MovablePropsAtBoot() {

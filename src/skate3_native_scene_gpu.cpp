@@ -6,6 +6,7 @@
 #include "skate3_native_debug_dialog.h"
 #include "skate3_native_scene.h"
 #include "skate3_mp_hooks.h"
+#include "skate3_mp_host_assets.h"
 
 #include "generated/skate3_init.h"
 
@@ -7060,6 +7061,192 @@ bool YieldForCasEditor(uint8_t* base) {
 // Services the debug-dialog texture/mesh cache flushes. (The old
 // retired-buffer drain / SRV-slot recycling is gone: deferred destruction
 // is backend-internal now: Device::DestroyDeferred.)
+// ---- Multiplayer host-built assets (skate3_mp_host_assets.h) --------------
+// Queued from any thread, recorded here at the top of a frame (no pass open).
+std::mutex g_host_asset_mutex;
+std::vector<mp_host_assets::Mesh> g_host_mesh_queue;
+std::vector<mp_host_assets::Texture> g_host_texture_queue;
+std::vector<uint32_t> g_host_mesh_release;
+std::vector<uint32_t> g_host_texture_release;
+
+void ReleaseHostTextureObject(uint32_t object_key, uint64_t submission) {
+  const auto route = g_r.tex_routes.find(object_key);
+  if (route == g_r.tex_routes.end()) {
+    return;
+  }
+  const auto stored = g_r.tex_store.find(route->second.key);
+  if (stored != g_r.tex_store.end()) {
+    RetireGuestTexture(stored->second, submission);
+    g_r.tex_store.erase(stored);
+  }
+  g_r.tex_routes.erase(route);
+}
+
+void ApplyPendingHostAssets(const NativeGuestOutputRenderContext& context) {
+  std::vector<mp_host_assets::Mesh> meshes;
+  std::vector<mp_host_assets::Texture> textures;
+  std::vector<uint32_t> mesh_release;
+  std::vector<uint32_t> texture_release;
+  {
+    std::lock_guard<std::mutex> lock(g_host_asset_mutex);
+    meshes.swap(g_host_mesh_queue);
+    textures.swap(g_host_texture_queue);
+    mesh_release.swap(g_host_mesh_release);
+    texture_release.swap(g_host_texture_release);
+  }
+  if (meshes.empty() && textures.empty() && mesh_release.empty() &&
+      texture_release.empty()) {
+    return;
+  }
+  const uint64_t submission = context.device->CurrentSubmission();
+  for (uint32_t key : mesh_release) {
+    const auto old = g_r.meshes.find(key);
+    if (old != g_r.meshes.end()) {
+      PoolMeshBuffer(context.device, old->second.vb);
+      PoolMeshBuffer(context.device, old->second.ib);
+      g_r.meshes.erase(old);
+    }
+  }
+  for (uint32_t object_key : texture_release) {
+    ReleaseHostTextureObject(object_key, submission);
+  }
+  const uint64_t frame_number = g_frames_rendered.load(std::memory_order_relaxed);
+  for (const mp_host_assets::Texture& source : textures) {
+    if (source.bytes.empty() || source.width == 0 || source.height == 0 ||
+        source.row_pitch == 0) {
+      continue;
+    }
+    ReleaseHostTextureObject(source.object_key, submission);
+    // A GPU that cannot sample BC (every iPhone/iPad so far) gets the blocks
+    // expanded to RGBA8 here, the same as the guest's own textures. Creating
+    // the BC texture anyway hands Metal pixelFormat 0, which aborts inside
+    // the driver - that crashed the phone the moment another player's outfit
+    // arrived.
+    const bool expand = DecodeBcOnCpu();
+    const uint32_t block_bytes = source.bc3 ? 16u : 8u;
+    const uint32_t blocks_x = (source.width + 3) / 4;
+    const uint32_t blocks_y = (source.height + 3) / 4;
+    std::vector<uint8_t> expanded;
+    uint32_t upload_pitch = source.row_pitch;
+    if (expand) {
+      if (source.row_pitch < blocks_x * block_bytes ||
+          source.bytes.size() < size_t(source.row_pitch) * blocks_y) {
+        continue;
+      }
+      upload_pitch = source.width * 4;
+      expanded.assign(size_t(upload_pitch) * source.height, 0);
+      uint8_t px[16][4];
+      for (uint32_t by = 0; by < blocks_y; ++by) {
+        for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+          const uint8_t* block =
+              source.bytes.data() + size_t(by) * source.row_pitch + size_t(bx) * block_bytes;
+          if (source.bc3) {
+            DecodeBc3Block(block, px);
+          } else {
+            DecodeBc1Block(block, px);
+          }
+          for (uint32_t y = 0; y < 4 && by * 4 + y < source.height; ++y) {
+            for (uint32_t x = 0; x < 4 && bx * 4 + x < source.width; ++x) {
+              std::memcpy(expanded.data() + size_t(by * 4 + y) * upload_pitch +
+                              size_t(bx * 4 + x) * 4,
+                          px[y * 4 + x], 4);
+            }
+          }
+        }
+      }
+    }
+    const std::vector<uint8_t>& upload_bytes = expand ? expanded : source.bytes;
+    nrhi::Buffer* upload = CreateUploadBuffer(context.device, upload_bytes.size(),
+                                              nrhi::BufferBindClass::kCopySrc);
+    nrhi::TextureDesc desc;
+    desc.kind = nrhi::TextureKind::k2D;
+    desc.width = source.width;
+    desc.height = source.height;
+    desc.mip_levels = 1;
+    desc.format = expand ? nrhi::Format::kR8G8B8A8_UNORM
+                 : source.bc3 ? nrhi::Format::kBC3_UNORM
+                              : nrhi::Format::kBC1_UNORM;
+    desc.initial_state = nrhi::ResourceState::kCopyDest;
+    nrhi::Texture* texture = context.device->CreateTexture(desc);
+    void* mapping = upload ? context.device->Map(upload) : nullptr;
+    if (upload == nullptr || texture == nullptr || mapping == nullptr) {
+      if (mapping) {
+        context.device->Unmap(upload);
+      }
+      context.device->DestroyDeferred(upload);
+      context.device->DestroyDeferred(texture);
+      continue;
+    }
+    std::memcpy(mapping, upload_bytes.data(), upload_bytes.size());
+    context.device->Unmap(upload);
+    context.cmd->CopyBufferToTexture(texture, 0, 0, upload, 0, upload_pitch,
+                                     source.width, source.height, 1);
+    context.cmd->Barrier(texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
+    context.device->DestroyDeferred(upload);
+    nrhi::TextureViewDesc view;
+    view.dimension = nrhi::ViewDimension::k2D;
+    view.format = desc.format;
+    view.mip_levels = 1;
+    GuestTexture entry;
+    entry.texture = texture;
+    entry.srv = context.device->CreateTextureView(texture, view);
+    entry.srv_format = desc.format;
+    entry.srv_mips = 1;
+    entry.valid = entry.srv != nullptr;
+    // Never idle out on its own; the module releases it explicitly.
+    entry.last_used_frame = std::numeric_limits<uint64_t>::max() / 2;
+    if (!entry.valid) {
+      RetireGuestTexture(entry, submission);
+      continue;
+    }
+    g_r.tex_store[source.store_key] = std::move(entry);
+    RendererState::TexRoute route;
+    route.key = source.store_key;
+    route.demoted = true;  // no live words to poll: the store entry is final
+    g_r.tex_routes[source.object_key] = route;
+  }
+  for (const mp_host_assets::Mesh& source : meshes) {
+    if (source.vertices.empty() || source.indices.empty() ||
+        source.vertices.size() % 14 != 0) {
+      continue;
+    }
+    const size_t vertex_bytes = source.vertices.size() * sizeof(float);
+    const size_t index_bytes = source.indices.size() * sizeof(uint16_t);
+    nrhi::Buffer* vb = AcquireMeshUploadBuffer(context.device, vertex_bytes);
+    nrhi::Buffer* ib = AcquireMeshUploadBuffer(context.device, index_bytes);
+    void* vb_mapping = vb ? context.device->Map(vb) : nullptr;
+    void* ib_mapping = ib ? context.device->Map(ib) : nullptr;
+    if (vb_mapping == nullptr || ib_mapping == nullptr) {
+      if (vb_mapping) context.device->Unmap(vb);
+      if (ib_mapping) context.device->Unmap(ib);
+      PoolMeshBuffer(context.device, vb);
+      PoolMeshBuffer(context.device, ib);
+      continue;
+    }
+    std::memcpy(vb_mapping, source.vertices.data(), vertex_bytes);
+    std::memcpy(ib_mapping, source.indices.data(), index_bytes);
+    context.device->Unmap(vb);
+    context.device->Unmap(ib);
+    const auto old = g_r.meshes.find(source.key);
+    if (old != g_r.meshes.end()) {
+      PoolMeshBuffer(context.device, old->second.vb);
+      PoolMeshBuffer(context.device, old->second.ib);
+      g_r.meshes.erase(old);
+    }
+    MeshBuffers buffers;
+    buffers.vb = vb;
+    buffers.ib = ib;
+    buffers.vb_view = {vb, 0, static_cast<uint32_t>(vertex_bytes), 56};
+    buffers.ib_view = {ib, 0, static_cast<uint32_t>(index_bytes)};
+    buffers.fingerprint = source.fingerprint;
+    buffers.last_used_frame = frame_number;
+    g_r.meshes.emplace(source.key, std::move(buffers));
+  }
+  REXLOG_INFO("native-scene: host assets +{} meshes +{} textures -{} meshes -{} textures",
+              meshes.size(), textures.size(), mesh_release.size(), texture_release.size());
+}
+
 void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context) {
   // Debug-dialog cache flushes: retire every cached decode (freed once the
   // GPU is done with the current submission) so hot-toggled decode settings
@@ -8901,6 +9088,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   nrhi::Cmd* cmd = context.cmd;
 
   ReleaseRetiredAndFlushCaches(context);
+  ApplyPendingHostAssets(context);
 
   // Reset this frame's bone ring region (shared by the shadow casters and
   // the main pass: the shadow pass allocates first, the main pass appends).
@@ -12934,6 +13122,38 @@ void Install() {
 
 }  // namespace skate3::native_scene
 
+namespace skate3::mp_host_assets {
+
+void Queue(std::vector<Mesh> meshes, std::vector<Texture> textures) {
+  std::lock_guard<std::mutex> lock(native_scene::g_host_asset_mutex);
+  for (Mesh& mesh : meshes) {
+    native_scene::g_host_mesh_queue.push_back(std::move(mesh));
+  }
+  for (Texture& texture : textures) {
+    native_scene::g_host_texture_queue.push_back(std::move(texture));
+  }
+}
+
+void Release(const std::vector<std::uint32_t>& mesh_keys,
+             const std::vector<std::uint32_t>& texture_object_keys) {
+  std::lock_guard<std::mutex> lock(native_scene::g_host_asset_mutex);
+  native_scene::g_host_mesh_release.insert(native_scene::g_host_mesh_release.end(),
+                                           mesh_keys.begin(), mesh_keys.end());
+  native_scene::g_host_texture_release.insert(native_scene::g_host_texture_release.end(),
+                                              texture_object_keys.begin(),
+                                              texture_object_keys.end());
+}
+
+bool MeshReady(std::uint32_t key) { return native_scene::g_r.meshes.contains(key); }
+
+bool TextureReady(std::uint32_t object_key) {
+  const auto route = native_scene::g_r.tex_routes.find(object_key);
+  return route != native_scene::g_r.tex_routes.end() &&
+         native_scene::g_r.tex_store.contains(route->second.key);
+}
+
+}  // namespace skate3::mp_host_assets
+
 #else  // !(REX_HAS_D3D12 || REX_HAS_VULKAN)
 
 namespace skate3::native_scene {
@@ -12941,5 +13161,12 @@ void Install() {}
 bool SceneFailed() { return false; }
 void ResetSceneFailure() {}
 }  // namespace skate3::native_scene
+
+namespace skate3::mp_host_assets {
+void Queue(std::vector<Mesh>, std::vector<Texture>) {}
+void Release(const std::vector<std::uint32_t>&, const std::vector<std::uint32_t>&) {}
+bool MeshReady(std::uint32_t) { return false; }
+bool TextureReady(std::uint32_t) { return false; }
+}  // namespace skate3::mp_host_assets
 
 #endif  // REX_HAS_D3D12 || REX_HAS_VULKAN

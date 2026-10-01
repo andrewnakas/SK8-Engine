@@ -67,6 +67,8 @@ class Skate3BaseApp : public rex::ReXApp {
   void TogglePerformanceMenu();
   // Builds simple_settings_dialog_ if it does not exist yet. Does not show it.
   void EnsureSimpleSettingsDialog();
+  // Opens (or closes) the settings menu on the multiplayer module's page.
+  void ToggleSettingsExtraPage();
   void ToggleNativeDebug();
   void ApplySettingsCursorMode();
   void ApplyGameplayCursorMode();

@@ -491,6 +491,9 @@ bool RunSequenceAsync(const std::string& sequence, int32_t settle_ms, bool wait_
         if (!PressStartUntilPaused(6, 400)) {
           REXLOG_WARN("Skate 3 demo path: pause menu never opened; abandoning the "
                       "input sequence rather than driving a screen that is not there");
+          // Over, if unsuccessfully: a caller waiting on completion must not
+          // wait forever (it checks for itself whether the menu was reached).
+          g_sequence_complete.store(true, std::memory_order_relaxed);
           return;
         }
         REXLOG_INFO("Skate 3 demo path: injected gameplay input 1/{} 'start' (confirmed)",
