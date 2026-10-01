@@ -1,4 +1,7 @@
 #include "skate3_native_render.h"
+#if defined(SKATE3_TRAINER)
+#include "skate3_trainer.h"
+#endif
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -432,6 +435,10 @@ extern "C" REX_FUNC(sub_827FAF50) {
 
 // Guest D3D Swap: frame boundary.
 extern "C" REX_FUNC(sub_82B82E08) {
+#if defined(SKATE3_TRAINER)
+  // SK8TRAINER: vault locator, frozen values, game speed.
+  skate3::trainer::Tick(base);
+#endif
   if (skate3::native_render::Enabled()) {
     skate3::native_render::OnFrameEnd(base);
   }
