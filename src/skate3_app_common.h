@@ -15,6 +15,9 @@
 
 #include "skate3_loader_overlay.h"
 #include "skate3_native_debug_dialog.h"
+#if defined(SKATE3_TRAINER)
+#include "skate3_trainer.h"
+#endif
 #include "skate3_touch_controls.h"
 
 namespace rex::ui {
@@ -91,6 +94,10 @@ class Skate3BaseApp : public rex::ReXApp {
   std::unique_ptr<rex::ui::SimpleSettingsDialog> simple_settings_dialog_;
   std::unique_ptr<skate3::NativeDebugDialog> native_debug_dialog_;
   std::unique_ptr<skate3::RenderModeIndicator> render_mode_indicator_;
+#if defined(SKATE3_TRAINER)
+  // SK8TRAINER: Insert, pad Back+LB+RB, or the touch SK8 button.
+  std::unique_ptr<skate3::trainer::TrainerDialog> trainer_dialog_;
+#endif
   std::unique_ptr<skate3::TouchControlsOverlay> touch_controls_;
   // Answered while the UI was still painting; consumed when staging runs.
   std::string chosen_content_pack_;

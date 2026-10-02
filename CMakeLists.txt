@@ -484,6 +484,33 @@ if(SKATE3_MULTIPLAYER_DIR)
     include("${SKATE3_MULTIPLAYER_DIR}/Skate3MultiplayerEngine.cmake")
 endif()
 
+# SK8TRAINER in-game trainer (https://github.com/andrewnakas/sk8trainer).
+# Skate 3 Ultimate vendors it at ../trainer; otherwise set SKATE3_TRAINER_DIR
+# to a checkout, or leave it empty to fetch the pinned release.
+# -DSKATE3_TRAINER=OFF builds without it.
+option(SKATE3_TRAINER "Build the SK8TRAINER in-game trainer" ON)
+set(SKATE3_TRAINER_DIR "" CACHE PATH "Local SK8TRAINER checkout (empty = ../trainer, else fetch)")
+set(SKATE3_TRAINER_TAG "v0.5.0" CACHE STRING "SK8TRAINER git tag to fetch")
+if(SKATE3_TRAINER)
+    if(NOT SKATE3_TRAINER_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../trainer/sk8trainer.cmake")
+        set(SKATE3_TRAINER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../trainer")
+    endif()
+    if(NOT SKATE3_TRAINER_DIR)
+        include(FetchContent)
+        FetchContent_Declare(sk8trainer
+            GIT_REPOSITORY https://github.com/andrewnakas/sk8trainer.git
+            GIT_TAG ${SKATE3_TRAINER_TAG}
+            GIT_SHALLOW TRUE)
+        FetchContent_GetProperties(sk8trainer)
+        if(NOT sk8trainer_POPULATED)
+            FetchContent_Populate(sk8trainer)
+        endif()
+        set(SKATE3_TRAINER_DIR "${sk8trainer_SOURCE_DIR}")
+    endif()
+    include("${SKATE3_TRAINER_DIR}/sk8trainer.cmake")
+    sk8trainer_add(skate3)
+endif()
+
 if(EXISTS "${SKATE3_GENERATED_ROOT}/eawebkit/sources.cmake")
     set(_SKATE3_SAVED_GENERATED_SOURCES ${GENERATED_SOURCES})
     include("${SKATE3_GENERATED_ROOT}/eawebkit/sources.cmake")

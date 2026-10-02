@@ -1,5 +1,8 @@
 #include "skate3_loader_overlay.h"
 #include "skate3_native_render.h"
+#if defined(SKATE3_TRAINER)
+#include "skate3_trainer.h"
+#endif
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -906,6 +909,10 @@ std::atomic<uint64_t> g_frame_count{0};
 // much of it. Split three ways: the runtime's swap handling, whatever the hook
 // layer does at frame end, and the rest of the guest's frame.
 extern "C" REX_FUNC(sub_82B82E08) {
+#if defined(SKATE3_TRAINER)
+  // SK8TRAINER: vault locator, frozen values, game speed.
+  skate3::trainer::Tick(base);
+#endif
   const auto swap_enter = std::chrono::steady_clock::now();
   {
     static std::atomic<int64_t> last_exit_ns{0};
