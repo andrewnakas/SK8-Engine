@@ -756,6 +756,34 @@ const char* FirstExistingFontPath(std::initializer_list<const char*> paths) {
   return nullptr;
 }
 
+std::string Hex8(uint32_t value) {
+  std::ostringstream stream;
+  stream << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
+  return stream.str();
+}
+
+std::filesystem::path InstalledMarketplaceContentPath(const std::filesystem::path& content_root,
+                                                      uint32_t title_id,
+                                                      const std::filesystem::path& package_path) {
+  return content_root / "0000000000000000" / Hex8(title_id) / "00000002" /
+         package_path.filename();
+}
+
+std::filesystem::path InstalledMarketplaceHeaderPath(const std::filesystem::path& content_root,
+                                                     uint32_t title_id,
+                                                     const std::filesystem::path& package_path) {
+  return content_root / "0000000000000000" / Hex8(title_id) / "Headers" / "00000002" /
+         (package_path.filename().string() + ".header");
+}
+
+bool IsInstalledMarketplaceContent(const std::filesystem::path& content_root, uint32_t title_id,
+                                   const std::filesystem::path& package_path) {
+  return std::filesystem::is_directory(
+             InstalledMarketplaceContentPath(content_root, title_id, package_path)) &&
+         std::filesystem::is_regular_file(
+             InstalledMarketplaceHeaderPath(content_root, title_id, package_path));
+}
+
 
 std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
     const std::filesystem::path& executable_root, const std::filesystem::path& game_data_root,
@@ -1255,17 +1283,13 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
       level_select_dialog_->Toggle();
     }
   });
-  rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings (close only)", [this] {
-    // Escape CLOSES the settings screen, level by level (rows -> category rail
-    // -> closed). It deliberately does not open it.
-    //
-    // The controller chord is the only way in - Back+Start, i.e. Select+Start.
-    // One entrance means one thing to explain and one thing that can fire by
-    // accident, and on a handheld there is no keyboard to press Escape on
-    // anyway. Escape still works as "back" because a player who opened the
-    // screen needs a way out that is not the same chord.
+  rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings", [this] {
+    // Escape backs out of the settings screen level by level (rows ->
+    // category rail -> closed); when the screen is closed it opens it.
     if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
       simple_settings_dialog_->NavigateBack();
+    } else {
+      ToggleSimpleSettings();
     }
   });
   rex::ui::RegisterBind("bind_skate3_menu_alt", "F1", "Skate 3 settings alternate", [this] {
@@ -1578,6 +1602,7 @@ void Skate3BaseApp::OnShutdown() {
   // to reproduce it with a stopwatch.
   const auto shutdown_began = std::chrono::steady_clock::now();
   rex::ui::UnregisterBind("bind_skate3_menu");
+  rex::ui::UnregisterBind("bind_skate3_menu_alt");
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
   rex::ui::UnregisterBind("bind_skate3_log_debug_marker");
   rex::ui::UnregisterBind("bind_skate3_log_user_marker");
@@ -2771,6 +2796,12 @@ void Skate3BaseApp::InstallDlcPackages() {
     return;
   }
 
+  const uint32_t title_id = runtime()->kernel_state()->title_id();
+  if (title_id == 0) {
+    REXLOG_WARN("Skipping Skate 3 DLC install; title ID is not available");
+    return;
+  }
+
   const auto user_dlc_root = runtime()->user_data_root() / std::string(kDlcDirectoryName);
   std::error_code create_ec;
   std::filesystem::create_directories(user_dlc_root, create_ec);
@@ -2782,6 +2813,9 @@ void Skate3BaseApp::InstallDlcPackages() {
   const auto source_dirs =
       DiscoverDlcSourceDirectories(rex::filesystem::GetAppRootFolder(),
                                    runtime()->game_data_root(), runtime()->user_data_root());
+  std::unordered_set<std::string> seen_packages;
+  size_t installed_count = 0;
+  size_t skipped_count = 0;
 
   for (const auto& source_dir : source_dirs) {
     if (!std::filesystem::is_directory(source_dir)) {
