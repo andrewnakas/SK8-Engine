@@ -9,6 +9,9 @@ namespace rex::ui {
 class ImGuiDrawer;
 struct SimpleSettingsExtraPage;
 }
+namespace rex::runtime {
+class FunctionDispatcher;
+}
 
 #include <string>
 #include <vector>
@@ -39,6 +42,9 @@ struct Hooks {
   void (*build_settings_page)(rex::ui::SimpleSettingsExtraPage& page) = nullptr;
   // Further pages after that one (Maps). Append to `pages`.
   void (*build_more_pages)(std::vector<rex::ui::SimpleSettingsExtraPage>& pages) = nullptr;
+  // Once the guest function table exists, before the game runs: the module
+  // swaps in its own runtime hooks (retail script bindings). App thread.
+  void (*on_dispatcher_ready)(rex::runtime::FunctionDispatcher* dispatcher) = nullptr;
 };
 
 void Register(const Hooks& hooks);

@@ -1579,6 +1579,11 @@ void Skate3BaseApp::OnPostSetup() {
   // Last, so a probe chains to whatever hook the features above installed
   // rather than replacing it.
   skate3::warp::Install(dispatcher);
+  // The multiplayer module's runtime hooks, after the warp probes so they
+  // chain to anything installed above.
+  if (skate3::mp::Get().on_dispatcher_ready) {
+    skate3::mp::Get().on_dispatcher_ready(dispatcher);
+  }
   // User-facing intro-movie skip (independent of the demo path): the movie
   // completion override polls the merged UI pad state through this provider.
   skate3::demo_path::SetUiInputProvider([this]() {
