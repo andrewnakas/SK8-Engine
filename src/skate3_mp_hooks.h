@@ -10,6 +10,7 @@ class ImGuiDrawer;
 struct SimpleSettingsExtraPage;
 }
 
+#include <string>
 #include <vector>
 
 namespace skate3::native_scene {
@@ -36,6 +37,8 @@ struct Hooks {
   // When the settings menu is built: the module's own page for its rail
   // (Multiplayer). Fill in name/desc/build; leave build empty for no page.
   void (*build_settings_page)(rex::ui::SimpleSettingsExtraPage& page) = nullptr;
+  // Further pages after that one (Maps). Append to `pages`.
+  void (*build_more_pages)(std::vector<rex::ui::SimpleSettingsExtraPage>& pages) = nullptr;
 };
 
 void Register(const Hooks& hooks);
@@ -46,5 +49,16 @@ const Hooks& Get();
 // UI thread. A no-op until the app has installed it.
 void SetOpenSettingsPage(void (*open)());
 void OpenSettingsPage();
+
+// Relaunch the game on a content pack (a folder under ContentPackRoot): the
+// choice is saved to the settings file first, the way the level picker does.
+// UI thread. A no-op until the app has installed it.
+void SetRestartOnPack(void (*restart)(const std::string& pack));
+void RestartOnPack(const std::string& pack);
+
+// The folder custom map packs are installed into (one sub-folder per pack,
+// .big + .header), as StageContentPacks scans it. Empty until the first scan.
+void SetContentPackRoot(const std::string& root);
+std::string ContentPackRoot();
 
 }  // namespace skate3::mp

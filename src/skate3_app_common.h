@@ -97,6 +97,7 @@ class Skate3BaseApp : public rex::ReXApp {
 #if defined(SKATE3_TRAINER)
   // SK8TRAINER: Insert, pad Back+LB+RB, or the touch SK8 button.
   std::unique_ptr<skate3::trainer::TrainerDialog> trainer_dialog_;
+  rex::ui::SimpleSettingsExtraPage BuildTrainerSettingsPage();
 #endif
   std::unique_ptr<skate3::TouchControlsOverlay> touch_controls_;
   // Answered while the UI was still painting; consumed when staging runs.

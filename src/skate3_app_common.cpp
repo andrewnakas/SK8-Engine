@@ -15,6 +15,10 @@
 #include "skate3_demo_path.h"
 #include "skate3_diagnostics.h"
 #include "skate3_dlc_trace.h"
+#if defined(SKATE3_TRAINER)
+#include "skate3_trainer_practice.h"
+#endif
+#include <cmath>
 #include "skate3_fov.h"
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
@@ -1369,6 +1373,16 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
       s_app_for_mp->ToggleSettingsExtraPage();
     }
   });
+  skate3::mp::SetRestartOnPack([](const std::string& pack) {
+    if (!s_app_for_mp) {
+      return;
+    }
+    rex::cvar::SetFlagByName("skate3_content_pack", pack);
+    if (s_app_for_mp->simple_settings_dialog_) {
+      s_app_for_mp->simple_settings_dialog_->SaveSettingsNow();
+    }
+    s_app_for_mp->RestartGame();
+  });
   if (skate3::mp::Get().on_app_init) {
     skate3::mp::Get().on_app_init(drawer);
   }
@@ -1828,12 +1842,102 @@ void Skate3BaseApp::EnsureSimpleSettingsDialog() {
     skate3::mp::Get().build_settings_page(page);
     simple_settings_dialog_->SetExtraPage(std::move(page));
   }
+#if defined(SKATE3_TRAINER)
+  simple_settings_dialog_->AddExtraPage(BuildTrainerSettingsPage());
+#endif
+  if (skate3::mp::Get().build_more_pages) {
+    std::vector<rex::ui::SimpleSettingsExtraPage> pages;
+    skate3::mp::Get().build_more_pages(pages);
+    for (auto& page : pages) {
+      simple_settings_dialog_->AddExtraPage(std::move(page));
+    }
+  }
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
   simple_settings_dialog_->SetTouchLayoutCallbacks(
       [](bool editing) { rex::input::touch::SetTouchLayoutEditing(editing); },
       [] { rex::input::touch::ResetTouchLayout(); });
 #endif
 }
+
+#if defined(SKATE3_TRAINER)
+// The everyday SK8TRAINER switches as a settings page, so a pad or touch
+// player reaches them from the same menu as everything else. The full trainer
+// (405 physics values, presets, marker slots) is one row away.
+rex::ui::SimpleSettingsExtraPage Skate3BaseApp::BuildTrainerSettingsPage() {
+  namespace practice = skate3::trainer::practice;
+  rex::ui::SimpleSettingsExtraPage page;
+  page.name = "Trainer";
+  page.desc = "SK8TRAINER: practice switches, game speed and the full physics trainer.";
+  page.build = [this](std::vector<rex::ui::SimpleSettingsExtraRow>& rows) {
+    using Row = rex::ui::SimpleSettingsExtraRow;
+    {
+      Row row;
+      row.kind = Row::Kind::kAction;
+      row.label = "Open SK8TRAINER";
+      row.desc = "Every physics value, presets and the marker slots (Insert, or Back+LB+RB).";
+      row.action = [this] {
+        if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
+          ToggleSimpleSettings();
+        }
+        if (trainer_dialog_) {
+          trainer_dialog_->Toggle();
+        }
+      };
+      rows.push_back(std::move(row));
+    }
+    // The row's index lives as long as the page; it is re-read from the
+    // trainer every time the page is built.
+    auto toggle = [&rows](int& index, const char* label, const char* desc, bool on,
+                          void (*set)(bool)) {
+      index = on ? 1 : 0;
+      Row row;
+      row.kind = Row::Kind::kEnum;
+      row.label = label;
+      row.desc = desc;
+      row.options = {"Off", "On"};
+      row.index = &index;
+      row.on_change = [set](int value) { set(value != 0); };
+      rows.push_back(std::move(row));
+    };
+    {
+      Row header;
+      header.kind = Row::Kind::kHeader;
+      header.label = "Practice";
+      rows.push_back(std::move(header));
+    }
+    static int s_never_bail = 0, s_no_air_timer = 0, s_no_bounds = 0;
+    toggle(s_never_bail, "Never Bail", "The skater is never allowed to bail.", practice::NeverBail(),
+           &practice::SetNeverBail);
+    toggle(s_no_air_timer, "No Air Timer", "No reset after five seconds in the air.", practice::NoAirTimer(),
+           &practice::SetNoAirTimer);
+    toggle(s_no_bounds, "No Out of Bounds", "Skate and walk past the edge of the play area.",
+           practice::NoBounds(), &practice::SetNoBounds);
+    {
+      static constexpr float kSpeeds[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f};
+      static int s_speed_index = 3;
+      const float speed = practice::GameSpeed();
+      for (int i = 0; i < 6; ++i) {
+        if (std::abs(kSpeeds[i] - speed) < 0.01f) {
+          s_speed_index = i;
+        }
+      }
+      Row row;
+      row.kind = Row::Kind::kEnum;
+      row.label = "Game Speed";
+      row.desc = "Slow motion for learning a line; physics stay stable at every speed.";
+      row.options = {"25%", "50%", "75%", "100%", "150%", "200%"};
+      row.index = &s_speed_index;
+      row.on_change = [](int value) {
+        if (value >= 0 && value < 6) {
+          practice::SetGameSpeed(kSpeeds[value]);
+        }
+      };
+      rows.push_back(std::move(row));
+    }
+  };
+  return page;
+}
+#endif
 
 void Skate3BaseApp::ToggleNativeDebug() {
   if (!native_debug_dialog_) {
@@ -2660,6 +2764,7 @@ void Skate3BaseApp::StageContentPacks() {
   if (level_select_dialog_) {
     level_select_dialog_->SetPackRootHint(rex::path_to_utf8(documents));
   }
+  skate3::mp::SetContentPackRoot(rex::path_to_utf8(documents));
   {
     std::string levels;
     for (const auto& entry : candidates) {
