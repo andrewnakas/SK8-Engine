@@ -231,6 +231,24 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "RelWithDebInfo"
             }
+        },
+        {
+            "name": "ultimate-linux",
+            "displayName": "Skate 3 Ultimate: Linux Release + multiplayer + trainer",
+            "inherits": "linux-release",
+            "binaryDir": "${sourceDir}/../build/linux",
+            "cacheVariables": {
+                "SKATE3_MULTIPLAYER_DIR": "${sourceDir}/../mp"
+            }
+        },
+        {
+            "name": "ultimate-windows",
+            "displayName": "Skate 3 Ultimate: Windows Release + multiplayer + trainer",
+            "inherits": "windows-release",
+            "binaryDir": "${sourceDir}/../build/windows",
+            "cacheVariables": {
+                "SKATE3_MULTIPLAYER_DIR": "${sourceDir}/../mp"
+            }
         }
     ],
     "buildPresets": [
@@ -306,6 +324,20 @@
         {
             "name": "windows-relwithdebinfo",
             "configurePreset": "windows-relwithdebinfo"
+        },
+        {
+            "name": "ultimate-linux",
+            "configurePreset": "ultimate-linux",
+            "targets": [
+                "skate3"
+            ]
+        },
+        {
+            "name": "ultimate-windows",
+            "configurePreset": "ultimate-windows",
+            "targets": [
+                "skate3"
+            ]
         }
     ]
 }
