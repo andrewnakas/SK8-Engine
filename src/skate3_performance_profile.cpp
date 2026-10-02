@@ -235,8 +235,44 @@ Profile DetectProfile() {
 }
 
 std::string_view ProfileName(Profile profile) {
-  return profile == Profile::kHandheld ? "performance" : "quality";
+  // A desktop starts on Balanced: the console's own draw distance, which is
+  // what the phones stream with, rather than Quality's doubled radius - four
+  // times the world area to stream, and the hitches at speed that come with
+  // it. Quality and Ultra are one row away in the settings screen.
+  return profile == Profile::kHandheld ? "performance" : "balanced";
 }
+
+namespace {
+
+// The phones' low-end tier, for a handheld or a machine with no discrete GPU.
+// Only first-run defaults: anything named on the command line is left alone.
+void ApplyLowEndTier() {
+  struct Default {
+    const char* name;
+    const char* value;
+  };
+  static constexpr Default kLowEnd[] = {
+      // Drop the top mip of anything sizeable and a second from the giants:
+      // 16x less texture decode on exactly the textures that fill the store.
+      {"skate3_native_render_scene_tex_base_mip_px", "256"},
+      {"skate3_native_render_scene_tex_base_mip2_px", "1024"},
+      // Build the suppressed static packets and simulate the crowd every
+      // other frame (Tab A7 Lite: 6 fps -> 56 in the world).
+      {"skate3_native_render_guest_static_refresh", "2"},
+      {"skate3_native_render_lw_refresh", "2"},
+      // Spin less against the threads being waited on.
+      {"gpu_idle_spin_iterations", "32"},
+      {"rtl_critical_section_max_spin", "256"},
+  };
+  for (const Default& d : kLowEnd) {
+    if (!NamedOnCommandLine(d.name)) {
+      rex::cvar::SetFlagByName(d.name, d.value);
+    }
+  }
+  REXLOG_INFO("Skate 3 low-end tier applied (mip drop, half-rate crowd and static packets)");
+}
+
+}  // namespace
 
 namespace {
 
@@ -265,6 +301,9 @@ bool ApplyRequestedProfile(bool first_run) {
   const Profile detected = DetectProfile();
   REXLOG_INFO("Skate 3 video preset: no saved settings; detected '{}' for this machine",
               ProfileName(detected));
+  if (detected == Profile::kHandheld) {
+    ApplyLowEndTier();
+  }
   return rex::ui::ApplyGraphicsPresetByName(ProfileName(detected));
 }
 
@@ -315,6 +354,7 @@ bool ApplyDeckDefaultsOnce(const std::filesystem::path& user_data_root) {
     return false;
   }
   rex::ui::ApplyGraphicsPresetByName("performance");
+  ApplyLowEndTier();
   // The panel's own refresh rate as the frame cap: a steady 60 on the LCD
   // reads better than an unsteady 75, and the OLED's 90 is real headroom.
   const double refresh = model == DeckModel::kOled ? 90.0 : 60.0;

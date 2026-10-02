@@ -47,6 +47,7 @@ uint64_t TakeClampCalls();
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
 #include <rex/ui/window.h>
 
@@ -58,6 +59,8 @@ REXCVAR_DEFINE_INT32(skate3_native_render_log_interval, 0, "Skate 3",
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
+REXCVAR_DECLARE(bool, skate3_native_render_scene);
+REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(bool, skate3_diagnostics);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull_guest);
 REXCVAR_DECLARE(int32_t, skate3_native_render_guest_static_refresh);
@@ -908,7 +911,44 @@ std::atomic<uint64_t> g_frame_count{0};
 // that second - so the time is inside the guest's own swap, and this says how
 // much of it. Split three ways: the runtime's swap handling, whatever the hook
 // layer does at frame end, and the rest of the guest's frame.
+namespace {
+
+// The blank difficulty dialog's fix, for when the native renderer is OFF.
+//
+// A first launch has no shader storage, so the boot frontend compiles as it
+// draws, and with async_shader_compilation on a still-compiling draw is
+// skipped. Those screens are drawn once and kept, so a skipped draw is a
+// widget that never appears: the difficulty dialog's options list. The native
+// scene path holds compilation synchronous through the pre-gameplay frontend
+// (YieldForMenus); that only runs when the native scene renders, and Windows
+// and Linux default to async compiles, so this covers the other case.
+void HoldShaderCompilationThroughColdFrontend() {
+  static bool s_seen_gameplay = false;
+  static bool s_forced = false;
+  static bool s_saved = false;
+  if (s_seen_gameplay || REXCVAR_GET(skate3_native_render_scene)) {
+    return;
+  }
+  const bool in_menus = rex::kernel::guest_presence::GameplayContextValue() == 0;
+  if (in_menus && !s_forced) {
+    s_saved = REXCVAR_GET(async_shader_compilation);
+    if (s_saved) {
+      REXCVAR_SET(async_shader_compilation, false);
+      REXLOG_WARN("native-render: cold boot frontend - shader compilation synchronous");
+    }
+    s_forced = true;
+  } else if (!in_menus) {
+    s_seen_gameplay = true;
+    if (s_forced && s_saved) {
+      REXCVAR_SET(async_shader_compilation, true);
+    }
+  }
+}
+
+}  // namespace
+
 extern "C" REX_FUNC(sub_82B82E08) {
+  HoldShaderCompilationThroughColdFrontend();
 #if defined(SKATE3_TRAINER)
   // SK8TRAINER: vault locator, frozen values, game speed.
   skate3::trainer::Tick(base);

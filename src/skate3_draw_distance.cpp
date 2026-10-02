@@ -64,7 +64,7 @@ REXCVAR_DEFINE_BOOL(skate3_stream_descriptor_prune, true, "Skate 3",
                     "crash happens. Off = leave the guest array alone, to test whether the "
                     "workaround is itself the corruption.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 2.0, "Skate 3",
+REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 1.0, "Skate 3",
                       "Scale the distance at which small world meshes "
                       "(foliage, props, street furniture) stop being drawn. "
                       "1 = original console behavior. Larger values draw more "
@@ -76,7 +76,7 @@ REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 2.0, "Skate 3",
                       "with any mass behind it.")
     .range(0.05, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 2.0, "Skate 3",
+REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 1.0, "Skate 3",
                       "Scale the distances at which skaters, pedestrians and "
                       "vehicles switch to lower-detail models. 1 = original "
                       "console behavior.")

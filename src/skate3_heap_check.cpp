@@ -112,12 +112,13 @@ REXCVAR_DEFINE_INT32(skate3_instance_free_defer_jobs, 0, "Skate 3",
                      "rather than to wall-clock time (0 = use _ms instead)")
     .range(0, 100000)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_INT32(skate3_instance_free_defer_ms, 0, "Skate 3",
+REXCVAR_DEFINE_INT32(skate3_instance_free_defer_ms, 250, "Skate 3",
                      "CANDIDATE FIX for the cross-thread use-after-free: hold "
                      "the u16 arrays freed by the WorldPresentation instance "
                      "teardown for this many ms, so a Job Manager worker still "
                      "walking an interior pointer into them writes to memory "
-                     "nobody has reused (0 = off)")
+                     "nobody has reused (0 = off). 250 on every platform: the "
+                     "phones have shipped with it since v2.6")
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(skate3_heap_quarantine_kb, 0, "Skate 3",

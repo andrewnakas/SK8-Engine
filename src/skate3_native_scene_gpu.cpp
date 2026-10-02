@@ -967,16 +967,22 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     const uint16_t* src_ib = reinterpret_cast<const uint16_t*>(ib_payload);
     uint32_t bad = 0, max_idx = 0;
     const DrawEntry whole{4, 0, 0, item.ib_count};
-    const std::vector<DrawEntry> whole_list{whole};
-    for (const DrawEntry& de : item.draws.empty() ? whole_list : item.draws) {
+    auto check = [&](const DrawEntry& de) {
       if (uint64_t(de.start_index) + de.index_count > item.ib_count) {
         ++bad;
-        continue;
+        return;
       }
       for (uint32_t i = 0; i < de.index_count; ++i) {
         const uint32_t a = uint32_t(SwapU16(src_ib[de.start_index + i])) + de.base_vertex;
         max_idx = std::max(max_idx, a);
         bad += a >= num_verts;
+      }
+    };
+    if (item.draws.empty()) {
+      check(whole);
+    } else {
+      for (const DrawEntry& de : item.draws) {
+        check(de);
       }
     }
     if (bad != 0) {
