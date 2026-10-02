@@ -1364,8 +1364,8 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                               skate3_native_render_scene_freecam,
                               !REXCVAR_GET(skate3_native_render_scene_freecam));
                         });
-  // Multiplayer's own overlays go on top of the engine's, and its MP button
-  // opens the settings menu on its page.
+  // Multiplayer's own overlays go on top of the engine's, and it can open
+  // the settings menu on its page.
   static Skate3BaseApp* s_app_for_mp = nullptr;
   s_app_for_mp = this;
   skate3::mp::SetOpenSettingsPage([] {
@@ -1864,31 +1864,38 @@ void Skate3BaseApp::EnsureSimpleSettingsDialog() {
 // player reaches them from the same menu as everything else. The full trainer
 // (405 physics values, presets, marker slots) is one row away.
 rex::ui::SimpleSettingsExtraPage Skate3BaseApp::BuildTrainerSettingsPage() {
-  namespace practice = skate3::trainer::practice;
   rex::ui::SimpleSettingsExtraPage page;
   page.name = "Trainer";
-  page.desc = "SK8TRAINER: practice switches, game speed and the full physics trainer.";
-  page.build = [this](std::vector<rex::ui::SimpleSettingsExtraRow>& rows) {
+  page.desc = "SK8TRAINER: practice switches, presets and every physics value.";
+  page.build = [](std::vector<rex::ui::SimpleSettingsExtraRow>& rows) {
+    namespace trainer = skate3::trainer;
+    namespace practice = skate3::trainer::practice;
     using Row = rex::ui::SimpleSettingsExtraRow;
-    {
+    // Which physics group is open; empty shows the main page. The page is
+    // rebuilt every frame it is drawn, so this is all the navigation needs.
+    static std::string s_group;
+    auto header = [&rows](const std::string& label) {
+      Row row;
+      row.kind = Row::Kind::kHeader;
+      row.label = label;
+      rows.push_back(std::move(row));
+    };
+    auto action = [&rows](const std::string& label, const std::string& desc,
+                          const std::string& value, std::function<void()> fn,
+                          bool enabled = true) -> Row& {
       Row row;
       row.kind = Row::Kind::kAction;
-      row.label = "Open SK8TRAINER";
-      row.desc = "Every physics value, presets and the marker slots (Insert, or Back+LB+RB).";
-      row.action = [this] {
-        if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
-          ToggleSimpleSettings();
-        }
-        if (trainer_dialog_) {
-          trainer_dialog_->Toggle();
-        }
-      };
+      row.label = label;
+      row.desc = desc;
+      row.value = value;
+      row.action = std::move(fn);
+      row.enabled = enabled;
       rows.push_back(std::move(row));
-    }
-    // The row's index lives as long as the page; it is re-read from the
-    // trainer every time the page is built.
+      return rows.back();
+    };
+    // An Off/On row whose index lives as long as the page.
     auto toggle = [&rows](int& index, const char* label, const char* desc, bool on,
-                          void (*set)(bool)) {
+                          std::function<void(bool)> set, bool enabled) {
       index = on ? 1 : 0;
       Row row;
       row.kind = Row::Kind::kEnum;
@@ -1896,29 +1903,103 @@ rex::ui::SimpleSettingsExtraPage Skate3BaseApp::BuildTrainerSettingsPage() {
       row.desc = desc;
       row.options = {"Off", "On"};
       row.index = &index;
-      row.on_change = [set](int value) { set(value != 0); };
+      row.enabled = enabled;
+      row.on_change = [set = std::move(set)](int value) { set(value != 0); };
+      row.reset = [&index, set] {
+        index = 0;
+        set(false);
+      };
       rows.push_back(std::move(row));
     };
-    {
-      Row header;
-      header.kind = Row::Kind::kHeader;
-      header.label = "Practice";
-      rows.push_back(std::move(header));
+
+    const bool locked = trainer::Locked();
+    if (locked) {
+      s_group.clear();
+      action("Set by This Room",
+             trainer::CurrentRoomRule() == trainer::RoomRule::kOff
+                 ? "The host turned trainers off. Your own settings come back when you leave."
+                 : "Everyone skates with the host's trainer settings. Yours come back when "
+                   "you leave.",
+             trainer::CurrentRoomRule() == trainer::RoomRule::kOff ? "Off" : "Host's", {},
+             false);
     }
-    static int s_never_bail = 0, s_no_air_timer = 0, s_no_bounds = 0;
-    toggle(s_never_bail, "Never Bail", "The skater is never allowed to bail.", practice::NeverBail(),
-           &practice::SetNeverBail);
-    toggle(s_no_air_timer, "No Air Timer", "No reset after five seconds in the air.", practice::NoAirTimer(),
-           &practice::SetNoAirTimer);
+
+    // ---- One physics group: every value in it.
+    if (!s_group.empty()) {
+      action("< Back", "Back to the trainer's main page.", "", [] { s_group.clear(); });
+      header(s_group);
+      const std::vector<trainer::ValueRow> values = trainer::GroupValues(s_group);
+      static std::vector<float> s_slider;
+      static std::vector<int> s_flag;
+      if (s_slider.size() < values.size()) {
+        s_slider.resize(values.size());
+        s_flag.resize(values.size());
+      }
+      for (size_t i = 0; i < values.size(); ++i) {
+        const trainer::ValueRow& v = values[i];
+        const int index = v.index;
+        char stock[48];
+        std::snprintf(stock, sizeof(stock), "%.4g", v.stock);
+        Row row;
+        row.label = v.changed ? v.label + "  *" : v.label;
+        row.desc = std::string("Game value ") + stock + ". Y / R puts it back.";
+        row.enabled = !locked;
+        row.reset = [index] { trainer::ResetValue(index); };
+        if (v.is_bool) {
+          s_flag[i] = v.value != 0 ? 1 : 0;
+          row.kind = Row::Kind::kEnum;
+          row.options = {"Off", "On"};
+          row.index = &s_flag[i];
+          row.on_change = [index](int on) { trainer::SetValue(index, on ? 1.0 : 0.0); };
+        } else {
+          s_slider[i] = static_cast<float>(v.value);
+          float* slot = &s_slider[i];
+          row.kind = Row::Kind::kSlider;
+          row.slider_value = slot;
+          row.min = static_cast<float>(v.min);
+          row.max = static_cast<float>(v.max);
+          row.step = static_cast<float>(v.step);
+          row.fmt = "%.4g";
+          row.on_value_change = [index, slot] { trainer::SetValue(index, *slot); };
+        }
+        rows.push_back(std::move(row));
+      }
+      action("Reset This Group", "Every value above back to the game's own.", "",
+             [values] {
+               for (const trainer::ValueRow& v : values) {
+                 trainer::ResetValue(v.index);
+               }
+             },
+             !locked);
+      return;
+    }
+
+    // ---- Main page.
+    if (!locked) {
+      action("SK8TRAINER", "Changes apply immediately and are saved for next time.",
+             trainer::StatusText(), {}, false);
+    }
+    header("Switches");
+    static int s_never_bail = 0, s_no_air = 0, s_no_bounds = 0, s_perfect = 0, s_feet = 0;
+    toggle(s_never_bail, "Never Bail", "Bail thresholds out of reach, and a bail is refused.",
+           trainer::NeverBail(), [](bool on) { trainer::SetNeverBail(on); }, !locked);
+    toggle(s_feet, "Keep Feet On", "With Never Bail: A / X do nothing in the air, so a foot never "
+           "comes off the board. Turn off for footplants.",
+           practice::KeepFeetOn(), [](bool on) { practice::SetKeepFeetOn(on); trainer::SaveSwitches(); }, !locked);
+    toggle(s_no_air, "No Air Timer", "No reset after five seconds in the air.",
+           practice::NoAirTimer(), [](bool on) { practice::SetNoAirTimer(on); trainer::SaveSwitches(); }, !locked);
     toggle(s_no_bounds, "No Out of Bounds", "Skate and walk past the edge of the play area.",
-           practice::NoBounds(), &practice::SetNoBounds);
+           practice::NoBounds(), [](bool on) { practice::SetNoBounds(on); trainer::SaveSwitches(); }, !locked);
+    toggle(s_perfect, "Perfect Finish", "Flip while a grab trigger is held; let go and the game "
+           "squares you up for the landing.",
+           trainer::PerfectFinish(), [](bool on) { trainer::SetPerfectFinish(on); }, !locked);
     {
       static constexpr float kSpeeds[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f};
-      static int s_speed_index = 3;
+      static int s_speed = 3;
       const float speed = practice::GameSpeed();
       for (int i = 0; i < 6; ++i) {
         if (std::abs(kSpeeds[i] - speed) < 0.01f) {
-          s_speed_index = i;
+          s_speed = i;
         }
       }
       Row row;
@@ -1926,13 +2007,67 @@ rex::ui::SimpleSettingsExtraPage Skate3BaseApp::BuildTrainerSettingsPage() {
       row.label = "Game Speed";
       row.desc = "Slow motion for learning a line; physics stay stable at every speed.";
       row.options = {"25%", "50%", "75%", "100%", "150%", "200%"};
-      row.index = &s_speed_index;
+      row.index = &s_speed;
+      row.enabled = !locked;
       row.on_change = [](int value) {
         if (value >= 0 && value < 6) {
           practice::SetGameSpeed(kSpeeds[value]);
         }
       };
+      row.reset = [] { practice::SetGameSpeed(1.0f); };
       rows.push_back(std::move(row));
+    }
+
+    header("Marker Slots");
+    {
+      static int s_slot = 0;
+      s_slot = std::clamp(practice::SelectedSlot(), 0, 4);
+      Row row;
+      row.kind = Row::Kind::kEnum;
+      row.label = "Slot";
+      row.desc = "Five saved spots to practise from.";
+      row.options = {"1", "2", "3", "4", "5"};
+      for (int i = 0; i < 5; ++i) {
+        if (practice::Slot(i).valid) {
+          row.options[size_t(i)] += " (saved)";
+        }
+      }
+      row.index = &s_slot;
+      row.enabled = !locked;
+      row.on_change = [](int value) { practice::SelectSlot(value); };
+      rows.push_back(std::move(row));
+      const int slot = s_slot;
+      action("Save Here", "Remember where you are in this slot.", "",
+             [slot] { practice::SaveHere(slot); }, !locked);
+      action("Go to Slot", "Back to the saved spot.", "", [slot] { practice::GoTo(slot); },
+             !locked && practice::Slot(slot).valid);
+      static int s_auto_return = 0;
+      toggle(s_auto_return, "Return After a Bail", "Go back to the slot a second after bailing.",
+             practice::AutoReturn(),
+             [](bool on) { practice::SetAutoReturn(on, practice::AutoReturnDelay()); }, !locked);
+    }
+
+    header("Presets");
+    const std::vector<trainer::PresetInfo> presets = trainer::PresetList();
+    for (int i = 0; i < static_cast<int>(presets.size()); ++i) {
+      action(i == 0 ? std::string("Reset Everything") : presets[size_t(i)].name,
+             presets[size_t(i)].note, i == 0 ? "Stock" : "Apply",
+             [i] { trainer::ApplyPreset(i); }, !locked && trainer::Ready());
+    }
+
+    header("Physics Values");
+    if (!trainer::Ready()) {
+      action("Values", "They appear once you're skating.", trainer::StatusText(), {}, false);
+    }
+    for (const std::string& group : trainer::Groups()) {
+      const std::vector<trainer::ValueRow> values = trainer::GroupValues(group);
+      const auto changed = std::count_if(values.begin(), values.end(),
+                                         [](const trainer::ValueRow& v) { return v.changed; });
+      action(group,
+             std::to_string(values.size()) + " values" +
+                 (changed ? ", " + std::to_string(changed) + " changed" : std::string()),
+             changed ? std::to_string(changed) + " changed  >" : ">",
+             [group] { s_group = group; }, !locked && trainer::Ready());
     }
   };
   return page;
