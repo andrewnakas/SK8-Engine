@@ -15,6 +15,9 @@
 // afterwards, and a preset derived from the hardware does that without ever
 // having been asked for. Naming one here is a request, made once.
 
+#include <filesystem>
+#include <string_view>
+
 namespace skate3 {
 
 // Apply skate3_performance_profile if it names a preset. Does nothing when it
@@ -22,3 +25,27 @@ namespace skate3 {
 void ApplyRequestedPerformanceProfile();
 
 }  // namespace skate3
+
+// First-run hardware detection, from the desktop branch: a Steam Deck or a
+// machine with no discrete GPU starts on the Performance preset.
+namespace skate3::perf {
+
+enum class Profile { kDesktop, kHandheld };
+Profile DetectProfile();
+std::string_view ProfileName(Profile profile);
+
+enum class DeckModel { kNotDeck, kLcd, kOled };
+DeckModel DetectSteamDeckModel();
+
+// On a Steam Deck, apply the Performance preset and the panel's refresh cap
+// once, leaving a marker beside the settings. Returns whether it ran.
+bool ApplyDeckDefaultsOnce(const std::filesystem::path& user_data_root);
+
+// Apply skate3_performance_profile when it names a preset; on a first run
+// with none named, pick one from the hardware. Returns whether one applied.
+bool ApplyRequestedProfile(bool first_run);
+
+// Apply a preset as soon as skate3_performance_profile changes.
+void InstallLiveProfileSwitch();
+
+}  // namespace skate3::perf

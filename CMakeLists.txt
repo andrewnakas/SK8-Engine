@@ -128,7 +128,13 @@ option(SKATE3_ENABLE_X86_64_V3
 
 if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
     if(SKATE3_ENABLE_X86_64_V3)
-        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        # MSVC FIRST, and that includes clang-cl: clang-cl reports its compiler
+        # id as "Clang" while driving an MSVC-style command line, so testing
+        # Clang before MSVC would hand it -march=, which its cl driver does not
+        # accept. Only the GCC-style drivers reach the branch below.
+        if(MSVC)
+            add_compile_options(/arch:AVX2)
+        elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
             add_compile_options(-march=x86-64-v3)
             set(SNAPPY_REQUIRE_AVX2 ON CACHE BOOL
                 "Match Snappy feature detection to the project x86-64-v3 target" FORCE)
@@ -138,11 +144,11 @@ if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
                 "x86-64-v3 requires SSE4.2 CRC32; Snappy checks do not see directory compile options" FORCE)
             set(SNAPPY_HAVE_BMI2 1 CACHE INTERNAL
                 "x86-64-v3 requires BMI2; Snappy checks do not see directory compile options" FORCE)
-        elseif(MSVC)
-            add_compile_options(/arch:AVX2)
         endif()
     else()
-        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        # The baseline: no arch flag on MSVC/clang-cl, whose default target is
+        # already plain x86-64 (SSE2), matching -march=x86-64 here.
+        if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
             add_compile_options(-march=x86-64 -mtune=generic -mssse3)
         endif()
         set(SNAPPY_REQUIRE_AVX OFF CACHE BOOL
@@ -304,6 +310,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_alloc_counter.cpp
     src/skate3_diagnostics.cpp
     src/skate3_diagnostics_report.cpp
+    src/skate3_dlc_trace.cpp
     src/skate3_draw_distance.cpp
     src/skate3_fov.cpp
     src/skate3_guest_trace.cpp

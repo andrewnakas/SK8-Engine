@@ -634,6 +634,22 @@ bool FreecamGuestPose(float out_pos[3]);
 // context reports true (the conservative side).
 bool LoadingOrFrontendActive();
 
+// Re-arm the native takeover for a map change that never passed through a
+// LOADING presence context.
+//
+// The gate normally re-arms when presence enters loading, which is what the
+// menu route does: gameplay -> loading -> gameplay. A world load INDUCED from
+// gameplay (skate3_warp_induce_load) never leaves gameplay, so the gate stays
+// disarmed from the boot takeover and the new world - fully streamed and
+// prewarmed, "0 still queued" - is rendered by nobody. Measured: 3565 of 3988
+// meshes decoded and a black screen.
+void ArmTakeoverForInducedLoad();
+
+// Drop everything held from the map being left, at the START of an induced map
+// change. Guest arena addresses are reused across loads, so anything keyed by
+// one is stale the moment a new world streams in.
+void BeginInducedMapChange();
+
 // Sentinel for "the frontend stack is empty, or has not been read yet".
 constexpr uint32_t kFrontEndStackEmpty = 0xFFFFFFFFu;
 

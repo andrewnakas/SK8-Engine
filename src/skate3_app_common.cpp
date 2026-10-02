@@ -14,6 +14,7 @@
 
 #include "skate3_demo_path.h"
 #include "skate3_diagnostics.h"
+#include "skate3_dlc_trace.h"
 #include "skate3_fov.h"
 #include "skate3_guest_trace.h"
 #include "skate3_iso_installer.h"
@@ -194,6 +195,13 @@ REXCVAR_DEFINE_STRING(skate3_dlc_root, "", "Skate 3",
                       "Directory containing Skate 3 DLC package files");
 REXCVAR_DEFINE_BOOL(skate3_auto_install_dlc, true, "Skate 3",
                     "Install DLC package files found in configured DLC folders");
+REXCVAR_DEFINE_BOOL(skate3_hide_cursor_in_game, true, "Skate 3",
+                    "Keep the mouse pointer off the screen during gameplay. The pointer was only "
+                    "AUTO-hidden, which reveals it on every scrap of mouse motion and hides it "
+                    "again a moment later - fine with a mouse sitting still, useless on a Steam "
+                    "Deck, where a trackpad in mouse mode moves the pointer continuously and so "
+                    "parks it permanently on screen. Set false for the old auto-hide behaviour. "
+                    "The settings screen always shows the pointer regardless of this.");
 REXCVAR_DEFINE_BOOL(skate3_ultrawide, false, "Skate 3",
                     "Ultrawide display support: the native renderer draws true widescreen "
                     "frames at the host display aspect (requires the native renderer; the "
@@ -577,20 +585,42 @@ void ApplyFirstRunVideoDefaults(const std::filesystem::path& settings_path,
     return;
   }
 
+  // Was a bare resolution_scale = 2 for every machine. That is a desktop
+  // discrete GPU's default: it renders the world at twice the window and, with
+  // the effect defaults on top, an integrated GPU at 1280x800 gets 7 fps
+  // measured. The preset picks the whole bundle from the hardware instead, and
+  // still only ever sets FIRST-RUN defaults.
   const auto scale = std::to_string(kDefaultResolutionScale);
   rex::cvar::SetFlagByName("resolution_scale", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_x", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_y", scale);
+  skate3::perf::ApplyRequestedProfile(/*first_run=*/true);
 }
 
 void LoadAndNormalizeSimpleSettings(const std::filesystem::path& settings_path,
                                     const std::filesystem::path& developer_config_path) {
   if (std::filesystem::exists(settings_path)) {
     rex::cvar::LoadConfig(settings_path);
+    // An explicitly named preset beats the saved settings; "auto" does not,
+    // so a player's own choices survive every launch after the first.
+    skate3::perf::ApplyRequestedProfile(/*first_run=*/false);
   } else {
     ApplyFirstRunVideoDefaults(settings_path, developer_config_path);
   }
   rex::ui::EnsureSimpleSettingsConfig(settings_path);
+
+  // A Deck that has run the game before already has a settings.toml, so the
+  // first-run path above never fires for it and it keeps a desktop's preset.
+  // This catches exactly that case, once per machine.
+  if (skate3::perf::ApplyDeckDefaultsOnce(settings_path.parent_path())) {
+    // Write the applied preset through to disk. Without this the marker file
+    // records "the handheld preset was applied" while settings.toml still
+    // holds the old values - so the preset is live for exactly one session,
+    // the next launch loads the old settings back, and the marker makes sure
+    // it never applies again. The Deck silently ends up on a desktop's
+    // settings forever.
+    rex::ui::SaveSimpleSettingsConfig(settings_path);
+  }
 }
 
 // True if the path sits inside the application bundle. On iOS that is
@@ -726,33 +756,6 @@ const char* FirstExistingFontPath(std::initializer_list<const char*> paths) {
   return nullptr;
 }
 
-std::string Hex8(uint32_t value) {
-  std::ostringstream stream;
-  stream << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
-  return stream.str();
-}
-
-std::filesystem::path InstalledMarketplaceContentPath(const std::filesystem::path& content_root,
-                                                      uint32_t title_id,
-                                                      const std::filesystem::path& package_path) {
-  return content_root / "0000000000000000" / Hex8(title_id) / "00000002" /
-         package_path.filename();
-}
-
-std::filesystem::path InstalledMarketplaceHeaderPath(const std::filesystem::path& content_root,
-                                                     uint32_t title_id,
-                                                     const std::filesystem::path& package_path) {
-  return content_root / "0000000000000000" / Hex8(title_id) / "Headers" / "00000002" /
-         (package_path.filename().string() + ".header");
-}
-
-bool IsInstalledMarketplaceContent(const std::filesystem::path& content_root, uint32_t title_id,
-                                   const std::filesystem::path& package_path) {
-  return std::filesystem::is_directory(
-             InstalledMarketplaceContentPath(content_root, title_id, package_path)) &&
-         std::filesystem::is_regular_file(
-             InstalledMarketplaceHeaderPath(content_root, title_id, package_path));
-}
 
 std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
     const std::filesystem::path& executable_root, const std::filesystem::path& game_data_root,
@@ -826,6 +829,7 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   ConfigureSkate3UserPaths(paths, user_settings_path_, profiles_path_);
   config_path_ = paths.config_path;
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
+  skate3::perf::InstallLiveProfileSwitch();
   Skate3InitializeFieldOfViewOverride();
   ApplyUltrawideVideoDefaults();
   DisableActiveDebugDiagnostics();
@@ -1251,13 +1255,17 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
       level_select_dialog_->Toggle();
     }
   });
-  rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings", [this] {
-    // Escape backs out of the settings screen level by level (rows ->
-    // category rail -> closed); when the screen is closed it opens it.
+  rex::ui::RegisterBind("bind_skate3_menu", "Escape", "Skate 3 settings (close only)", [this] {
+    // Escape CLOSES the settings screen, level by level (rows -> category rail
+    // -> closed). It deliberately does not open it.
+    //
+    // The controller chord is the only way in - Back+Start, i.e. Select+Start.
+    // One entrance means one thing to explain and one thing that can fire by
+    // accident, and on a handheld there is no keyboard to press Escape on
+    // anyway. Escape still works as "back" because a player who opened the
+    // screen needs a way out that is not the same chord.
     if (simple_settings_dialog_ && simple_settings_dialog_->visible()) {
       simple_settings_dialog_->NavigateBack();
-    } else {
-      ToggleSimpleSettings();
     }
   });
   rex::ui::RegisterBind("bind_skate3_menu_alt", "F1", "Skate 3 settings alternate", [this] {
@@ -1485,7 +1493,6 @@ void Skate3BaseApp::OnPostSetup() {
       REXLOG_INFO("Skate 3 saves: using portable folder {}", portable_saves.string());
     }
   }
-  InstallDlcPackages();
   InstallRecipeOverlay();
 
   // Register retail multi-entry-function alternate entries.
@@ -1496,6 +1503,8 @@ void Skate3BaseApp::OnPostSetup() {
   auto* dispatcher = runtime()->function_dispatcher();
   skate3::native_render::Install();
   skate3::demo_path::InstallHooks(dispatcher);
+  // Diagnostic only, and gated on its own cvar inside.
+  skate3::dlc_trace::InstallHooks(dispatcher);
   // Guest call trace: no-op unless --skate3_trace=true. Installed after the
   // demo path because its controller reads that macro's progress milestones.
   skate3::guest_trace::Install();
@@ -1528,6 +1537,16 @@ void Skate3BaseApp::OnPostSetup() {
   }
 }
 
+void Skate3BaseApp::OnPreLaunchModule() {
+  // Deliberately here rather than in OnPostSetup, where the DLC install used
+  // to live. The add-on picker is a dialog the player drives, so it needs the
+  // app's event loop to be running; OnPostSetup runs inside OnInitialize,
+  // before that loop starts, while LaunchModule defers this step onto the UI
+  // thread once it is. The guest still has not started either way, so the
+  // choice is made before anything can enumerate content.
+  InstallDlcPackages();
+}
+
 void Skate3BaseApp::OnShutdown() {
   // Timed, because "quitting takes five to ten seconds" is a real report and
   // nothing in the log said which part of it did. One line at the end naming
@@ -1535,7 +1554,6 @@ void Skate3BaseApp::OnShutdown() {
   // to reproduce it with a stopwatch.
   const auto shutdown_began = std::chrono::steady_clock::now();
   rex::ui::UnregisterBind("bind_skate3_menu");
-  rex::ui::UnregisterBind("bind_skate3_menu_alt");
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
   rex::ui::UnregisterBind("bind_skate3_log_debug_marker");
   rex::ui::UnregisterBind("bind_skate3_log_user_marker");
@@ -1783,7 +1801,13 @@ void Skate3BaseApp::ApplySettingsCursorMode() {
 
 void Skate3BaseApp::ApplyGameplayCursorMode() {
   if (window()) {
-    window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kAutoHidden);
+    // kAutoHidden un-hides on any mouse motion and re-hides on a timer, which
+    // is the wrong shape for a handheld: a Steam Deck trackpad left in mouse
+    // mode emits motion the whole time a thumb rests on it, so the pointer
+    // never gets to the "hidden" half of that cycle. kHidden has no timer.
+    window()->SetCursorVisibility(REXCVAR_GET(skate3_hide_cursor_in_game)
+                                      ? rex::ui::Window::CursorVisibility::kHidden
+                                      : rex::ui::Window::CursorVisibility::kAutoHidden);
   }
 }
 
@@ -2104,6 +2128,16 @@ void Skate3BaseApp::InstallBigDeviceAliases() {
       "big:", "\\Device\\Harddisk0\\Partition1");
   runtime()->file_system()->RegisterSymbolicLink(
       "dlcbig:", "\\Device\\Harddisk0\\Partition1");
+  // After it notices content it has not seen before, the game restarts itself
+  // by name and asks the disc for the RETAIL executable, sk83_na_f.xex. That
+  // file does not exist in a recomp install - the entry point is default.xex -
+  // so the open fails and the title exits immediately after the content scan,
+  // which reads as "the game quits as soon as I add a map". Alias the retail
+  // name onto the real entry point; the VFS resolves symlinks by prefix, so
+  // this redirects exactly that one file and nothing else.
+  runtime()->file_system()->RegisterSymbolicLink(
+      "\\Device\\Harddisk0\\Partition1\\sk83_na_f.xex",
+      "\\Device\\Harddisk0\\Partition1\\default.xex");
   big_device_aliases_installed_ = true;
 }
 
@@ -2707,12 +2741,6 @@ void Skate3BaseApp::InstallDlcPackages() {
     return;
   }
 
-  const uint32_t title_id = runtime()->kernel_state()->title_id();
-  if (title_id == 0) {
-    REXLOG_WARN("Skipping Skate 3 DLC install; title ID is not available");
-    return;
-  }
-
   const auto user_dlc_root = runtime()->user_data_root() / std::string(kDlcDirectoryName);
   std::error_code create_ec;
   std::filesystem::create_directories(user_dlc_root, create_ec);
@@ -2724,9 +2752,6 @@ void Skate3BaseApp::InstallDlcPackages() {
   const auto source_dirs =
       DiscoverDlcSourceDirectories(rex::filesystem::GetAppRootFolder(),
                                    runtime()->game_data_root(), runtime()->user_data_root());
-  std::unordered_set<std::string> seen_packages;
-  size_t installed_count = 0;
-  size_t skipped_count = 0;
 
   for (const auto& source_dir : source_dirs) {
     if (!std::filesystem::is_directory(source_dir)) {

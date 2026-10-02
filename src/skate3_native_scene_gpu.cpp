@@ -187,6 +187,8 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_tex_store_mb);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_budget_ms);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_min_items);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_mesh);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_log);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_verbose);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_2d);
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
@@ -952,6 +954,57 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     }
     ib_payload = ib_scratch.data();
   }
+  // Index range guard. A mesh whose indices address past its own vertex
+  // buffer is reading the wrong memory (New San Van: the resolved IB/VB
+  // addresses of two whole arenas land in the arena's main block, while
+  // the converted pack itself is clean), and drawing it throws spikes
+  // across the map. Reject it; the draw path retries on later frames, so
+  // if the addresses are only transiently wrong it decodes once they
+  // settle - the "recovered" line below says which case it is.
+  static std::mutex s_badidx_mutex;
+  static std::unordered_set<uint32_t> s_badidx_meshes;
+  if (!item.cloth_quads) {
+    const uint16_t* src_ib = reinterpret_cast<const uint16_t*>(ib_payload);
+    uint32_t bad = 0, max_idx = 0;
+    const DrawEntry whole{4, 0, 0, item.ib_count};
+    const std::vector<DrawEntry> whole_list{whole};
+    for (const DrawEntry& de : item.draws.empty() ? whole_list : item.draws) {
+      if (uint64_t(de.start_index) + de.index_count > item.ib_count) {
+        ++bad;
+        continue;
+      }
+      for (uint32_t i = 0; i < de.index_count; ++i) {
+        const uint32_t a = uint32_t(SwapU16(src_ib[de.start_index + i])) + de.base_vertex;
+        max_idx = std::max(max_idx, a);
+        bad += a >= num_verts;
+      }
+    }
+    if (bad != 0) {
+      bool first;
+      {
+        std::lock_guard<std::mutex> lock(s_badidx_mutex);
+        first = s_badidx_meshes.insert(item.mesh).second;
+      }
+      static std::atomic<uint32_t> s_logs{0};
+      if (first && s_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+        REXLOG_WARN(
+            "native-scene: mesh {:08X} rejected: {} indices past {} verts (max {}) "
+            "vb_obj {:08X} vb {:08X} ib_obj {:08X} ib {:08X} ib_count {}",
+            item.mesh, bad, num_verts, max_idx, item.vb_obj, item.vb_addr, item.ib_obj,
+            item.ib_addr, item.ib_count);
+      }
+      return false;
+    }
+    bool recovered = false;
+    {
+      std::lock_guard<std::mutex> lock(s_badidx_mutex);
+      recovered = s_badidx_meshes.erase(item.mesh) != 0;
+    }
+    if (recovered) {
+      REXLOG_WARN("native-scene: mesh {:08X} recovered: vb {:08X} ib {:08X} now in range",
+                  item.mesh, item.vb_addr, item.ib_addr);
+    }
+  }
   nrhi::Buffer* vb = AcquireMeshUploadBuffer(device, size_t(num_verts) * 56);
   nrhi::Buffer* ib = AcquireMeshUploadBuffer(device, size_t(item.ib_count) * 2);
   if (!vb || !ib) {
@@ -1304,7 +1357,11 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
           item.mesh, min_bi, max_bi, palette_bones);
     }
   }
-  if (garbage != 0) {
+  // Capped: one malformed mesh streams in repeatedly and would otherwise
+  // print this every time it is decoded. The first few are the diagnostic;
+  // the rest are noise.
+  static std::atomic<uint32_t> s_bbox_logs{0};
+  if (garbage != 0 && s_bbox_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
     REXLOG_WARN(
         "native-scene: mesh {:08X} decoded {} of {} verts outside bbox "
         "({:.1f},{:.1f},{:.1f})..({:.1f},{:.1f},{:.1f}) fmt {} stride {} vb {:08X}",
@@ -2404,7 +2461,7 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
       if (total_blocks >= 32 && (guard_zeroed * 4 >= total_blocks ||
                                  zero_samples >= 12)) {
         static std::atomic<uint32_t> s_mip_diag{0};
-        if (s_mip_diag.fetch_add(1, std::memory_order_relaxed) < 24) {
+        if (REXCVAR_GET(skate3_native_render_scene_verbose) && s_mip_diag.fetch_add(1, std::memory_order_relaxed) < 24) {
           REXLOG_INFO(
               "native-scene: MIP DIAG {}x{} mip {}/{} zero_samples={}/32 "
               "guard_zeroed={}/{} ox={} oy={} pitch_b={} size={} min={} "
@@ -5553,6 +5610,35 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   g_prewarm_out.push_back(std::move(res));
 }
 
+// Everything held from the map being left. Arena addresses are REUSED across
+// map loads, so anything keyed by guest address outlives its meaning the moment
+// a new world streams into the same arena.
+//
+// Called on entering the loading presence context, and by the induced map
+// change (skate3_warp_request_world), which never enters that context. Missing
+// it there was visible as texture decodes whose fetch words were plainly
+// file-path text - the renderer reading descriptors out of memory the guest had
+// already handed to the streamer - and as a world that arrived with untextured
+// ground and missing props.
+void DropOutgoingMapState() {
+  // Let the next load's registrations re-queue meshes (and re-stage textures)
+  // at reused addresses, and drop the cached item cores built from them.
+  ClearItemCache();
+  // Off-screen retention holds guest-address-keyed copies too.
+  g_retained_clear.store(true, std::memory_order_relaxed);
+  // The static-caster cache holds world-positioned records from the OUTGOING
+  // map; different maps share coordinate ranges, so stale records whose meshes
+  // survive the transition would keep casting (an entire arriving area sat
+  // under the previous map's building shadows). Invalidate the sun map with it.
+  g_r.static_casters.clear();
+  g_r.nsm_dirty = true;
+  g_r.static_sun_valid = false;
+  g_r.nsm_built_radius = 0.0f;
+  std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+  g_prewarm_seen.clear();
+  g_prewarm_tex_seen.clear();
+}
+
 void PrewarmWorkerLoop() {
 #if defined(__SWITCH__)
   // Horizon has no nice(), and no priority lever an unprivileged process can
@@ -6280,24 +6366,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
           "native-scene: menus/loading - {} (presence context)",
           loading_native ? "rendering the loading screen NATIVELY"
                          : "yielding to emulated output");
-      // Arena addresses are reused across map loads: let the next load's
-      // registrations re-queue meshes (and re-stage textures) at reused
-      // addresses, and drop the cached item cores built from them.
-      ClearItemCache();
-      // Off-screen retention holds guest-address-keyed copies too.
-      g_retained_clear.store(true, std::memory_order_relaxed);
-      // The static-caster cache holds world-positioned records from the
-      // OUTGOING map; different maps share coordinate ranges, so stale
-      // records whose meshes survive the transition would keep casting
-      // (an entire arriving area sat under the previous map's building
-      // shadows). Invalidate the sun map with it.
-      g_r.static_casters.clear();
-      g_r.nsm_dirty = true;
-      g_r.static_sun_valid = false;
-      g_r.nsm_built_radius = 0.0f;
-      std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-      g_prewarm_seen.clear();
-      g_prewarm_tex_seen.clear();
+      DropOutgoingMapState();
     } else {
       size_t queued = 0;
       {
@@ -10044,7 +10113,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           // on one key = streaming oscillation, visible as texture flicker
           // on the affected meshes.
           static std::atomic<uint32_t> s_redecode_logs{0};
-          if (s_redecode_logs.fetch_add(1) < 256) {
+          if (REXCVAR_GET(skate3_native_render_scene_tex_log) &&
+              s_redecode_logs.fetch_add(1) < 256) {
             REXLOG_INFO(
                 "native-scene: texture re-decode key={:016X} reason={}{}{} "
                 "words=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
@@ -10095,7 +10165,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                       frame_number, slot, tex_ptr);
         }
         static std::atomic<uint32_t> s_nb_logs{0};
-        if (s_nb_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+        if (REXCVAR_GET(skate3_native_render_scene_tex_log) &&
+            s_nb_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
           REXLOG_INFO(
               "native-scene: near-black decode obj={:08X} slot={} served as "
               "white fallback (mid-compose/stream content)",
@@ -13120,6 +13191,40 @@ void Install() {
               SceneEnabled() ? "on" : "off");
 }
 
+// Re-arm the native takeover for a map change that never entered LOADING.
+//
+// The gate re-arms when the presence context enters loading - the menu route,
+// gameplay -> loading -> gameplay. A world load INDUCED from gameplay
+// (skate3_warp_induce_load) never leaves gameplay, so the gate stays disarmed
+// from the boot takeover and the new world is rendered by nobody even though it
+// streamed and prewarmed completely. Measured before this existed: 3565 of 3988
+// meshes decoded, "0 still queued", and a black screen.
+// The other half: drop the outgoing map's state at the START of an induced
+// change, the way entering the loading context does. Arming and resetting have
+// to be separate here - the presence route can do both at once because g_scene
+// stops publishing behind the loading screen, whereas an induced change keeps
+// rendering gameplay throughout, so an arm taken at the start is spent on the
+// teardown's own generation bump.
+void BeginInducedMapChange() {
+  REXLOG_INFO("native-scene: dropping the outgoing map's cached state for an induced change");
+  DropOutgoingMapState();
+  // NOT armed here, twice measured: the outgoing world is still fully resident
+  // at this point, so the very next frame is a big fresh scene and the arm is
+  // spent on it 8 ms later - "taking over natively (787 items)" while the new
+  // world had not started loading. The arm belongs at the far end of the
+  // change, where the scene being built is the new world's.
+}
+
+void ArmTakeoverForInducedLoad() {
+  g_warmup_armed.store(true, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(g_scene_mutex);
+    g_warmup_fresh_generation = (g_scene ? g_scene->generation : 0) + 1;
+  }
+  REXLOG_INFO("native-scene: takeover re-armed for an induced load (fresh generation {})",
+              g_warmup_fresh_generation);
+}
+
 }  // namespace skate3::native_scene
 
 namespace skate3::mp_host_assets {
@@ -13160,6 +13265,9 @@ namespace skate3::native_scene {
 void Install() {}
 bool SceneFailed() { return false; }
 void ResetSceneFailure() {}
+void ArmTakeoverForInducedLoad() {}
+void BeginInducedMapChange() {}
+
 }  // namespace skate3::native_scene
 
 namespace skate3::mp_host_assets {

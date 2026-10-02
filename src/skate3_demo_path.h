@@ -32,6 +32,12 @@ bool ShouldSkipIntroMovieEarly();
 // selector to drive the pause menu the same way the boot macro does.
 bool RunGameplayInputs(const std::string& sequence, int32_t settle_ms);
 
+// Press START until the frontend stack actually shows the pause root, rather
+// than pressing once and hoping. The gameplay presence context flips BEFORE
+// the game will take input, and how long before varies per map, so no fixed
+// wait is correct. Degrades to a single press when the stack is unreadable.
+bool PressStartUntilPaused(int32_t attempts, int32_t wait_ms);
+
 int32_t GameplayInputsInjected();
 int32_t GameplayInputsTotal();
 bool GameplayInputSequenceComplete();
