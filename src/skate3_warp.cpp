@@ -15,6 +15,7 @@
 //     spent days on: nothing is called from a state the game did not choose.
 
 #include "skate3_warp.h"
+#include "skate3_mp_hooks.h"
 
 #include "skate3_native_scene.h"
 
@@ -22,6 +23,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -1877,6 +1879,17 @@ extern "C" REX_FUNC(sub_828A3928) {
               skate3::warp::LoadGuestU64BE(base, ctx.r3.u32 + 2200),
               skate3::warp::LoadGuestU64BE(base, 0x830B7AE8 + 48));
   skate3::guest_trace::LogHostBacktrace("map-change sub_828A3928");
+  if (const auto intercept = skate3::mp::Get().intercept_map_change) {
+    float position[3];
+    for (int i = 0; i < 3; ++i) {
+      position[i] = std::bit_cast<float>(skate3::warp::LoadGuestU32BE(base, v + 4 * i));
+    }
+    if (intercept(position)) {
+      REXLOG_INFO("skate3 warp entry: map change skipped (the multiplayer module moves the "
+                  "skater instead)");
+      return;
+    }
+  }
   __imp__sub_828A3928(ctx, base);
 }
 

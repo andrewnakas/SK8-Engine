@@ -45,6 +45,11 @@ struct Hooks {
   // Once the guest function table exists, before the game runs: the module
   // swaps in its own runtime hooks (retail script bindings). App thread.
   void (*on_dispatcher_ready)(rex::runtime::FunctionDispatcher* dispatcher) = nullptr;
+  // Guest thread, as a map change is kicked off (sub_828A3928, spawning at
+  // `position`). Return true to skip it: the module moves the skater itself
+  // (a retail challenge's own location change reloads the world, and with it
+  // every script, mid-challenge).
+  bool (*intercept_map_change)(const float position[3]) = nullptr;
 };
 
 void Register(const Hooks& hooks);
