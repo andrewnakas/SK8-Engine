@@ -6,6 +6,7 @@
 
 #include "skate3_alloc_counter.h"
 #include "skate3_native_scene.h"
+#include "skate3_spectator_camera.h"
 
 #include "generated/skate3_init.h"
 
@@ -7151,6 +7152,98 @@ bool UpdateFreecam(FrameScene& scene, const float cam_view[16], double now) {
   return true;
 }
 
+// Spectator camera (skate3_spectator_camera.h): a look-at pose handed in by
+// the multiplayer module (watching another player's turn). Published and
+// handed to the guest-camera takeover exactly like the drone's flown pose.
+std::mutex g_spectator_mutex;
+bool g_spectator_set = false;
+float g_spectator_eye[3] = {};
+float g_spectator_target[3] = {};
+struct SpectatorState {
+  bool engaged = false;
+  float sign_right = 1.0f, sign_up = 1.0f;
+};
+SpectatorState g_spectator;
+
+// Guest render thread only, after UpdateFreecam (which wins while engaged).
+// Returns true while the spectator pose is in control.
+bool UpdateSpectatorCam(FrameScene& scene, const float cam_view[16], bool freecam) {
+  SpectatorState& sc = g_spectator;
+  float eye[3], target[3];
+  bool set;
+  {
+    std::lock_guard<std::mutex> lock(g_spectator_mutex);
+    set = g_spectator_set;
+    std::memcpy(eye, g_spectator_eye, sizeof(eye));
+    std::memcpy(target, g_spectator_target, sizeof(target));
+  }
+  if (!set || freecam) {
+    if (sc.engaged) {
+      sc.engaged = false;
+      if (!freecam) {
+        g_freecam_guest_active.store(0, std::memory_order_release);
+      }
+      REXLOG_INFO("native-scene spectator: off (guest camera restored)");
+    }
+    return false;
+  }
+  float f[3] = {target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]};
+  const float flen = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+  const float hlen = std::sqrt(f[0] * f[0] + f[2] * f[2]);
+  if (!(flen > 1e-3f) || !(hlen > 1e-3f * flen) || !std::isfinite(flen)) {
+    return sc.engaged;  // degenerate this frame: keep the last published pose
+  }
+  for (float& v : f) v /= flen;
+  if (!sc.engaged) {
+    // Basis signs from the live guest view, as the drone resolves them at
+    // engage (columns 0/1/2 = right/up/forward in world space).
+    const float f0[3] = {cam_view[2], cam_view[6], cam_view[10]};
+    sc.sign_right = f0[2] * cam_view[0] - f0[0] * cam_view[8] >= 0.0f ? 1.0f : -1.0f;
+    const float r0[3] = {f0[2] * sc.sign_right, 0.0f, -f0[0] * sc.sign_right};
+    const float u0[3] = {f0[1] * r0[2] - f0[2] * r0[1], f0[2] * r0[0] - f0[0] * r0[2],
+                         f0[0] * r0[1] - f0[1] * r0[0]};
+    sc.sign_up = u0[0] * cam_view[1] + u0[1] * cam_view[5] + u0[2] * cam_view[9] >= 0.0f
+                     ? 1.0f
+                     : -1.0f;
+    sc.engaged = true;
+    REXLOG_INFO("native-scene spectator: ENGAGED at ({:.1f}, {:.1f}, {:.1f})", eye[0],
+                eye[1], eye[2]);
+  }
+  const float hl = std::sqrt(f[0] * f[0] + f[2] * f[2]);
+  const float right[3] = {f[2] / hl * sc.sign_right, 0.0f, -f[0] / hl * sc.sign_right};
+  const float up[3] = {(f[1] * right[2] - f[2] * right[1]) * sc.sign_up,
+                       (f[2] * right[0] - f[0] * right[2]) * sc.sign_up,
+                       (f[0] * right[1] - f[1] * right[0]) * sc.sign_up};
+  float view[16] = {};
+  for (int i = 0; i < 3; ++i) {
+    view[i * 4 + 0] = right[i];
+    view[i * 4 + 1] = up[i];
+    view[i * 4 + 2] = f[i];
+  }
+  for (int k = 0; k < 3; ++k) {
+    view[12 + k] = -(eye[0] * view[0 * 4 + k] + eye[1] * view[1 * 4 + k] +
+                     eye[2] * view[2 * 4 + k]);
+  }
+  view[15] = 1.0f;
+  {
+    std::lock_guard<std::mutex> lock(g_freecam_guest_mutex);
+    std::memcpy(g_freecam_guest_view, view, sizeof(view));
+    std::memcpy(g_freecam_guest_pos, eye, sizeof(eye));
+  }
+  g_freecam_guest_active.store(1, std::memory_order_release);
+  for (int r = 0; r < 4; ++r) {
+    for (int col = 0; col < 4; ++col) {
+      float sum = 0.0f;
+      for (int k = 0; k < 4; ++k) {
+        sum += view[r * 4 + k] * scene.proj[k * 4 + col];
+      }
+      scene.view_proj[r * 4 + col] = sum;
+    }
+  }
+  std::memcpy(scene.cam_pos, eye, sizeof(eye));
+  return true;
+}
+
 // While the freecam is engaged, fills out_pos with the flown camera world
 // position and returns true. Consumed by the draw-distance hooks to
 // recenter the guest distance culls on the drone.
@@ -11039,8 +11132,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // wins while engaged. No draw-item union here; the SetViewMatrix
   // override hands the flown pose to the game, whose own culling then
   // submits exactly what the drone sees (statics AND animated entities).
-  UpdateFreecam(scene, cam_view,
-                std::chrono::duration<double>(build_t0.time_since_epoch()).count());
+  const bool freecam = UpdateFreecam(
+      scene, cam_view, std::chrono::duration<double>(build_t0.time_since_epoch()).count());
+  // Watching another player (multiplayer spectator camera), unless flying.
+  UpdateSpectatorCam(scene, cam_view, freecam);
 
   // Hor+ ultrawide: widen the published camera to the wide output aspect.
   // Applied after every camera override (smoothing, synthetic pan, freecam)
@@ -11507,6 +11602,18 @@ std::atomic<bool> g_ambient_npcs_suppressed{false};
 bool skate3::native_scene::AmbientNpcsEnabled() {
   return AmbientNpcsAtBoot() &&
          !g_ambient_npcs_suppressed.load(std::memory_order_relaxed);
+}
+
+void skate3::native_scene::SetSpectatorCamera(const float eye[3], const float target[3]) {
+  std::lock_guard<std::mutex> lock(g_spectator_mutex);
+  std::memcpy(g_spectator_eye, eye, 3 * sizeof(float));
+  std::memcpy(g_spectator_target, target, 3 * sizeof(float));
+  g_spectator_set = true;
+}
+
+void skate3::native_scene::ClearSpectatorCamera() {
+  std::lock_guard<std::mutex> lock(g_spectator_mutex);
+  g_spectator_set = false;
 }
 
 void skate3::native_scene::SetAmbientNpcsSuppressed(bool suppressed) {
