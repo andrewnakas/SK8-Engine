@@ -122,6 +122,12 @@ namespace {
 constexpr uint32_t kSysLockFn = 84;    // void (*)() - null on every build seen
 constexpr uint32_t kSysUnlockFn = 88;  // unused: we only ever take the critical section
 constexpr uint32_t kSysCritSec = 96;   // RTL_CRITICAL_SECTION*, the real lock
+// The command queue: records go to *(sys+48) + *(sys+204); 256000 bytes of
+// room (+200). No appender checks it - the drain (sub_82B48530, on the audio
+// thread) is what keeps it from filling.
+constexpr uint32_t kSysQueueCapacity = 200;
+constexpr uint32_t kSysQueueWrite = 204;
+constexpr uint32_t kQueueRecordMax = 64;   // largest record, with margin
 
 // PacketPlayer, from sub_82B28B78 (the SetFormat handler).
 constexpr uint32_t kPlayerSystem = 8;      // System*
@@ -408,11 +414,37 @@ inline uint32_t SysFromOwner16(uint8_t* base, uint32_t self) {
 // the override would silently not happen.
 namespace {
 
+std::atomic<uint64_t> g_queue_full{0};
+std::atomic<uint64_t> g_queue_high{0};
+
 void RunUnderSystemLock(PPCContext& __restrict ctx, uint8_t* base, uint32_t sys,
                         PPCFunc* original) {
   if (sys == 0) {
     original(ctx, base);
     return;
+  }
+  // The queue only drains while the audio clock runs. When it stopped (a
+  // stalled output device, a starved audio thread) the game kept appending
+  // until it wrote past the end: the System's own lock pointer, the voice
+  // lists, eventually other threads' stacks - every rw::audio crash in the
+  // reports. Dropping a command is a lost sound; overflowing is a crash.
+  const uint32_t capacity = REX_LOAD_U32(sys + kSysQueueCapacity);
+  const uint32_t write = REX_LOAD_U32(sys + kSysQueueWrite);
+  if (capacity != 0 && write + kQueueRecordMax > capacity) {
+    uint64_t n = 0;
+    if (ShouldLog(g_queue_full, &n)) {
+      REXLOG_ERROR("skate3-audio: the audio command queue is full ({} of {} bytes; the audio "
+                   "thread stopped draining it) - dropped command {}",
+                   write, capacity, n);
+    }
+    return;
+  }
+  if (capacity != 0 && write > capacity / 2) {
+    uint64_t n = 0;
+    if (ShouldLog(g_queue_high, &n)) {
+      REXLOG_WARN("skate3-audio: audio command queue at {} of {} bytes (occurrence {})", write,
+                  capacity, n);
+    }
   }
   const VolatileState saved(ctx);
   const bool locked = SystemTryLock(ctx, base, sys);
