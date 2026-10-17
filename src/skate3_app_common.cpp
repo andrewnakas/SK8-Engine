@@ -93,6 +93,7 @@ REXCVAR_DEFINE_STRING(skate3_content_pack, "", "Skate 3",
 #include "skate3_touch_controls.h"
 #include "skate3_native_scene.h"
 #include "skate3_crash_report.h"
+#include "skate3_audio_shadow.h"
 #include "skate3_image_watch.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
@@ -1453,6 +1454,9 @@ void Skate3BaseApp::OnPostSetup() {
   // make its read-only pages read-only, so the first write to any of them is
   // caught with its writer (see skate3_image_watch.h).
   skate3::image_watch::Install();
+  // Also before the guest: the audio command queue is enlarged the moment the
+  // game constructs it (skate3_audio_fixes.cpp).
+  skate3::audio::StartQueueGrowth();
   // After the cvars are parsed, so a profile on the SD card can ask for it, and
   // before the guest starts, so the frames it buys are the ones being measured.
   // A no-op unless switch_overclock was set, and on every other platform.

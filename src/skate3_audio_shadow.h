@@ -51,4 +51,8 @@ bool ShadowCompare(PPCContext& ctx, uint8_t* base, PPCFunc* native, PPCFunc* lif
 /// Whether shadow comparison is armed (cvar-backed, read once).
 bool ShadowEnabled();
 
+// Before the guest starts: watch for rw::audio::core's System and give its
+// command queue room to fall behind (skate3_audio_fixes.cpp).
+void StartQueueGrowth();
+
 }  // namespace skate3::audio

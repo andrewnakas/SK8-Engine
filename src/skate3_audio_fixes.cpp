@@ -87,8 +87,11 @@
  *     really closed.
  */
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <thread>
 
@@ -96,7 +99,11 @@
 #include <rex/logging.h>
 
 #include "generated/skate3_init.h"
+#include "skate3_audio_shadow.h"
 #include "skate3_image_watch.h"
+
+#include <rex/runtime.h>
+#include <rex/system/xmemory.h>
 
 REXCVAR_DEFINE_BOOL(
     skate3_audio_repair_format_table, true, "Skate 3",
@@ -114,6 +121,13 @@ REXCVAR_DEFINE_BOOL(
     "again. What it buys is a device that gets past the frontend and can report "
     "what else is broken. Turn it off to see the failure unrepaired.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    skate3_audio_queue_kb, 2048, "Skate 3",
+    "Size of rw::audio::core's command queue, in KB (the game's own is 250). The queue "
+    "only drains when the audio thread runs; on a loaded device that thread falls behind "
+    "and a full queue overwrites the memory after it. 0 keeps the game's size.")
+    .range(0, 16384);
 
 namespace {
 
@@ -745,3 +759,86 @@ extern "C" REX_FUNC(sub_82B7F828) {
   }
   __imp__sub_82B7F828(ctx, base);
 }
+
+namespace skate3::audio {
+namespace {
+
+// The System singleton (sub_82B47E68 constructs it there) and its queue fields.
+constexpr uint32_t kSystemSingleton = 0x8307762C;
+constexpr uint32_t kQueueBuffer = 48;
+constexpr uint32_t kQueueCapacityField = 200;
+constexpr uint32_t kQueueWriteField = 204;
+constexpr uint32_t kGameQueueBytes = 0x3E800;
+
+using GuestMemory = rex::memory::Memory;
+
+uint32_t LoadBE(GuestMemory* memory, uint32_t addr) {
+  uint32_t v;
+  std::memcpy(&v, memory->TranslateVirtual<const uint8_t*>(addr), 4);
+  return __builtin_bswap32(v);
+}
+void StoreBE(GuestMemory* memory, uint32_t addr, uint32_t value) {
+  value = __builtin_bswap32(value);
+  std::memcpy(memory->TranslateVirtual<uint8_t*>(addr), &value, 4);
+}
+
+// The System, once its constructor has allocated the queue - whether the
+// singleton slot holds the object or a pointer to it.
+uint32_t ConstructedSystem(GuestMemory* memory) {
+  const uint32_t ptr = LoadBE(memory, kSystemSingleton);
+  for (const uint32_t sys : {ptr, kSystemSingleton}) {
+    if (sys < 0x40000000u || sys >= 0xA0000000u) {
+      continue;
+    }
+    if (LoadBE(memory, sys + kQueueCapacityField) == kGameQueueBytes &&
+        LoadBE(memory, sys + kQueueBuffer) != 0) {
+      return sys;
+    }
+  }
+  return 0;
+}
+
+}  // namespace
+
+// The queue is swapped the moment the constructor has filled it in, while the
+// audio system is still being set up and nothing appends yet: the game's ~140
+// appenders are inlined and take no lock, so later there is no safe moment.
+// The 250 KB buffer is left allocated. The new one is from the system heap;
+// the System lives for the whole run, so its destructor never frees it.
+void StartQueueGrowth() {
+  const int32_t kb = REXCVAR_GET(skate3_audio_queue_kb);
+  auto* runtime = rex::Runtime::instance();
+  if (kb <= 0 || uint32_t(kb) * 1024u <= kGameQueueBytes || !runtime || !runtime->memory()) {
+    return;
+  }
+  auto* memory = runtime->memory();
+  std::thread([memory, bytes = uint32_t(kb) * 1024u] {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+      const uint32_t sys = ConstructedSystem(memory);
+      if (sys == 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        continue;
+      }
+      const uint32_t old_buffer = LoadBE(memory, sys + kQueueBuffer);
+      const uint32_t write = LoadBE(memory, sys + kQueueWriteField);
+      const uint32_t grown = memory->SystemHeapAlloc(bytes, 0x20);
+      if (!grown) {
+        REXLOG_WARN("skate3-audio: no room for a {} KB audio command queue", bytes / 1024);
+        return;
+      }
+      std::memcpy(memory->TranslateVirtual<uint8_t*>(grown),
+                  memory->TranslateVirtual<const uint8_t*>(old_buffer),
+                  std::min(write, kGameQueueBytes));
+      StoreBE(memory, sys + kQueueBuffer, grown);
+      StoreBE(memory, sys + kQueueCapacityField, bytes);
+      REXLOG_INFO("skate3-audio: audio command queue {} -> {} KB at {:08X} (System {:08X}, "
+                  "{} bytes queued)",
+                  kGameQueueBytes / 1024, bytes / 1024, grown, sys, write);
+      return;
+    }
+    REXLOG_WARN("skate3-audio: never saw the audio System; its queue keeps the game's size");
+  }).detach();
+}
+
+}  // namespace skate3::audio
