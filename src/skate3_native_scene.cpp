@@ -721,10 +721,26 @@ REXCVAR_DEFINE_INT32(
     "unsafe screen was entered/left within the last 3 s (one-shot portrait "
     "RTT renders fire at those transitions), OR the CAS heartbeat is "
     "fresh, OR the stack is unreadable; everything unknown fails OPEN to "
-    "mode 0. Outside the window menus run the "
+    "mode 3 - except over a live world (pause and its sub-screens), where "
+    "only the portrait screens open it (see menu_rtt_live_unknown). "
+    "Outside the window menus run the "
     "gameplay-proven mode-2 suppression (lightmap pages + <= 512 "
     "composites still execute).")
     .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_menu_rtt_live_unknown, false, "Skate 3",
+    "Let an UNCLASSIFIED front-end screen (or an unreadable screen stack) "
+    "open the portrait window while the live world renders behind the menu "
+    "(pause, replay editor, settings, challenge lists). Off: there only the "
+    "portrait screens (63 team / Import Skater, 15 CAS, the CAS heartbeat) "
+    "open it; the CAS _nis shader heartbeat is ignored there too, since "
+    "replay-editor playback uses the same shaders. On is the old fail-open "
+    "rule: every world sub-framebuffer pass "
+    "then executes emulated each menu frame and their pipelines compile "
+    "synchronously - measured 12 fps and a 6.7 s freeze on opening the "
+    "pause menu on Mac. Turn on only if a pause-menu screen shows an empty "
+    "skater portrait box.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_menu_unsuppress, false, "Skate 3",
@@ -3925,13 +3941,33 @@ void LogFrontEndDebug(uint8_t* base, uint32_t mgr, const uint32_t* ids, uint32_t
   }
 }
 
-bool PortraitRttWindowActive() {
-  if (CasEditorHeartbeatFresh()) {
+bool PortraitRttWindowActive(bool over_live_world) {
+  // The _nis shader heartbeat is not CAS-only: replay-editor playback draws
+  // the skater with the same cac_*_nis shaders, so over a live world it held
+  // the window open for the editor's whole lifetime (measured on Mac: 7 fps,
+  // command processor 99% busy, vs 58 fps with the window closed). Pause-world
+  // CAS is [0,56,63,15], which the portrait-screen rule below already covers;
+  // the heartbeat stays for the menu-only entry points (startup new-game flow).
+  if (!over_live_world && CasEditorHeartbeatFresh()) {
     return true;
   }
+  // Over a LIVE world (the pause menu and everything pushed on it: replay
+  // editor, settings, challenge lists) the window is not cheap: the world
+  // keeps rendering behind the menu, so mode 3 executes every one of its
+  // sub-framebuffer passes (census 1200/800/640/600/560) each frame, and the
+  // synchronous compilation the window also forces compiles their pipelines -
+  // never built before, gameplay always suppresses them - all at once.
+  // Measured on Mac: an unclassified screen over the pause world held the
+  // command processor at 91% busy (322k executed draws per 30 s, 12 fps), and
+  // the window opening at pause entry froze the guest 6.7 s, long enough for
+  // the title's own D3D to report "The GPU is hung!". So over a live world
+  // only the screens that really render one-shot portraits open it (and the
+  // grace after leaving them); unknown screens and unreadable stacks fail
+  // CLOSED there. With no world behind (boot frontend, loading) the
+  // fail-open rules below are unchanged.
   uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
   if (base == nullptr) {
-    return true;
+    return !over_live_world;
   }
   constexpr uint32_t kFrontEndManagerPtr = 0x830CFE14;
   uint32_t mgr = 0, beg = 0, end = 0;
@@ -3939,16 +3975,17 @@ bool PortraitRttWindowActive() {
       !GuestTryLoadU32(base, mgr + 0x210, &beg) ||
       !GuestTryLoadU32(base, mgr + 0x214, &end) || beg > end ||
       end - beg > 20 * 16) {
-    return true;
+    return !over_live_world;
   }
   const uint32_t n = (end - beg) / 20;
   uint32_t ids[16] = {};
   bool unknown_screen = false;
+  bool portrait_screen = false;
   uint64_t sig = 1469598103934665603ull;
   for (uint32_t i = 0; i < n; ++i) {
     uint32_t f0 = 0;
     if (!GuestTryLoadU32(base, beg + i * 20, &f0)) {
-      return true;
+      return !over_live_world;
     }
     ids[i] = f0;
     sig = (sig ^ f0) * 1099511628211ull;
@@ -3965,7 +4002,16 @@ bool PortraitRttWindowActive() {
     if (f0 != 0 && f0 != 56 && f0 != 24 && f0 != 17 && f0 != 59) {
       unknown_screen = true;
     }
+    // The screens that render one-shot skater portraits: 63 = team (and the
+    // Import Skater flow pushed on it), 15 = CAS (the edit-skater flow is
+    // [0,56,63]->[0,56,63,15]).
+    if (f0 == 63 || f0 == 15) {
+      portrait_screen = true;
+    }
   }
+  // What opens the window: any unclassified screen with no world behind the
+  // menu, only a portrait screen over a live one (see the top).
+  const bool arming = over_live_world ? portrait_screen : unknown_screen;
   // Publish the top of the stack for the boot macro. It presses `start` a
   // fixed delay after the gameplay presence context and has no way to know the
   // press was taken; on some maps the game is not accepting input yet, the
@@ -3977,7 +4023,7 @@ bool PortraitRttWindowActive() {
   LogFrontEndDebug(base, mgr, ids, n, beg);
   static uint64_t s_last_sig = 0;
   static int64_t s_change_ns = -1;
-  static bool s_prev_unknown = false;
+  static bool s_prev_arming = false;
   const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
@@ -3988,10 +4034,10 @@ bool PortraitRttWindowActive() {
     // the tail after LEAVING one (the accepted-edit portrait re-render
     // fires as the editor pops). Safe<->safe transitions (pause <->
     // challenge map flapping) must not arm it.
-    if (unknown_screen || s_prev_unknown) {
+    if (arming || s_prev_arming) {
       s_change_ns = now_ns;
     }
-    s_prev_unknown = unknown_screen;
+    s_prev_arming = arming;
     static uint32_t s_logs = 0;
     if (s_logs < 64) {
       ++s_logs;
@@ -4002,14 +4048,18 @@ bool PortraitRttWindowActive() {
       }
       REXLOG_INFO(
           "native-scene: FE stack changed: [{}] (portrait window {}; "
-          "steady-safe = 0/56/24/17/59)",
-          buf, unknown_screen ? "OPEN - unclassified screen" : "steady");
+          "steady-safe = 0/56/24/17/59, portrait = 63/15{})",
+          buf,
+          arming ? (portrait_screen ? "OPEN - portrait screen" : "OPEN - unclassified screen")
+                 : (unknown_screen ? "closed - unclassified screen over the live world"
+                                   : "steady"),
+          over_live_world ? ", live world" : "");
     }
   }
   if (s_change_ns >= 0 && now_ns - s_change_ns < 3'000'000'000ll) {
     return true;
   }
-  return unknown_screen;
+  return arming;
 }
 
 void OnRenderStateUpload(uint64_t mask, uint32_t bank, uint32_t ptr) {

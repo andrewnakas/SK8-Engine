@@ -1163,7 +1163,8 @@ inline std::atomic<int64_t> g_cas_ps_last_ns{-1};
 bool GuestTryLoadU32(uint8_t* base, uint32_t addr, uint32_t* out);
 void ClearItemCache();
 bool CasEditorActive(uint8_t* base);
-bool PortraitRttWindowActive();
+// over_live_world: the pause world renders behind the menu (see the definition).
+bool PortraitRttWindowActive(bool over_live_world);
 // Parse a guest mesh struct into a DrawItem (prewarm decode workers build
 // items off the queue without a live capture).
 bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item);

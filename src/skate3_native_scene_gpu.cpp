@@ -172,6 +172,7 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_debug);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_detail_hold);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_hdr_debug);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_menu_rtt_scope);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_rtt_live_unknown);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_mesh_decode_budget);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_mesh_store_mb);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_msaa);
@@ -6268,7 +6269,9 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
     const bool want =
         in_menus && REXCVAR_GET(skate3_native_render_scene_menu_rtt_passes) &&
         (REXCVAR_GET(skate3_native_render_scene_menu_rtt_scope) == 0 ||
-         PortraitRttWindowActive());
+         PortraitRttWindowActive(
+             pause_native &&
+             !REXCVAR_GET(skate3_native_render_scene_menu_rtt_live_unknown)));
     // Mode 3, not 0: the portrait-class RTTs (census 560-1200 during the
     // window) execute, but the 1152-wide main scene + postfx band stays
     // suppressed; mode 0 ran the game's whole pipeline at scaled
