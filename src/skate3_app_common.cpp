@@ -3007,7 +3007,20 @@ void Skate3BaseApp::StageContentPacks() {
     const bool header_current =
         std::filesystem::exists(target_header, ec) &&
         std::filesystem::file_size(target_header, ec) == kXContentRecordSize + sizeof(uint32_t);
-    if (std::filesystem::exists(target_big, ec) && header_current) {
+    // The same package name says nothing about the bytes: a map re-downloaded
+    // or re-converted under its old name has to replace the staged copy, or
+    // the game keeps loading the previous build without a word. The staged
+    // copy is written after its source, so a source newer than it (or of
+    // another size) is a new build.
+    std::error_code size_ec, time_ec;
+    const bool big_current =
+        std::filesystem::exists(target_big, ec) &&
+        std::filesystem::file_size(target_big, size_ec) == std::filesystem::file_size(big, size_ec) &&
+        !size_ec &&
+        std::filesystem::last_write_time(target_big, time_ec) >=
+            std::filesystem::last_write_time(big, time_ec) &&
+        !time_ec;
+    if (big_current && header_current) {
       REXLOG_INFO("Skate 3 content pack '{}' already staged", package);
       ApplyContentPackWorkarounds(package);
       break;  // one per launch; others were cleared above
@@ -3016,7 +3029,7 @@ void Skate3BaseApp::StageContentPacks() {
     std::filesystem::create_directories(target_dir, ec);
     std::filesystem::create_directories(headers_dir, ec);
     std::error_code copy_ec;
-    if (!std::filesystem::exists(target_big, ec) && !CopyFileBytes(big, target_big, copy_ec)) {
+    if (!big_current && !CopyFileBytes(big, target_big, copy_ec)) {
       REXLOG_WARN("Could not stage '{}' content: {}", package, copy_ec.message());
       continue;
     }

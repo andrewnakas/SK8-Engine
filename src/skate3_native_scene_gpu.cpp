@@ -8968,6 +8968,26 @@ void AddGuestOcclSkipped(uint32_t n) {
 
 namespace {
 
+// The takeover gates' item floor (skate3_native_render_scene_warmup_min_items)
+// waits out the few near-empty frames of a fade-in. A map built from a few
+// large arenas (converted custom maps: 16 items for a whole level) never
+// reaches it, and both gates then stay shut for good - the player skates a
+// world that is never drawn. So a fresh, non-empty scene that has stayed
+// under the floor for ~1.5 s is taken to be the whole map.
+uint64_t g_small_fresh_since_frame = 0;
+bool PassesItemFloor(const FrameScene& scene, bool fresh) {
+  const uint64_t now = g_frames_rendered.load(std::memory_order_relaxed);
+  if (!fresh || scene.items.empty()) {
+    g_small_fresh_since_frame = 0;
+    return false;
+  }
+  if (scene.items.size() >= size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items))) {
+    return true;
+  }
+  if (g_small_fresh_since_frame == 0) g_small_fresh_since_frame = now;
+  return now - g_small_fresh_since_frame >= 90;
+}
+
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
   // Same reason as the guest thread's: what the command processor allocates
   // around the scene render is the emulated pipeline, and it was invisible.
@@ -9052,8 +9072,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const bool fresh =
         g_scene && g_scene->generation >= g_warmup_fresh_generation;
     const bool ready =
-        fresh && (g_scene->items.size() >=
-                      size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items)) ||
+        fresh && (PassesItemFloor(*g_scene, fresh) ||
                   (!g_scene->items.empty() && CasEditorActive(base)));
     loading_native = !ready;
   }
@@ -9218,10 +9237,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   if (warmup_ms > 0 && !loading_native &&
       REXCVAR_GET(skate3_native_render_scene_debug) == 0) {
     if (g_warmup_armed.load(std::memory_order_relaxed)) {
+      const bool fresh = scene.generation >= g_warmup_fresh_generation;
+      // The CAS editor's skater-only scene is small on purpose; it must not
+      // count as the gameplay takeover however long it stays up.
       const bool small_or_stale =
-          scene.generation < g_warmup_fresh_generation ||
-          scene.items.size() <
-              size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items));
+          !fresh || (CasEditorActive(base)
+                         ? scene.items.size() < size_t(REXCVAR_GET(
+                                                    skate3_native_render_scene_warmup_min_items))
+                         : !PassesItemFloor(scene, fresh));
       // A fresh CAS-editor scene renders despite being under min_items (the
       // startup-flow editor is skater-only, ~10 items), but does NOT count
       // as the gameplay takeover; the gate stays armed for the real load
