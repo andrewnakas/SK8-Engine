@@ -34,6 +34,7 @@
 // the ultrawide aspect is derived from off Windows. The context header above
 // only pulls SDL_events.h.
 #include <SDL3/SDL_video.h>
+#include <SDL3/SDL_hints.h>
 #endif
 
 // Defined in skate3_loader_overlay.cpp: the file a desktop launcher watches
@@ -822,6 +823,12 @@ static void Sub82EBAE4CImpl(PPCContext& ctx, uint8_t* base) {
 Skate3BaseApp::~Skate3BaseApp() = default;
 
 void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // SDL's resizable UIKit window otherwise accepts every orientation, even
+  // when Info.plist lists landscape only. A portrait surface reduces the
+  // 16:9 picture to a small band in the middle of an iPad's screen.
+  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
   ConfigureSkate3UserPaths(paths, user_settings_path_, profiles_path_);
   config_path_ = paths.config_path;
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
