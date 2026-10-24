@@ -24,6 +24,12 @@
 	<string>${CMAKE_OSX_DEPLOYMENT_TARGET}</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- Ninja does not apply Xcode's TARGETED_DEVICE_FAMILY setting. -->
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+		<integer>2</integer>
+	</array>
 
 	<!-- The 6 GB disc is staged into Documents over Finder file sharing rather
 	     than shipped in the bundle; both keys are required for the app's
@@ -68,6 +74,11 @@
 
 	<!-- Landscape only: the game renders a fixed 16:9 guest framebuffer. -->
 	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
