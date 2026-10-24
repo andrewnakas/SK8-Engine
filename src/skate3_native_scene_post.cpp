@@ -177,6 +177,9 @@ bool EnsureSsaoPipeline(const NativeGuestOutputRenderContext& context) {
   pso.vs = vs;
   pso.cull = nrhi::CullMode::kNone;
   pso.sample_count = 1;
+  // Every AO pass is a fullscreen triangle, including the depth-only path
+  // used by occlusion culling when the AO effect itself is disabled.
+  pso.triangle_list_only = true;
   pso.ps = ps[0];
   pso.rtv_format = nrhi::Format::kR32_FLOAT;
   g_r.pso_ao_linearize = device->CreateGraphicsPipeline(pso);
@@ -255,6 +258,7 @@ static void EmitOcclusionGridReduce(nrhi::Device* device, nrhi::Cmd* cmd,
       rp.cull = nrhi::CullMode::kNone;
       rp.sample_count = 1;
       rp.rtv_format = nrhi::Format::kR32_FLOAT;
+      rp.triangle_list_only = true;
       g_r.pso_occl_reduce = device->CreateGraphicsPipeline(rp);
     }
     if (rvs != nullptr) {
@@ -1183,6 +1187,7 @@ bool EnsureVolumetricPipeline(const NativeGuestOutputRenderContext& context) {
   pso.vs = vs;
   pso.cull = nrhi::CullMode::kNone;
   pso.sample_count = 1;
+  pso.triangle_list_only = true;
   pso.ps = ps_lin;
   pso.rtv_format = nrhi::Format::kR32_FLOAT;
   g_r.pso_vol_linearize = device->CreateGraphicsPipeline(pso);
@@ -1678,6 +1683,7 @@ bool EnsureHdrPipeline(const NativeGuestOutputRenderContext& context) {
   pso.vs = vs;
   pso.cull = nrhi::CullMode::kNone;
   pso.sample_count = 1;
+  pso.triangle_list_only = true;
   pso.rtv_format = nrhi::Format::kR16G16B16A16_FLOAT;
   pso.ps = ps_first;
   g_r.pso_bloom_first = device->CreateGraphicsPipeline(pso);

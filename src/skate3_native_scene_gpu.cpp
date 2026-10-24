@@ -3454,6 +3454,7 @@ bool EnsureResolvePso(const NativeGuestOutputRenderContext& context) {
     rp.rtv_format = g_r.hdr_active ? g_r.hdr_scene_format
                                    : context.guest_output->format();
     rp.sample_count = 1;
+    rp.triangle_list_only = true;
     g_r.resolve_pso = device->CreateGraphicsPipeline(rp);
     device->DestroyDeferred(rvs);
     device->DestroyDeferred(rps);
@@ -3500,6 +3501,9 @@ bool EnsureBlurPsos(const NativeGuestOutputRenderContext& context) {
     bp.cull = nrhi::CullMode::kNone;
     bp.rtv_format = context.guest_output->format();
     bp.sample_count = 1;
+    // These passes only draw fullscreen triangles. Building strip variants
+    // compiles an unused Metal pipeline on the render thread at first use.
+    bp.triangle_list_only = true;
     if (g_r.pso_blur) device->DestroyDeferred(g_r.pso_blur);
     if (g_r.pso_blur_blit) device->DestroyDeferred(g_r.pso_blur_blit);
     if (g_r.pso_blur_down) device->DestroyDeferred(g_r.pso_blur_down);
@@ -3559,6 +3563,7 @@ bool EnsureOutlineEdgePso(const NativeGuestOutputRenderContext& context) {
     op.cull = nrhi::CullMode::kNone;
     op.rtv_format = context.guest_output->format();
     op.sample_count = 1;
+    op.triangle_list_only = true;
     if (g_r.pso_outline_edge) device->DestroyDeferred(g_r.pso_outline_edge);
     g_r.pso_outline_edge = device->CreateGraphicsPipeline(op);
     device->DestroyDeferred(ovs);
@@ -3796,6 +3801,7 @@ bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
     bp.depth_clip = true;
     bp.rtv_format = nrhi::Format::kR16G16_UNORM;
     bp.sample_count = 1;
+    bp.triangle_list_only = true;
     g_r.pso_shadow_blur = device->CreateGraphicsPipeline(bp);
     device->DestroyDeferred(cvs);
     device->DestroyDeferred(cps);
